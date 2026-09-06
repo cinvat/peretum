@@ -1,0 +1,86 @@
+# API Target Configuration
+name: "api"
+listen: "api.example.com"
+lb_algorithm: "maglev"
+upstreams:
+  - url: "https://api1.example.com"
+    weight: 3
+  - url: "https://api2.example.com"
+    weight: 2
+  - url: "https://api3.example.com"
+    weight: 1
+tls:
+  cert_file: "./certs/api.example.com.crt"
+  key_file: "./certs/api.example.com.key"
+locations:
+  - path: "/api/"
+    match_type: "prefix"
+    cache: true
+    cache_ttl: "1h"
+    cors:
+      enabled: true
+      allow_origins:
+        - "https://app.example.com"
+        - "https://dev.example.com"
+      allow_methods:
+        - "GET"
+        - "POST"
+        - "PUT"
+        - "DELETE"
+      allow_headers:
+        - "Authorization"
+        - "Content-Type"
+        - "X-Request-ID"
+      expose_headers:
+        - "X-Total-Count"
+      allow_credentials: true
+      max_age: 3600
+    rewrite:
+      pattern: "^/api/v1/(.*)"
+      replacement: "/v2/$1"
+    headers:
+      request_add:
+        X-Forwarded-By: "peretum"
+        X-API-Version: "v2"
+      request_remove:
+        - "X-Internal-Token"
+      response_add:
+        X-Powered-By: "peretum"
+        Cache-Control: "public, max-age=300"
+      response_remove:
+        - "Server"
+    proxy:
+      pass_host_header: true
+      websocket: true
+      connect_timeout: "5s"
+      read_timeout: "30s"
+      send_timeout: "30s"
+
+  - path: "/health"
+    match_type: "exact"
+    cache: false
+    cors:
+      enabled: true
+      allow_origins: ["*"]
+      allow_methods: ["GET"]
+
+  - path: "/v1/users/[0-9]+"
+    match_type: "regex"
+    cache: true
+    cache_ttl: "5m"
+    rewrite:
+      pattern: "^/v1/users/([0-9]+)"
+      replacement: "/api/users/$1"
+
+  - path: "/legacy/"
+    match_type: "prefix"
+    cache: false
+    rewrite:
+      pattern: "^/legacy/(.*)"
+      replacement: "/new/$1"
+      redirect: "permanent"
+
+  - path: "/"
+    match_type: "prefix"
+    cache: true
+    cache_ttl: "5m"
