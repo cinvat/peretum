@@ -1,0 +1,118 @@
+# Test Target for novin.cloud
+name: "test"
+listen: "test.test"
+host: "test.test"
+lb_algorithm: "round_robin"
+upstreams:
+  - url: "http://127.0.0.1:8082"
+    weight: 1
+locations:
+  - path: "/"
+    match_type: "prefix"
+    cache: true
+    cache_ttl: "5s"
+    cors:
+      enabled: true
+      allow_origins: ["*"]
+      allow_methods: ["GET", "POST", "OPTIONS"]
+      allow_headers: ["*"]
+      allow_credentials: true
+    headers:
+      request_add:
+        X-Proxy: "peretum"
+      response_add:
+        X-Cache-Status: "enabled"
+    proxy:
+      pass_host_header: true
+      websocket: true
+    optimize:
+      enabled: true
+      minify_css: true
+      minify_js: true
+      uglify_js: true
+      images:
+        enabled: true
+        max_width: 800
+        max_height: 600
+        quality: 80
+        format: "webp"
+        strip_metadata: true
+    compression:
+      enabled: true
+      level: 5
+      min_length: 100
+      types:
+        - "text/html"
+        - "text/css"
+        - "application/javascript"
+    waf:
+      enabled: true
+      rules:
+        # Localhost always passes — replaces the former ip_whitelist.
+        - id: "allow-localhost"
+          name: "Always allow local development traffic"
+          enabled: true
+          action:
+            type: "allow"
+          conditions:
+            - - param: "ip"
+                operator: "in_ip"
+                value: "127.0.0.1, ::1"
+        # Lua-WAF style rule conditions — geo and IP checks as rules.
+        - id: "geo-ip"
+          name: "Geo + IP enforcement"
+          enabled: true
+          action:
+            type: "deny"
+            code: 403
+            message: "Geo/IP rule blocked"
+          conditions:
+            # OR between groups, AND within a group (DNF, mirrors the Lua WAF).
+            - - param: "country"
+                operator: "contains"       # case-insensitive substring: "ir" matches IR
+                value: "ir"
+            - - param: "asn"
+                operator: "in"
+                value: "4134,4837"
+            - - param: "city"
+                operator: "equals"
+                value: "Tehran"
+            - - param: "ip"
+                operator: "in_ip"
+                value: "8.8.8.0/24, 51.0.0.0/8"
+        # SQL injection
+        - id: "SQLi-select-union"
+          name: "Block obvious SQL injection"
+          enabled: true
+          action:
+            type: "deny"
+            code: 403
+            message: "SQL injection attempt blocked"
+          conditions:
+            - - param: "body"
+                operator: "contains"
+                value: "select"
+              - param: "body"
+                operator: "contains"
+                value: "from"
+            - - param: "query"
+                operator: "matches"
+                value: "union.*select"
+        - id: "UA-bot-block"
+          name: "Block curl/curl-ish agents"
+          action:
+            type: "deny"
+          conditions:
+            - - param: "user_agent"
+                operator: "contains"
+                value: "curl"
+        - id: "presence-audit"
+          name: "WHMCS-style prescan marker"
+          action:
+            type: "deny"
+          conditions:
+            - - param: "user_agent"
+                operator: "not_exists"
+              - param: "method"
+                operator: "equals"
+                value: "POST"

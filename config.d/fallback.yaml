@@ -1,0 +1,13 @@
+# Fallback Target Configuration (default)
+name: "fallback"
+listen: "_default"
+lb_algorithm: "round_robin"
+upstreams:
+  - url: "https://app1.example.com"
+    weight: 1
+  - url: "https://app2.example.com"
+    weight: 1
+locations:
+  - path: "/"
+    match_type: "prefix"
+    cache: false
