@@ -1,0 +1,39 @@
+﻿# Peretum
+
+> A lightweight, high-performance HTTP/HTTPS reverse proxy with transparent disk-based response caching, host + location routing, a plugin system, HTTP/3 (QUIC), gRPC passthrough and a Web Application Firewall.
+
+- [Peretum](https://cinvat.github.io/peretum/index.md): Peretum
+- [Quickstart](https://cinvat.github.io/peretum/quickstart.md): Go 1.26.2+ (the module lives at github.com/cinvat/peretum).
+- [Command line](https://cinvat.github.io/peretum/cli.md): peretum is a single command (cobra-based):
+- [Configuration](https://cinvat.github.io/peretum/configuration/index.md): Peretum uses two kinds of YAML files:
+- [Plugins](https://cinvat.github.io/peretum/plugins/index.md): Peretum loads plugins from a registry and dispatches lifecycle hooks around the request path. Plugins are configured globally in config.yaml (global settings) and per-location in config.d/*.yaml (their behavior).
+- [HTTP/3 (QUIC)](https://cinvat.github.io/peretum/http3.md): HTTP/3 is served by default on the same port as the TLS frontend whenever a TLS certificate is active, and can be pinned to another UDP port with http3_addr.
+- [gRPC proxying](https://cinvat.github.io/peretum/grpc.md): gRPC requests are HTTP/2 streams. Peretum supports them as tunneled pass-through: end-to-end transport (HTTP/2) and binary bodies are left untouched, and no gRPC-specific features (messages, trailers, reflection) are interpreted.
+- [Disk cache](https://cinvat.github.io/peretum/cache.md): Peretum stores backend responses as files on disk and serves subsequent requests straight from disk — no network, no upstream connection. The cache is transparent: the proxy only caches responses that are cacheable, keyed by method + route + upstream + request body hash when applicable.
+- [Routing](https://cinvat.github.io/peretum/routing.md): Peretum routes requests in two steps: host routing selects a target, and location routing selects the backend within that target.
+- [Development](https://cinvat.github.io/peretum/development/index.md): Everything you need to extend Peretum: repo layout, the testing bar, and how to add new plugins and targets.
+
+## Configuration
+
+- [Global configuration (config.yaml)](https://cinvat.github.io/peretum/configuration/global.md): Key
+- [Targets (config.d/*.yaml)](https://cinvat.github.io/peretum/configuration/targets.md): One YAML file per target:
+- [Listeners](https://cinvat.github.io/peretum/configuration/listeners.md): Peretum can bind any number of frontends with the nginx-style listeners: directive. Each entry is address[:port] [flags]:
+
+## Plugins
+
+- [Compression](https://cinvat.github.io/peretum/plugins/compression.md): Transparent gzip compression of upstream responses.
+- [Optimizer](https://cinvat.github.io/peretum/plugins/optimizer.md): Minifies CSS/JavaScript and re-encodes/resizes JPEG and PNG images.
+- [CORS](https://cinvat.github.io/peretum/plugins/cors.md): Cross-Origin Resource Sharing response headers.
+- [Headers](https://cinvat.github.io/peretum/plugins/headers.md): Adds and removes request and response headers.
+- [Rewrite](https://cinvat.github.io/peretum/plugins/rewrite.md): Regex-based request path rewrites, with optional $N capture groups, break and redirect support.
+- [JSON logs](https://cinvat.github.io/peretum/plugins/jsonlog.md): nginx-style access and error logs as JSON Lines (JSONL).
+- [Prometheus metrics](https://cinvat.github.io/peretum/plugins/prometheus.md): Exports an HTTP /metrics endpoint on a dedicated listener.
+- [Error pages](https://cinvat.github.io/peretum/plugins/errorpage.md): Replaces default error responses with branded HTML pages.
+- [Web Application Firewall (WAF)](https://cinvat.github.io/peretum/plugins/waf.md): The waf plugin inspects requests before proxying and blocks or audits them against per-location rule sets. It runs from BeforeProxy, so it applies to proxied, cached and gRPC requests alike.
+
+## Development
+
+- [Project layout](https://cinvat.github.io/peretum/development/layout.md): Concern
+- [Testing](https://cinvat.github.io/peretum/development/testing.md): Every package must keep 100% statement coverage — new code requires matching tests, never a relaxed bar.
+- [Adding a plugin](https://cinvat.github.io/peretum/development/adding-a-plugin.md): Implement the contracts from plugins/base/base.go:
+- [Contributing](https://cinvat.github.io/peretum/development/contributing.md): Drop a new YAML file in config.d/ (see the targets reference), verify it with peretum -t, then SIGHUP a running proxy (or use peretum -r, or restart it). No code changes needed.
