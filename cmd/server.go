@@ -46,6 +46,9 @@ type proxyServer struct {
 	targets     []config.TargetConfig
 	pluginMgr   *manager.PluginManager
 
+	// Health checkers for each target (keyed by target name).
+	healthCheckers map[string]*loadbalancer.HealthChecker
+
 	// cfgPath/targetsDir are the config file and target directory the proxy
 	// was started with, so SIGHUP reloads re-read the same sources no matter
 	// which working directory the process runs from. Empty keeps the legacy
@@ -76,13 +79,14 @@ type proxyServer struct {
 
 func newProxyServer(proxyCfg *config.ProxyConfig, targets []config.TargetConfig, diskCache *disk.DiskCache, writeSem chan struct{}, pluginMgr *manager.PluginManager, maxBodySize int64) *proxyServer {
 	return &proxyServer{
-		router:      router.NewHostRouter(),
-		diskCache:   diskCache,
-		writeSem:    writeSem,
-		proxyCfg:    proxyCfg,
-		targets:     targets,
-		pluginMgr:   pluginMgr,
-		maxBodySize: maxBodySize,
+		router:         router.NewHostRouter(),
+		diskCache:      diskCache,
+		writeSem:       writeSem,
+		proxyCfg:       proxyCfg,
+		targets:        targets,
+		pluginMgr:      pluginMgr,
+		maxBodySize:    maxBodySize,
+		healthCheckers: make(map[string]*loadbalancer.HealthChecker),
 	}
 }
 
@@ -90,6 +94,9 @@ func (ps *proxyServer) buildHostRouter() *router.HostRouter {
 	hr := router.NewHostRouter()
 	targets := make(map[string]*router.TargetConfigHandler)
 	var defaultHandler *handler.TargetHandler
+
+	// Build new health checkers for this configuration.
+	newHealthCheckers := make(map[string]*loadbalancer.HealthChecker)
 
 	for i := range ps.targets {
 		target := &ps.targets[i]
@@ -111,6 +118,42 @@ func (ps *proxyServer) buildHostRouter() *router.HostRouter {
 			}
 		}
 		lb := loadbalancer.New(target.LBAlgorithm, lbUpstreams)
+
+		// Create health checker if any upstream has health_check configured.
+		var hcConfig *loadbalancer.HealthCheckConfig
+		for _, uc := range target.Upstreams {
+			if uc.HealthCheck != nil && uc.HealthCheck.Path != "" {
+				interval := 10 * time.Second
+				if uc.HealthCheck.Interval != "" {
+					if d, err := time.ParseDuration(uc.HealthCheck.Interval); err == nil {
+						interval = d
+					}
+				}
+				timeout := 3 * time.Second
+				if uc.HealthCheck.Timeout != "" {
+					if d, err := time.ParseDuration(uc.HealthCheck.Timeout); err == nil {
+						timeout = d
+					}
+				}
+				expectedStatus := uc.HealthCheck.ExpectedStatus
+				if expectedStatus == 0 {
+					expectedStatus = 200
+				}
+				hcConfig = &loadbalancer.HealthCheckConfig{
+					Path:           uc.HealthCheck.Path,
+					Interval:       interval,
+					Timeout:        timeout,
+					ExpectedStatus: expectedStatus,
+					Headers:        uc.HealthCheck.Headers,
+				}
+				break
+			}
+		}
+		if hcConfig != nil {
+			hc := loadbalancer.NewHealthChecker(lb, hcConfig)
+			newHealthCheckers[target.Name] = hc
+			klog.Infof("enabled active health checks for target %s (path=%s, interval=%v, timeout=%v)", target.Name, hcConfig.Path, hcConfig.Interval, hcConfig.Timeout)
+		}
 
 		var handlers []*handler.TargetHandler
 		var defaultLoc *handler.TargetHandler
@@ -145,6 +188,22 @@ func (ps *proxyServer) buildHostRouter() *router.HostRouter {
 			defaultHandler = defaultLoc
 		}
 	}
+
+	// Stop old health checkers that are no longer in the new config.
+	for name, oldHC := range ps.healthCheckers {
+		if _, ok := newHealthCheckers[name]; !ok {
+			oldHC.Stop()
+			klog.Infof("stopped health checker for target %s", name)
+		}
+	}
+	// Start new health checkers.
+	for name, newHC := range newHealthCheckers {
+		if _, ok := ps.healthCheckers[name]; !ok {
+			newHC.Start(context.Background())
+			klog.Infof("started health checker for target %s", name)
+		}
+	}
+	ps.healthCheckers = newHealthCheckers
 
 	hr.Reload(targets, defaultHandler)
 	return hr
@@ -216,11 +275,18 @@ func (ps *proxyServer) buildTLSConfig() *tls.Config {
 		}
 	}
 
+	// Advertise HTTP/2 (and HTTP/1.1 fallback) via ALPN explicitly. The
+	// per-handshake config returned by GetConfigForClient replaces the base
+	// config, so net/http's automatic "h2" ALPN entry (added to the base
+	// config) would otherwise be discarded and every client would negotiate
+	// plain HTTP/1.1.
+	nextProtos := []string{"h2", "http/1.1"}
 	return &tls.Config{
 		Certificates: certs,
 		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
-			return &tls.Config{Certificates: certs}, nil
+			return &tls.Config{Certificates: certs, NextProtos: nextProtos}, nil
 		},
+		NextProtos: nextProtos,
 		MinVersion: tls.VersionTLS12,
 	}
 }
@@ -657,6 +723,13 @@ var serverShutdown = func(ctx context.Context, srv *http.Server) error { return 
 
 func (ps *proxyServer) shutdown(ctx context.Context) error {
 	signal.Reset(syscall.SIGHUP)
+
+	// Stop all health checkers.
+	for name, hc := range ps.healthCheckers {
+		hc.Stop()
+		klog.Infof("stopped health checker for target %s", name)
+	}
+
 	var closeErrs []error
 	for _, h := range ps.quicServers() {
 		if err := h3Shutdown(ctx, h); err != nil {

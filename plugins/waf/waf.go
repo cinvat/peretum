@@ -27,10 +27,11 @@ var errWAFBlocked = fmt.Errorf("waf: request blocked")
 // under each target location; the GeoLite databases are shared globally.
 type WAFPlugin struct {
 	*base.BasePlugin
-	enabled bool
-	geodir  string
-	rs      map[string]*ruleSet
-	gs      *geodb
+	enabled     bool
+	geodir      string
+	rs          map[string]*ruleSet
+	gs          *geodb
+	maxBodySize int64 // maximum request body size to read for "body" parameter
 }
 
 // NewWAFPlugin returns a fresh WAF plugin instance.
@@ -44,6 +45,10 @@ func (p *WAFPlugin) Init(config map[string]any) error {
 	p.BasePlugin.Init(config)
 	p.enabled = base.GetBool(config, "enabled")
 	p.geodir = base.GetString(config, "geolite_dir")
+	p.maxBodySize = base.GetInt64(config, "max_body_size")
+	if p.maxBodySize == 0 {
+		p.maxBodySize = 1 << 20 // default 1MB
+	}
 	p.rs = make(map[string]*ruleSet)
 
 	locs, _ := config["locations"].([]any)
@@ -58,7 +63,7 @@ func (p *WAFPlugin) Init(config map[string]any) error {
 		if !ok {
 			continue
 		}
-		rs, err := buildRuleSet(wafCfg)
+		rs, err := buildRuleSet(wafCfg, p.maxBodySize)
 		if err != nil {
 			klog.Warningf("waf: skipping %s|%s: %v", target, location, err)
 			continue
@@ -158,20 +163,21 @@ func clientIP(r *http.Request) string {
 // requestCtx lazily extracts the request fields a policy references so each
 // value (including the body) is read at most once.
 type requestCtx struct {
-	r        *http.Request
-	gs       *geodb
-	ip       string
-	geoDone  bool
-	country  string
-	asn      uint32
-	asnOrg   string
-	city     string
-	bodyDone bool
-	body     string
+	r           *http.Request
+	gs          *geodb
+	ip          string
+	geoDone     bool
+	country     string
+	asn         uint32
+	asnOrg      string
+	city        string
+	bodyDone    bool
+	body        string
+	maxBodySize int64
 }
 
-func newRequestCtx(r *http.Request, gs *geodb) *requestCtx {
-	return &requestCtx{r: r, gs: gs, ip: clientIP(r)}
+func newRequestCtx(r *http.Request, gs *geodb, maxBodySize int64) *requestCtx {
+	return &requestCtx{r: r, gs: gs, ip: clientIP(r), maxBodySize: maxBodySize}
 }
 
 func (c *requestCtx) ensureGeo() {
@@ -197,9 +203,17 @@ func (c *requestCtx) ensureBody() string {
 	if c.r.Body == nil {
 		return ""
 	}
-	b, err := io.ReadAll(c.r.Body)
+	limit := c.maxBodySize
+	if limit <= 0 {
+		limit = 1 << 20 // default 1MB
+	}
+	b, err := io.ReadAll(io.LimitReader(c.r.Body, limit+1))
 	if err != nil {
 		return ""
+	}
+	if int64(len(b)) > limit {
+		// Body exceeded limit; return truncated indication
+		return string(b[:limit]) + "... [truncated]"
 	}
 	c.body = string(b)
 	return c.body
@@ -268,9 +282,10 @@ const (
 
 // ruleSet is a compiled per-location WAF policy.
 type ruleSet struct {
-	params    map[string]*paramIndex
-	rules     []*compiledRule
-	condCount int
+	params      map[string]*paramIndex
+	rules       []*compiledRule
+	condCount   int
+	maxBodySize int64
 }
 
 // compiledRule is a rule with its OR-of-AND-groups of condition ids. The
@@ -355,12 +370,13 @@ func addIPCond(idx *paramIndex, value string, negate bool, condID int) {
 }
 
 // buildRuleSet compiles the per-location WAF configuration.
-func buildRuleSet(cfg map[string]any) (*ruleSet, error) {
+func buildRuleSet(cfg map[string]any, maxBodySize int64) (*ruleSet, error) {
 	if !getBool(cfg, "enabled") {
 		return nil, nil
 	}
 	rs := &ruleSet{
-		params: make(map[string]*paramIndex),
+		params:      make(map[string]*paramIndex),
+		maxBodySize: maxBodySize,
 	}
 
 	rules, ok := cfg["rules"].([]any)
@@ -510,7 +526,7 @@ func finalizeIndexes(rs *ruleSet) {
 // evaluate runs the policy against one request and returns the enforcement
 // decision plus the matched deny rule (for rule-driven blocks) or nil.
 func (rs *ruleSet) evaluate(r *http.Request, gs *geodb) (ruleSetAction, *compiledRule) {
-	ctx := newRequestCtx(r, gs)
+	ctx := newRequestCtx(r, gs, rs.maxBodySize)
 
 	hits := make([]bool, rs.condCount)
 	for param, idx := range rs.params {

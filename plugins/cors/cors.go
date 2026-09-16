@@ -77,6 +77,9 @@ func (p *CORSPlugin) BeforeProxy(w http.ResponseWriter, r *http.Request, target,
 		return nil
 	}
 
+	// Vary: Origin is required for correct caching when CORS is enabled.
+	w.Header().Add("Vary", "Origin")
+
 	w.Header().Set("Access-Control-Allow-Origin", origin)
 
 	if p.config.AllowCredentials {

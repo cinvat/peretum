@@ -300,6 +300,22 @@ func (d *DiskCache) StreamCachedResponseTTL(w http.ResponseWriter, key string, t
 	return d.streamCachedResponse(w, key, ttl)
 }
 
+// Peek reports whether a fresh cached entry exists for key, mirroring the
+// freshness (TTL/MaxAge) check used by streamCachedResponse but without
+// writing anything or expiring the entry. It lets callers set up response
+// headers before committing to a cache hit.
+func (d *DiskCache) Peek(key string, ttl time.Duration) bool {
+	info, err := os.Stat(CachePath(d.CacheDir, key, metaExt))
+	if err != nil {
+		return false
+	}
+	age := d.MaxAge
+	if ttl > 0 {
+		age = ttl
+	}
+	return age <= 0 || time.Since(info.ModTime()) <= age
+}
+
 func (d *DiskCache) streamCachedResponse(w http.ResponseWriter, key string, ttl time.Duration) error {
 	metaPath := CachePath(d.CacheDir, key, metaExt)
 	bodyPath := CachePath(d.CacheDir, key, bodyExt)

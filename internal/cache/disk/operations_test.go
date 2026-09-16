@@ -224,6 +224,27 @@ func TestStreamCachedResponse_CacheMiss(t *testing.T) {
 	}
 }
 
+func TestPeek_ExistenceAndFreshness(t *testing.T) {
+	c := newTestCache(t) // MaxAge = 0: only an explicit per-entry TTL expires entries
+
+	if c.Peek("nonexistent", 0) {
+		t.Error("Peek on a missing key should return false")
+	}
+
+	c.SetResponseToCache("peekkey", "example.com", "/peek", 200, http.Header{}, []byte("data"))
+	if !c.Peek("peekkey", time.Hour) {
+		t.Error("fresh entry should Peek true")
+	}
+	if !c.Peek("peekkey", 0) {
+		t.Error("global MaxAge 0 means never expired, Peek should be true")
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if c.Peek("peekkey", 10*time.Millisecond) {
+		t.Error("entry past its per-entry TTL should Peek false")
+	}
+}
+
 func TestStreamCachedResponse_ExpiredEntry(t *testing.T) {
 	dir := t.TempDir()
 	c, err := New(dir, 10<<20, 50*time.Millisecond)

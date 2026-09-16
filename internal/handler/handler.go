@@ -44,6 +44,7 @@ type requestLogger interface {
 type capturingTransport struct {
 	transport        http.RoundTripper
 	lb               loadbalancer.LoadBalancer
+	pinned           string // location-pinned upstream ("http://host"), or "" to balance
 	statusCode       int
 	headers          http.Header
 	body             []byte
@@ -51,18 +52,68 @@ type capturingTransport struct {
 	maxBodySize      int64
 }
 
+// upstreamIdentityHeaders are response headers that disclose the upstream
+// server, CDN, or edge cache behind the proxy. A reverse proxy should not
+// forward them to clients verbatim: they are stripped before the response is
+// buffered or replayed from cache, so clients can only see peretum.
+var upstreamIdentityHeaders = []string{
+	"Server",
+	"Via",
+	"Age",
+	"X-Powered-By",
+	"X-Cache",
+	"X-Cache-Hits",
+	"X-Cache-Status",
+	"X-Served-By",
+	"X-Backend-Server",
+	"X-Backend-Host",
+	"Cf-Ray",
+	"Cf-Cache-Status",
+	"Cf-Worker",
+}
+
+// sanitizeResponseHeaders removes upstream-identity headers and replaces the
+// Server value so clients cannot tell which origin or CDN served the body.
+func sanitizeResponseHeaders(hdr http.Header) {
+	for _, k := range upstreamIdentityHeaders {
+		hdr.Del(k)
+	}
+	hdr.Set("Server", "peretum")
+}
+
 func (ct *capturingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	klog.Infof("capturingTransport.RoundTrip: %s %s", req.Method, req.URL.String())
-	upstream := ct.lb.Next(req)
-	if upstream == nil {
-		return nil, fmt.Errorf("no healthy upstreams")
+	targetURL := ct.pinned
+	var lbUpstream *loadbalancer.Upstream
+	if targetURL == "" {
+		lbUpstream = ct.lb.Next(req)
+		if lbUpstream == nil {
+			return nil, fmt.Errorf("no healthy upstreams")
+		}
+		targetURL = lbUpstream.URL
 	}
-	ct.selectedUpstream = upstream.URL
+	ct.selectedUpstream = targetURL
 
-	resp, err := ct.transport.RoundTrip(req)
+	// Forward to the resolved upstream. The reverse proxy's Rewrite pins
+	// req.URL to a placeholder (the first upstream, or a location-pinned
+	// one), so when load balancing, re-point the request at the
+	// actually-selected host. A pinned location upstream already has the
+	// correct URL in req.
+	outReq := req
+	if lbUpstream != nil {
+		outReq = req.Clone(req.Context())
+		if scheme, rest, ok := strings.Cut(targetURL, "://"); ok {
+			u := *req.URL
+			u.Scheme = scheme
+			u.Host = rest
+			outReq.URL = &u
+		}
+	}
+
+	resp, err := ct.transport.RoundTrip(outReq)
 	if err != nil {
 		klog.Infof("RoundTrip error: %v", err)
-		ct.lb.MarkHealthy(upstream.URL, false)
+		ct.lb.MarkHealthy(targetURL, false)
 		return nil, err
 	}
 
@@ -88,16 +139,32 @@ func (ct *capturingTransport) RoundTrip(req *http.Request) (*http.Response, erro
 
 	if err != nil {
 		klog.Infof("ReadAll error: %v", err)
-		ct.lb.MarkHealthy(upstream.URL, false)
+		ct.lb.MarkHealthy(targetURL, false)
 		return nil, err
 	}
 	if limit >= 0 && int64(len(body)) > limit {
-		ct.lb.MarkHealthy(upstream.URL, false)
+		ct.lb.MarkHealthy(targetURL, false)
 		return nil, fmt.Errorf("response body exceeds max read size")
 	}
 
-	ct.lb.MarkHealthy(upstream.URL, true)
+	ct.lb.MarkHealthy(targetURL, true)
 	ct.body = buf.Bytes()
+	// The body is fully buffered, so its length is known even when the
+	// upstream streamed it (chunked transfer encoding, ContentLength == -1).
+	// Report the real length: otherwise httputil.ReverseProxy treats the
+	// response as an unbounded stream and flushes after every write, which
+	// emits the response headers before the compression plugin has set
+	// Content-Encoding — losing the header and delivering raw gzip bytes.
+	resp.ContentLength = int64(len(ct.body))
+	// Do not forward upstream/CDN identity headers (Server, cf-ray, ...)
+	// either live or into the cache.
+	sanitizeResponseHeaders(resp.Header)
+	// Snapshot the sanitized headers. ct.headers is what gets stored to
+	// cache and handed to plugins, while resp.Header is the live map that
+	// ReverseProxy.ModifyResponse later mutates (X-Cache, location
+	// response_add). Sharing the map would bake those per-request headers
+	// into the cached entry and replay them on every hit.
+	ct.headers = resp.Header.Clone()
 	resp.Body = io.NopCloser(bytes.NewReader(ct.body))
 	return resp, nil
 }
@@ -112,7 +179,8 @@ func (ct *capturingTransport) RoundTrip(req *http.Request) (*http.Response, erro
 // requests use an h2c-aware RoundTripper instead of a plain HTTP/1.1 one;
 // TLS backends keep http.DefaultTransport, which negotiates h2 via ALPN.
 type grpcTransport struct {
-	lb loadbalancer.LoadBalancer
+	lb     loadbalancer.LoadBalancer
+	pinned string // location-pinned upstream, or "" to balance
 }
 
 // h2cRT is a shared HTTP/2 RoundTripper that dials plaintext upstreams with
@@ -124,10 +192,38 @@ var h2cRT http.RoundTripper = &http2.Transport{
 	},
 }
 
+// proxyTransport is the RoundTripper used for proxied (non-gRPC) upstream
+// requests. Compression is disabled at the transport layer: the Rewrite drops
+// the client's Accept-Encoding so cached bodies stay uncompressed, and Go
+// would otherwise re-add "Accept-Encoding: gzip" itself. That advertises gzip
+// the proxy never asked for, and CDNs such as Cloudflare then answer with a
+// gzip body without a Content-Encoding header — which Go does not
+// auto-decompress — leaving the client with raw compressed bytes.
+var proxyTransport http.RoundTripper = func() http.RoundTripper {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DisableCompression = true
+	return tr
+}()
+
 func (gt *grpcTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	upstream := gt.lb.Next(req)
-	if upstream == nil {
-		return nil, fmt.Errorf("no healthy upstreams")
+	targetURL := gt.pinned
+	var upstream *loadbalancer.Upstream
+	if targetURL == "" {
+		upstream = gt.lb.Next(req)
+		if upstream == nil {
+			return nil, fmt.Errorf("no healthy upstreams")
+		}
+		targetURL = upstream.URL
+		// Point the request at the LB-selected upstream: the gRPC reverse
+		// proxy's Rewrite pinned the URL to a placeholder, but balancing is
+		// decided here.
+		req = req.Clone(req.Context())
+		if scheme, rest, ok := strings.Cut(targetURL, "://"); ok {
+			u := *req.URL
+			u.Scheme = scheme
+			u.Host = rest
+			req.URL = &u
+		}
 	}
 	var rt http.RoundTripper
 	if req.URL.Scheme == "https" {
@@ -137,10 +233,10 @@ func (gt *grpcTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	resp, err := rt.RoundTrip(req)
 	if err != nil {
-		gt.lb.MarkHealthy(upstream.URL, false)
+		gt.lb.MarkHealthy(targetURL, false)
 		return nil, err
 	}
-	gt.lb.MarkHealthy(upstream.URL, true)
+	gt.lb.MarkHealthy(targetURL, true)
 	return resp, nil
 }
 
@@ -276,6 +372,15 @@ func (th *TargetHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Check cache
 	if th.location.Cache {
+		// Apply the location's response header rules before the cached
+		// response is written (mutations after the response is committed
+		// never reach the client), but only when a fresh entry will really
+		// be streamed. On a miss we must not pre-populate w.Header():
+		// ReverseProxy normally adds its headers with Add, so a pre-set value
+		// plus the proxy copy would duplicate every response header.
+		if th.diskCache.Peek(key, th.cacheTTL) {
+			th.applyResponseHeadersTo(w.Header())
+		}
 		if err := th.diskCache.StreamCachedResponseTTL(w, key, th.cacheTTL); err == nil {
 			cached = true
 			th.diskCache.RecordHit()
@@ -283,7 +388,6 @@ func (th *TargetHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				th.pluginMgr.RunRecordCacheHit(th.targetName(), th.location.Path)
 				th.pluginMgr.RunAfterCacheHit(w, r, key, th.targetName(), th.location.Path)
 			}
-			th.applyResponseHeaders(w)
 			return
 		}
 		th.diskCache.RecordMiss()
@@ -361,8 +465,9 @@ func (th *TargetHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	klog.Infof("Upstream URL: %s, path: %s", upstreamURL, path)
 
 	capture := &capturingTransport{
-		transport:   http.DefaultTransport,
+		transport:   proxyTransport,
 		lb:          th.lb,
+		pinned:      th.pinnedUpstream(),
 		maxBodySize: th.resolveMaxBodySize(),
 	}
 
@@ -391,14 +496,17 @@ func (th *TargetHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	if th.location.Proxy != nil && th.location.Proxy.WebSocket {
-		rp.ModifyResponse = func(resp *http.Response) error {
-			if resp.StatusCode == http.StatusSwitchingProtocols {
-				resp.Header.Set("Connection", "upgrade")
-				resp.Header.Set("Upgrade", "websocket")
-			}
-			return nil
+	// Tag the response with the proxy's own cache status and apply the
+	// location's response header rules before the reverse proxy writes the
+	// response, so the extra headers actually reach the client.
+	rp.ModifyResponse = func(resp *http.Response) error {
+		if th.location.Proxy != nil && th.location.Proxy.WebSocket && resp.StatusCode == http.StatusSwitchingProtocols {
+			resp.Header.Set("Connection", "upgrade")
+			resp.Header.Set("Upgrade", "websocket")
 		}
+		resp.Header.Set("X-Cache", "MISS")
+		th.applyResponseHeadersTo(resp.Header)
+		return nil
 	}
 
 	// Wrap with compression if configured
@@ -421,9 +529,6 @@ func (th *TargetHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	klog.Infof("Serving request with finalHandler: %T", finalHandler)
 	finalHandler.ServeHTTP(w, r)
 	klog.Infof("After ServeHTTP, statusCode=%d", capture.statusCode)
-
-	// Apply response header modifications
-	th.applyResponseHeaders(w)
 
 	// Run plugin AfterProxy hooks
 	if th.pluginMgr != nil {
@@ -518,7 +623,7 @@ func (th *TargetHandler) serveWaiterFromFlight(w http.ResponseWriter, r *http.Re
 		th.pluginMgr.RunRecordCacheHit(th.targetName(), th.location.Path)
 		th.pluginMgr.RunAfterCacheHit(w, r, key, th.targetName(), th.location.Path)
 	}
-	th.applyResponseHeaders(w)
+	th.applyResponseHeadersTo(w.Header())
 	if err := th.diskCache.StreamCachedResponseTTL(w, key, th.cacheTTL); err == nil {
 		return true
 	}
@@ -551,7 +656,8 @@ func (th *TargetHandler) serveGRPC(w http.ResponseWriter, r *http.Request) {
 			}
 		},
 		Transport: &grpcTransport{
-			lb: th.lb,
+			lb:     th.lb,
+			pinned: th.pinnedUpstream(),
 		},
 		FlushInterval: -1,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -572,6 +678,15 @@ func (th *TargetHandler) getUpstreamURL(r *http.Request) string {
 	upstreams, _ := th.target.ParseUpstreams()
 	if len(upstreams) > 0 {
 		return upstreams[0].String()
+	}
+	return ""
+}
+
+// pinnedUpstream returns the location's per-location upstream override, or ""
+// when the location does not pin one (in which case the load balancer picks).
+func (th *TargetHandler) pinnedUpstream() string {
+	if th.location.Proxy != nil && th.location.Proxy.Upstream != "" {
+		return th.location.Proxy.Upstream
 	}
 	return ""
 }
@@ -669,17 +784,22 @@ func (th *TargetHandler) applyRequestHeaders(r *http.Request) {
 	}
 }
 
-func (th *TargetHandler) applyResponseHeaders(w http.ResponseWriter) {
+// applyResponseHeadersTo applies the location's configured response header
+// additions and removals to an arbitrary header set. It must run before the
+// response headers are committed to the client (via ReverseProxy.ModifyResponse
+// for proxied responses, or before StreamCachedResponseTTL for cache hits);
+// mutating a ResponseWriter after the response is sent has no effect.
+func (th *TargetHandler) applyResponseHeadersTo(h http.Header) {
 	headers := th.location.Headers
 	if headers == nil {
 		return
 	}
 	if headers.ResponseAdd != nil {
 		for k, v := range headers.ResponseAdd {
-			w.Header().Set(k, v)
+			h.Set(k, v)
 		}
 	}
 	for _, k := range headers.ResponseRemove {
-		w.Header().Del(k)
+		h.Del(k)
 	}
 }

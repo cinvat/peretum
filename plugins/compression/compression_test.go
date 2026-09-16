@@ -237,6 +237,43 @@ func TestWrapHandlerGzipCloseError(t *testing.T) {
 	}
 }
 
+func TestWrapHandlerAlreadyEncoded(t *testing.T) {
+	// Upstream already negotiated gzip: the plugin must pass the encoded
+	// body through untouched instead of double-compressing it.
+	p := newCompressionPlugin(t, baseCfg())
+	body := []byte(strings.Repeat("compressible body ", 20))
+	var gzBuf bytes.Buffer
+	zw, _ := gzip.NewWriterLevel(&gzBuf, 6)
+	_, _ = zw.Write(body)
+	_ = zw.Close()
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = w.Write(gzBuf.Bytes())
+	})
+	h := p.WrapHandler(inner)
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("Accept-Encoding", "gzip, deflate")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Header().Get("Content-Encoding") != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", rec.Header().Get("Content-Encoding"))
+	}
+	zr, err := gzip.NewReader(rec.Body)
+	if err != nil {
+		t.Fatalf("gzip reader: %v", err)
+	}
+	decoded, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("gzip read: %v", err)
+	}
+	if !bytes.Equal(decoded, body) {
+		t.Errorf("single-decompressed body mismatch: got %q", decoded)
+	}
+}
+
 func TestShouldCompress(t *testing.T) {
 	p := newCompressionPlugin(t, baseCfg())
 	if p.shouldCompress("text/html", 50) {

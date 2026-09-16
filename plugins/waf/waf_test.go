@@ -144,7 +144,7 @@ func TestRequestCtxGet(t *testing.T) {
 	r.Header.Set("Cookie", "session=abc")
 	r.Header.Set("X-Real-IP", "3.3.3.3")
 
-	ctx := newRequestCtx(r, nil)
+	ctx := newRequestCtx(r, nil, 1<<20)
 	cases := []struct {
 		param, name, want string
 	}{
@@ -182,7 +182,7 @@ func TestRequestCtxGet(t *testing.T) {
 		t.Fatalf("cached body = %q %v", got, present)
 	}
 	// body read error -> empty.
-	ctxErr := newRequestCtx(httptest.NewRequest("POST", "/", &errReader{}), nil)
+	ctxErr := newRequestCtx(httptest.NewRequest("POST", "/", &errReader{}), nil, 1<<20)
 	if got, present := ctxErr.get("body", ""); present || got != "" {
 		t.Fatalf("error body = %q %v", got, present)
 	}
@@ -196,7 +196,7 @@ func TestRequestCtxGeo(t *testing.T) {
 	}
 	r := httptest.NewRequest("GET", "/", nil)
 	r.RemoteAddr = "8.8.8.8:1234"
-	ctx := newRequestCtx(r, gs)
+	ctx := newRequestCtx(r, gs, 1<<20)
 	country, p := ctx.get("country", "")
 	if !p || country != "US" {
 		t.Fatalf("country = %q %v", country, p)
@@ -218,7 +218,7 @@ func TestRequestCtxBadIP(t *testing.T) {
 	g, _ := openGeodb("")
 	r := httptest.NewRequest("GET", "/", nil)
 	r.RemoteAddr = "bad-ip"
-	ctx := newRequestCtx(r, g)
+	ctx := newRequestCtx(r, g, 1<<20)
 	if c, p := ctx.get("country", ""); p || c != "" {
 		t.Fatalf("invalid ip country = %q %v", c, p)
 	}
@@ -232,7 +232,7 @@ func TestRequestCtxNoBody(t *testing.T) {
 		Header:     make(http.Header),
 		RemoteAddr: "1.2.3.4:1",
 	}
-	ctx := newRequestCtx(r, nil)
+	ctx := newRequestCtx(r, nil, 1<<20)
 	if b, p := ctx.get("body", ""); p || b != "" {
 		t.Fatalf("no-body = %q %v", b, p)
 	}
@@ -434,7 +434,7 @@ func TestBuildRuleSetParsing(t *testing.T) {
 				"conditions": []any{"notgroupany"}},
 		},
 	}
-	rs, err := buildRuleSet(cfg)
+	rs, err := buildRuleSet(cfg, 1<<20)
 	if err != nil {
 		t.Fatalf("buildRuleSet: %v", err)
 	}
@@ -451,17 +451,17 @@ func TestBuildRuleSetParsing(t *testing.T) {
 	}
 
 	// Defaults when keys are absent.
-	rs2, err := buildRuleSet(map[string]any{"enabled": true})
+	rs2, err := buildRuleSet(map[string]any{"enabled": true}, 1<<20)
 	if err != nil || len(rs2.rules) != 0 {
 		t.Fatalf("defaults: %v", rs2)
 	}
 	// Disabled returns nil.
-	rs3, err := buildRuleSet(map[string]any{"enabled": false})
+	rs3, err := buildRuleSet(map[string]any{"enabled": false}, 1<<20)
 	if err != nil || rs3 != nil {
 		t.Fatal("disabled should be nil")
 	}
 	// rules present but wrong type.
-	rs4, err := buildRuleSet(map[string]any{"enabled": true, "rules": "bad"})
+	rs4, err := buildRuleSet(map[string]any{"enabled": true, "rules": "bad"}, 1<<20)
 	if err == nil || rs4 != nil {
 		t.Fatal("bad rules type should error")
 	}
@@ -491,7 +491,7 @@ func TestBuildRuleSetOperatorInRealGroup(t *testing.T) {
 			},
 		},
 	}
-	rs, err := buildRuleSet(cfg)
+	rs, err := buildRuleSet(cfg, 1<<20)
 	if err != nil {
 		t.Fatalf("buildRuleSet: %v", err)
 	}
@@ -523,7 +523,7 @@ func TestEvaluateImmediateBlock(t *testing.T) {
 			"id": "x", "action": map[string]any{"type": "deny", "code": 451, "message": "bad"},
 			"conditions": []any{[]any{map[string]any{"param": "user_agent", "operator": "contains", "value": "safari"}}},
 		}},
-	})
+	}, 1<<20)
 	req := requestFor("8.8.8.8:1", "x.com", "Mozilla Safari 5", "GET")
 	act, rule := rs.evaluate(req, nil)
 	if act != ruleSetActionBlock || rule.id != "x" {
@@ -569,7 +569,7 @@ func TestEvaluateGeoRules(t *testing.T) {
 		{"geo_and_host", []any{rule(mk("country", "equals", "US"), mk("host", "equals", "x.com"))}, "8.8.8.8:1", ruleSetActionBlock},
 	}
 	for _, tc := range cases {
-		rs, err := buildRuleSet(map[string]any{"enabled": true, "rules": tc.rules})
+		rs, err := buildRuleSet(map[string]any{"enabled": true, "rules": tc.rules}, 1<<20)
 		if err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
@@ -609,7 +609,7 @@ func TestEvaluateIPRules(t *testing.T) {
 		{"ipv6_contains", []any{rule(mk("equals", "2001:db8::/32"))}, "2001:db8::1:1", ruleSetActionBlock},
 	}
 	for _, tc := range cases {
-		rs, err := buildRuleSet(map[string]any{"enabled": true, "rules": tc.rules})
+		rs, err := buildRuleSet(map[string]any{"enabled": true, "rules": tc.rules}, 1<<20)
 		if err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
@@ -627,20 +627,20 @@ func TestEvaluateAllowAndLogActions(t *testing.T) {
 	}
 	// allow rule runs first and short-circuits.
 	rs, _ := buildRuleSet(map[string]any{"enabled": true,
-		"rules": []any{mk("allow", "allow"), mk("deny", "deny")}})
+		"rules": []any{mk("allow", "allow"), mk("deny", "deny")}}, 1<<20)
 	act, r := rs.evaluate(requestFor("8.8.8.8:1", "match", "", "GET"), nil)
 	if act != ruleSetActionAllow || r.id != "allow" {
 		t.Fatalf("allow short-circuit: %d %v", act, r)
 	}
 	// log action only.
 	rs, _ = buildRuleSet(map[string]any{"enabled": true,
-		"rules": []any{mk("log", "log")}})
+		"rules": []any{mk("log", "log")}}, 1<<20)
 	if act, _ := rs.evaluate(requestFor("8.8.8.8:1", "match", "", "GET"), nil); act != ruleSetActionAllow {
 		t.Fatal("log action should allow")
 	}
 	// disabled rule ignored.
 	rs, _ = buildRuleSet(map[string]any{"enabled": true,
-		"rules": []any{mk("off", "deny")}})
+		"rules": []any{mk("off", "deny")}}, 1<<20)
 	rs.rules[0].enabled = false
 	if act, _ := rs.evaluate(requestFor("8.8.8.8:1", "match", "", "GET"), nil); act != ruleSetActionAllow {
 		t.Fatal("disabled rule should allow")
@@ -727,7 +727,7 @@ func TestBeforeProxy(t *testing.T) {
 			"id": "x", "action": map[string]any{"type": "deny", "code": 418, "message": "blocked"},
 			"conditions": []any{[]any{map[string]any{"param": "host", "operator": "contains", "value": "deny"}}},
 		}},
-	})
+	}, 1<<20)
 	p := NewWAFPlugin()
 	_ = p.Init(map[string]any{"enabled": true})
 	p.rs = map[string]*ruleSet{"a|/": rs}

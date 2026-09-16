@@ -82,6 +82,10 @@ type gzipResponseWriter struct {
 	wroteHeader  bool
 	originalSize int64
 	contentType  string
+	// contentEncoding is the Content-Encoding header set by the inner
+	// handler (i.e. already negotiated upstream). Such responses are never
+	// re-compressed to avoid double encoding.
+	contentEncoding string
 }
 
 func (p *CompressionPlugin) BeforeProxy(w http.ResponseWriter, r *http.Request, target, location string) error {
@@ -139,7 +143,7 @@ func (p *CompressionPlugin) WrapHandler(h http.Handler) http.Handler {
 			klog.Warningf("compression: failed to finalize gzip stream: %v", err)
 		}
 
-		if gzw.status != 0 && gzw.wroteHeader && p.shouldCompress(gzw.contentType, gzw.originalSize) {
+		if gzw.status != 0 && gzw.wroteHeader && gzw.contentEncoding == "" && p.shouldCompress(gzw.contentType, gzw.originalSize) {
 			w.Header().Set("Content-Encoding", "gzip")
 			w.Header().Set("Vary", "Accept-Encoding")
 			w.Header().Del("Content-Length")
@@ -167,6 +171,7 @@ func (grw *gzipResponseWriter) WriteHeader(status int) {
 	grw.status = status
 	grw.wroteHeader = true
 	grw.contentType = grw.ResponseWriter.Header().Get("Content-Type")
+	grw.contentEncoding = grw.ResponseWriter.Header().Get("Content-Encoding")
 }
 
 func (grw *gzipResponseWriter) Write(data []byte) (int, error) {

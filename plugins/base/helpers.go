@@ -27,6 +27,19 @@ func GetIntOrDefault(config map[string]any, key string, defaultVal int) int {
 	return defaultVal
 }
 
+func GetInt64(config map[string]any, key string) int64 {
+	if v, ok := config[key].(int64); ok {
+		return v
+	}
+	if v, ok := config[key].(float64); ok {
+		return int64(v)
+	}
+	if v, ok := config[key].(int); ok {
+		return int64(v)
+	}
+	return 0
+}
+
 func GetString(config map[string]any, key string) string {
 	if v, ok := config[key].(string); ok {
 		return v

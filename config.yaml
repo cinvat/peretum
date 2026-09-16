@@ -4,10 +4,8 @@
 # Flags per entry: ssl, h2c, h2/http2, h3/http3/quic (h3 implies ssl).
 # `listen: ":8081"` above is ignored while the list below is active.
 listeners:
-  - ":8080"
-  - ":443 ssl h2"
-  - ":443 h3"
-  - ":8443 ssl h3"
+  - ":80"
+  - ":443 ssl h2 h3"
 # If you prefer the single-address form, comment out `listeners` and use:
 # listen: ":8081"
 # http3_addr: ":8443"          # HTTP/3 (QUIC/UDP) frontend; required for TLS
@@ -48,7 +46,7 @@ error_page:
   enabled: true
 
 waf:
-  enabled: true
+  enabled: false
   # GeoLite databases are general: one shared directory for every location.
   # http://geolite.maxmind.com/download/geoip/database/GeoLite2-Country.tar.gz
   # http://geolite.maxmind.com/download/geoip/database/GeoLite2-ASN.tar.gz

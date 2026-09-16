@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"compress/gzip"
 	"errors"
 	"fmt"
 	"io"
@@ -149,6 +150,8 @@ type fixture struct {
 	targetHost  string
 	location    *config.LocationConfig
 	upstreamURL string
+	upstreams   []config.UpstreamConfig
+	lbAlgorithm string
 	maxSize     int64
 	bodyLimit   int64
 	semCap      int
@@ -192,15 +195,24 @@ func setupHandler(t *testing.T, f fixture) (*TargetHandler, *disk.DiskCache) {
 	if f.targetHost != "" {
 		target.Host = f.targetHost
 	}
-	if f.upstreamURL != "" {
+	if len(f.upstreams) > 0 {
+		target.Upstreams = f.upstreams
+	} else if f.upstreamURL != "" {
 		target.Upstreams = []config.UpstreamConfig{{URL: f.upstreamURL}}
 	}
 	var lb loadbalancer.LoadBalancer
-	if f.upstreamURL != "" {
-		lb = loadbalancer.New("", []*loadbalancer.Upstream{{URL: f.upstreamURL, Weight: 1}})
-	} else {
-		lb = loadbalancer.New("", nil)
+	lbUpstreams := make([]*loadbalancer.Upstream, 0, len(target.Upstreams))
+	for _, uc := range target.Upstreams {
+		if uc.URL == "" {
+			continue
+		}
+		weight := uc.Weight
+		if weight == 0 {
+			weight = 1
+		}
+		lbUpstreams = append(lbUpstreams, &loadbalancer.Upstream{URL: uc.URL, Weight: weight})
 	}
+	lb = loadbalancer.New(f.lbAlgorithm, lbUpstreams)
 
 	if f.direct {
 		return &TargetHandler{
@@ -234,6 +246,111 @@ func TestServeHTTP_PlainProxy(t *testing.T) {
 	}
 	if state.hits != 1 {
 		t.Errorf("upstream hits=%d", state.hits)
+	}
+}
+
+// TestServeHTTP_RoundRobinAlternates guards against the LB pick being ignored:
+// the reverse proxy's Rewrite pinned the outgoing URL to the first upstream,
+// so every request went to upstream[0] regardless of round-robin selection.
+func TestServeHTTP_RoundRobinAlternates(t *testing.T) {
+	upA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "UPSTREAM-A:"+r.URL.Path)
+	}))
+	t.Cleanup(upA.Close)
+	upB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "UPSTREAM-B:"+r.URL.Path)
+	}))
+	t.Cleanup(upB.Close)
+
+	th, _ := setupHandler(t, fixture{
+		upstreams:   []config.UpstreamConfig{{URL: upA.URL}, {URL: upB.URL}},
+		lbAlgorithm: "round_robin",
+		location:    &config.LocationConfig{Path: "/"},
+	})
+
+	want := []string{"UPSTREAM-A:", "UPSTREAM-B:"}
+	for i := 0; i < 4; i++ {
+		rec := doRequest(th, "GET", fmt.Sprintf("http://example.com/alt%d", i))
+		if rec.Code != 200 {
+			t.Fatalf("req %d: code=%d", i, rec.Code)
+		}
+		if body := rec.Body.String(); !strings.HasPrefix(body, want[i%2]) {
+			t.Errorf("req %d: body=%q, want prefix %q", i, body, want[i%2])
+		}
+	}
+}
+
+// TestServeHTTP_PinnedUpstream serves through a location-pinned upstream,
+// bypassing the load balancer entirely.
+func TestServeHTTP_PinnedUpstream(t *testing.T) {
+	pinned := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "PINNED:"+r.URL.Path)
+	}))
+	t.Cleanup(pinned.Close)
+	unused := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "UNUSED")
+	}))
+	t.Cleanup(unused.Close)
+
+	th, _ := setupHandler(t, fixture{
+		upstreams: []config.UpstreamConfig{{URL: unused.URL}},
+		location:  &config.LocationConfig{Path: "/", Proxy: &config.ProxyLocationConfig{Upstream: pinned.URL}},
+	})
+
+	rec := doRequest(th, "GET", "http://example.com/path")
+	if rec.Code != 200 {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	if body := rec.Body.String(); body != "PINNED:/path" {
+		t.Errorf("body=%q", body)
+	}
+}
+
+// quirkUpstream mirrors example.com behind Cloudflare: it gzip-compresses the
+// response whenever the request advertises gzip but omits the Content-Encoding
+// header, and serves plain HTML otherwise.
+func quirkUpstream(t *testing.T) (upURL string, sawAE *bool, recBody *string) {
+	t.Helper()
+	var mu sync.Mutex
+	sawAE = new(bool)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		*sawAE = r.Header.Get("Accept-Encoding") != ""
+		mu.Unlock()
+		body := "<html><body>upstream-clean</body></html>"
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			var buf bytes.Buffer
+			gz := gzip.NewWriter(&buf)
+			_, _ = gz.Write([]byte(body))
+			_ = gz.Close()
+			w.Header().Set("Content-Type", "text/html")
+			// Deliberately no Content-Encoding header.
+			_, _ = w.Write(buf.Bytes())
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL, sawAE, recBody
+}
+
+func TestServeHTTP_UpstreamGzipWithoutContentEncoding(t *testing.T) {
+	upURL, sawAE, _ := quirkUpstream(t)
+	th, _ := setupHandler(t, fixture{upstreamURL: upURL})
+
+	rec := doRequest(th, "GET", "http://example.com/hello")
+	// The proxied upstream request must not advertise gzip (the Rewrite
+	// strips Accept-Encoding and the transport must not re-add it), otherwise
+	// the Cloudflare-style gzip-without-header response is buffered raw.
+	if *sawAE {
+		t.Errorf("upstream saw an advertised Accept-Encoding")
+	}
+	if rec.Code != 200 {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	if got := rec.Body.String(); got != "<html><body>upstream-clean</body></html>" {
+		t.Fatalf("body=%q want clean upstream HTML", got)
 	}
 }
 
@@ -861,6 +978,74 @@ func TestServeHTTP_RequestHeaders(t *testing.T) {
 	}
 }
 
+func TestServeHTTP_SanitizesUpstreamHeaders(t *testing.T) {
+	// The upstream dresses its response like a CDN (Cloudflare-style).
+	upURL, _ := leakyUpstream(t)
+	th, _ := setupHandler(t, fixture{upstreamURL: upURL})
+
+	rec := doRequest(th, "GET", "http://example.com/leaky")
+	if rec.Header().Get("Server") != "peretum" {
+		t.Errorf("Server=%q, want peretum", rec.Header().Get("Server"))
+	}
+	for _, leak := range []string{"Cf-Ray", "Cf-Cache-Status", "Age", "X-Powered-By", "X-Cache-Hits", "Via"} {
+		if v := rec.Header().Get(leak); v != "" {
+			t.Errorf("upstream leak header %s=%q should be stripped", leak, v)
+		}
+	}
+	if got := rec.Header().Get("X-Cache"); got != "MISS" {
+		t.Errorf("live X-Cache=%q, want MISS (upstream X-Cache value replaced)", got)
+	}
+}
+
+func TestServeHTTP_CacheHitHidesUpstreamHeaders(t *testing.T) {
+	upURL, _ := leakyUpstream(t)
+	th, _ := setupHandler(t, fixture{
+		upstreamURL: upURL,
+		location:    &config.LocationConfig{Path: "/", Cache: true},
+	})
+
+	// Miss populates the cache, hit serves from it. Neither may leak the
+	// upstream CDN headers.
+	doRequest(th, "GET", "http://example.com/leaky")
+	rec := doRequest(th, "GET", "http://example.com/leaky")
+
+	if rec.Header().Get("X-Cache") != "HIT" {
+		t.Errorf("X-Cache=%q, want HIT", rec.Header().Get("X-Cache"))
+	}
+	if rec.Header().Get("Server") != "peretum" {
+		t.Errorf("Server=%q, want peretum", rec.Header().Get("Server"))
+	}
+	for _, leak := range []string{"Cf-Ray", "Cf-Cache-Status", "Age", "X-Powered-By", "X-Cache-Hits"} {
+		if v := rec.Header().Get(leak); v != "" {
+			t.Errorf("cache hit leaked %s=%q", leak, v)
+		}
+	}
+}
+
+// leakyUpstream mirrors a CDN-fronted origin that leaks its identity in
+// response headers.
+func leakyUpstream(t *testing.T) (string, *upstreamState) {
+	t.Helper()
+	state := &upstreamState{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		state.mu.Lock()
+		state.hits++
+		state.mu.Unlock()
+		w.Header().Set("Server", "cloudflare")
+		w.Header().Set("Cf-Ray", "a3c6b6676d077104-AMS")
+		w.Header().Set("Cf-Cache-Status", "HIT")
+		w.Header().Set("Age", "14098")
+		w.Header().Set("X-Powered-By", "PHP/8.2")
+		w.Header().Set("X-Cache", "HIT")
+		w.Header().Set("X-Cache-Hits", "3")
+		w.Header().Set("Via", "1.1 CloudFront")
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<html>clean</html>"))
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL, state
+}
+
 func TestServeHTTP_RequestHeaders_AddNil(t *testing.T) {
 	upURL, state := newUpstream(t)
 	th, _ := setupHandler(t, fixture{
@@ -1172,6 +1357,47 @@ func TestServeHTTP_LoggerNotFound(t *testing.T) {
 
 // --- helpers / misc -------------------------------------------------------
 
+func TestCapturingTransport_SetsContentLengthForChunkedUpstream(t *testing.T) {
+	// The upstream streams a chunked (unknown-length) response. Because the
+	// capturing transport buffers the whole body, it must report the real
+	// ContentLength; otherwise httputil.ReverseProxy treats the response as
+	// unbounded and flushes after every write, which can emit response
+	// headers before the compression plugin sets Content-Encoding.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		_, _ = w.Write([]byte(strings.Repeat("<div>line</div>\n", 100)))
+	}))
+	defer upstream.Close()
+
+	lb := loadbalancer.New("", []*loadbalancer.Upstream{{URL: upstream.URL, Weight: 1}})
+	ct := &capturingTransport{transport: http.DefaultTransport, lb: lb}
+	req, err := http.NewRequest("GET", "http://example.com/test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := ct.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ct.body) == 0 {
+		t.Fatal("expected a buffered body")
+	}
+	if resp.ContentLength != int64(len(ct.body)) {
+		t.Errorf("ContentLength=%d, want %d (fully buffered upstream body)", resp.ContentLength, len(ct.body))
+	}
+
+	// Buffered body must be readable back from the replaced response body.
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, ct.body) {
+		t.Error("response body does not match buffered body")
+	}
+}
+
 func TestGetUpstreamURL(t *testing.T) {
 	t.Run("proxy override", func(t *testing.T) {
 		th, _ := setupHandler(t, fixture{
@@ -1423,18 +1649,23 @@ func TestGRPCTransport_RoundTrip(t *testing.T) {
 	}
 
 	// Recovery over a real h2c backend: the body is streamed untouched and
-	// the upstream is marked healthy again.
+	// the upstream is marked healthy again. With LB-authoritative routing the
+	// transport re-points the request at the selected upstream, so the live
+	// LB entry must be the h2c backend.
 	echo := newH2CUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/grpc")
 		w.WriteHeader(200)
 		_, _ = w.Write([]byte("stream"))
 	}))
-	req2, _ := http.NewRequest("POST", echo+"/pkg.Svc/Foo", nil)
-	resp, err := gt.RoundTrip(req2)
+	upLive := &loadbalancer.Upstream{URL: echo}
+	lbLive := loadbalancer.New("", []*loadbalancer.Upstream{upLive})
+	gtLive := &grpcTransport{lb: lbLive}
+	req2, _ := http.NewRequest("POST", "http://placeholder.invalid/pkg.Svc/Foo", nil)
+	resp, err := gtLive.RoundTrip(req2)
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
-	if !up.Healthy.Load() {
+	if !upLive.Healthy.Load() {
 		t.Fatal("upstream should be healthy after success")
 	}
 	body, _ := io.ReadAll(resp.Body)

@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -177,9 +178,17 @@ func TestBuildTLSConfig(t *testing.T) {
 	if tc.MinVersion != tls.VersionTLS12 {
 		t.Fatalf("MinVersion = %d", tc.MinVersion)
 	}
+	if !slices.Contains(tc.NextProtos, "h2") || !slices.Contains(tc.NextProtos, "http/1.1") {
+		t.Fatalf("base NextProtos = %v, want h2 + http/1.1", tc.NextProtos)
+	}
 	got, err := tc.GetConfigForClient(nil)
 	if err != nil || got == nil {
 		t.Fatalf("GetConfigForClient = %v, %v", got, err)
+	}
+	// The per-handshake config replaces the base config, so it must repeat
+	// the ALPN list: otherwise h2 is never negotiated over TLS.
+	if !slices.Contains(got.NextProtos, "h2") || !slices.Contains(got.NextProtos, "http/1.1") {
+		t.Fatalf("GetConfigForClient NextProtos = %v, want h2 + http/1.1", got.NextProtos)
 	}
 }
 

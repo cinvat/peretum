@@ -93,9 +93,17 @@ type TargetTLSConfig struct {
 }
 
 type UpstreamConfig struct {
-	URL         string `yaml:"url"`
-	Weight      int    `yaml:"weight"`
-	HealthCheck string `yaml:"health_check"`
+	URL         string             `yaml:"url"`
+	Weight      int                `yaml:"weight"`
+	HealthCheck *HealthCheckConfig `yaml:"health_check"`
+}
+
+type HealthCheckConfig struct {
+	Path           string            `yaml:"path"`
+	Interval       string            `yaml:"interval"`        // e.g., "10s"
+	Timeout        string            `yaml:"timeout"`         // e.g., "3s"
+	ExpectedStatus int               `yaml:"expected_status"` // default 200
+	Headers        map[string]string `yaml:"headers"`         // custom headers
 }
 
 type LocationConfig struct {

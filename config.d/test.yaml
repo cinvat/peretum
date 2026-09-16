@@ -1,16 +1,16 @@
 # Test Target for novin.cloud
 name: "test"
-listen: "test.test"
-host: "test.test"
+listen: "example1.com"
+host: "example.com"
 lb_algorithm: "round_robin"
 upstreams:
-  - url: "http://127.0.0.1:8082"
+  - url: "http://example.com"
     weight: 1
 locations:
   - path: "/"
     match_type: "prefix"
     cache: true
-    cache_ttl: "5s"
+    cache_ttl: "20s"
     cors:
       enabled: true
       allow_origins: ["*"]
@@ -46,7 +46,7 @@ locations:
         - "text/css"
         - "application/javascript"
     waf:
-      enabled: true
+      enabled: false
       rules:
         # Localhost always passes — replaces the former ip_whitelist.
         - id: "allow-localhost"
