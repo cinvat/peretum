@@ -32,6 +32,10 @@ locations:
     match_type: "prefix"
     cache: true
     cache_ttl: "1h"
+    cache_excludes:
+      - ".m3u8"
+      - ".ts"
+      - "/live/"
     ...
 ```
 
@@ -90,6 +94,7 @@ A location is matched by `path` (first match wins, ordered by priority):
 | `match_type` | string | `prefix` (default), `exact`, `regex`. |
 | `cache` | bool | Enable the disk cache for this location. |
 | `cache_ttl` | duration | Overrides `max_cache_age` for entries of this location. |
+| `cache_excludes` | []string | Paths/extensions to bypass cache (e.g., `.m3u8`, `.ts`, `/live/`). Sets `Cache-Control: no-store` and skips cache lookup/write. |
 | `proxy` | object | `websocket`, `pass_host_header`, `upstream` (override), timeouts, `buffering`, `buffer_size`. |
 | `cors`, `headers`, `rewrite`, `optimize`, `compression`, `waf` | object | See [Plugins](../plugins/index.md). |
 
@@ -107,3 +112,63 @@ A location is matched by `path` (first match wins, ordered by priority):
 All algorithms skip unhealthy upstreams. Upstreams are marked **unhealthy** on
 transport errors and **healthy** again on successful reads; when every upstream
 is unhealthy the least-recently-checked one is probed.
+
+## Active Health Checks
+
+Enable per-upstream HTTP health checks to proactively probe and recover failed
+upstreams:
+
+```yaml
+upstreams:
+  - url: "http://backend1:8080"
+    weight: 1
+    health_check:
+      path: "/healthz"          # required to enable
+      interval: "30s"           # default 10s
+      timeout: "5s"             # default 3s
+      expected_status: 200      # default 200
+      headers:
+        X-Custom-Probe: "true"
+```
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `path` | string | — | HTTP path to probe (required). |
+| `interval` | duration | `10s` | How often to probe unhealthy upstreams. |
+| `timeout` | duration | `3s` | Maximum time to wait for probe response. |
+| `expected_status` | int | `200` | Expected HTTP status code. |
+| `headers` | map[string]string | — | Additional headers to send with probe. |
+
+Active checks run in the background; recovered upstreams are automatically
+marked healthy and re-enter the load balancer rotation.
+
+## Cache Excludes (Live Streaming)
+
+For HLS/DASH live streaming, certain paths (manifests, segments) must not be
+cached. Use `cache_excludes` on a location:
+
+```yaml
+locations:
+  - path: "/"
+    match_type: "prefix"
+    cache: true
+    cache_ttl: "5s"
+    cache_excludes:
+      - ".m3u8"      # HLS playlists
+      - ".ts"        # HLS segments
+      - "/live/"     # path prefix
+```
+
+Behavior for excluded paths:
+1. **Cache bypassed** — no cache lookup, no cache write, no request coalescing.
+2. **No-cache headers sent to browser:**
+   ```
+   Cache-Control: no-store, no-cache, must-revalidate, max-age=0
+   Pragma: no-cache
+   Expires: 0
+   ```
+
+Pattern matching:
+- `.m3u8` — matches any path ending with `.m3u8` (extension).
+- `/live/` — matches any path starting with `/live/` (prefix).
+- `/exact/path` — exact match.
