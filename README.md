@@ -34,7 +34,7 @@
 go run .
 ```
 
-Serves on `:8081` by default using `config.yaml` and `config.d/`.
+Serves using `config.yaml` and `config.d/*.yaml`.
 
 ```bash
 peretum          # run (writes pid file)
