@@ -932,7 +932,7 @@ func TestRunServeTLS(t *testing.T) {
 	}
 	writeFile(t, filepath.Join(targetsDir, "t.yaml"),
 		fmt.Sprintf("name: tg\nupstreams:\n  - url: %s\nlocations:\n  - path: /\n", up.URL))
-	cfg := runConfigYAML(fmt.Sprintf("127.0.0.1:%d", port), filepath.Join(dir, "cache"), false)
+	cfg := runConfigYAML(fmt.Sprintf("127.0.0.1:%d ssl", port), filepath.Join(dir, "cache"), false)
 	cfg += fmt.Sprintf("tls_cert_file: %s\ntls_key_file: %s\n", cert, key)
 	writeFile(t, cfgPath, cfg)
 

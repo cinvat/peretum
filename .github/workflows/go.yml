@@ -1,0 +1,49 @@
+name: Go
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: Run gofmt
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "gofmt failed on:"
+            gofmt -l .
+            exit 1
+          fi
+      - name: Run go vet
+        run: go vet ./...
+      - name: Build
+        run: go build ./...
+      - name: Test with race detector
+        run: go test ./... -race -count=1
+      - name: Check 100% coverage
+        run: |
+          go test ./... -coverprofile=coverage.out
+          # Check each package has 100% coverage
+          while read -r line; do
+            pkg=$(echo "$line" | awk '{print $1}')
+            cov=$(echo "$line" | awk '{print $3}' | sed 's/%//')
+            if [ "$pkg" != "total:" ] && [ -n "$cov" ]; then
+              if [ "$cov" != "100.0" ]; then
+                echo "FAIL: $pkg coverage $cov% < 100%"
+                exit 1
+              fi
+            fi
+          done < <(go tool cover -func=coverage.out | tail -n +2)
+          echo "All packages 100% coverage"
