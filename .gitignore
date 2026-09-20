@@ -6,3 +6,4 @@ coverage.out
 docs/.retype/
 docs/retype.manifest
 *.pid
+node_modules/
