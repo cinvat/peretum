@@ -1,0 +1,25 @@
+# Static Assets Target Configuration
+name: "static"
+listen: "cdn.example.com"
+lb_algorithm: "weighted_rr"
+upstreams:
+  - url: "https://cdn1.example.com"
+    weight: 2
+  - url: "https://cdn2.example.com"
+    weight: 1
+locations:
+  - path: "/static/"
+    match_type: "prefix"
+    cache: true
+    cache_ttl: "168h"
+  - path: "/assets/"
+    match_type: "prefix"
+    cache: true
+    cache_ttl: "720h"
+  - path: "/favicon.ico"
+    match_type: "exact"
+    cache: true
+    cache_ttl: "24h"
+  - path: "/"
+    match_type: "prefix"
+    cache: false

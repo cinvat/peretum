@@ -1,0 +1,8 @@
+/cache
+.DS_STORE
+coverage.out
+/logs
+*.png
+docs/.retype/
+docs/retype.manifest
+*.pid
