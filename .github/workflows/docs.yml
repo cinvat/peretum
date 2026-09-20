@@ -7,6 +7,8 @@ on:
       - 'docs/**'
       - '.github/workflows/docs.yml'
       - 'retype.yml'
+      - 'package.json'
+      - 'package-lock.json'
   workflow_dispatch:
 
 permissions:
@@ -22,12 +24,12 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           cache: 'npm'
-      - name: Install Retype
-        run: npm install -g retypeapp
+      - name: Install dependencies
+        run: npm ci
       - name: Build
-        run: retype build docs
+        run: npm run build
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:

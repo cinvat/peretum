@@ -1,0 +1,11 @@
+{
+  "name": "peretum-docs",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "retype build docs"
+  },
+  "devDependencies": {
+    "retypeapp": "latest"
+  }
+}
