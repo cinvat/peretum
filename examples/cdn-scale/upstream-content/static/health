@@ -1,0 +1,1 @@
+{"status": "healthy", "server": "upstream-static", "region": "global", "timestamp": "{{.Now}}"}

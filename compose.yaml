@@ -1,0 +1,14 @@
+services:
+  peretum:
+    build: .
+    ports:
+    - 80:80/tcp
+    - 443:443/tcp
+    - 443:443/udp
+    volumes:
+    - ./cache:/cache
+    - ./config.yaml:/config.yaml
+    - ./config.d:/config.d
+    - ./logs:/var/log/peretum
+    - ./geolitedb:/geolitedb
+    - /etc/letsencrypt:/etc/letsencrypt

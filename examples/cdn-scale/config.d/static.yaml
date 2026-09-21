@@ -1,0 +1,59 @@
+name: "static"
+listen: "static.local"
+host: "static.example.com"
+lb_algorithm: "round_robin"
+upstreams:
+  - url: "http://upstream-static:80"
+    weight: 1
+    health_check:
+      path: "/health"
+      interval: "10s"
+      timeout: "3s"
+      expected_status: 200
+locations:
+  - path: "/"
+    match_type: "prefix"
+    cache: true
+    cache_ttl: "1h"
+    cache_excludes:
+      - ".m3u8"
+      - ".ts"
+      - "/live/"
+    cors:
+      enabled: true
+      allow_origins: ["*"]
+      allow_methods: ["GET", "HEAD", "OPTIONS"]
+      allow_credentials: false
+      max_age: 86400
+    headers:
+      request_add:
+        X-Proxy: "peretum"
+      response_add:
+        X-Cache-Status: "enabled"
+        Cache-Control: "public, max-age=3600"
+    proxy:
+      pass_host_header: false
+      websocket: false
+      connect_timeout: "5s"
+      read_timeout: "30s"
+      send_timeout: "30s"
+  - path: "/live/"
+    match_type: "prefix"
+    cache: false
+    cors:
+      enabled: true
+      allow_origins: ["*"]
+      allow_methods: ["GET", "HEAD", "OPTIONS"]
+    headers:
+      request_add:
+        X-Proxy: "peretum"
+      response_add:
+        Cache-Control: "no-store, no-cache, must-revalidate, max-age=0"
+        Pragma: "no-cache"
+        Expires: "0"
+    proxy:
+      pass_host_header: false
+      websocket: false
+      connect_timeout: "5s"
+      read_timeout: "30s"
+      send_timeout: "30s"

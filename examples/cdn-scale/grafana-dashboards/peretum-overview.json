@@ -1,0 +1,328 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 80}
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "id": 1,
+      "options": {
+        "legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom"},
+        "tooltip": {"mode": "single"}
+      },
+      "targets": [
+        {
+          "expr": "peretum_requests_cached_total / peretum_requests_total * 100",
+          "legendFormat": "Cache Hit Rate %",
+          "refId": "A"
+        }
+      ],
+      "title": "Cache Hit Rate",
+      "type": "gauge"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 100},
+              {"color": "red", "value": 500}
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "id": 2,
+      "options": {
+        "legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom"},
+        "tooltip": {"mode": "single"}
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(peretum_request_latency_bucket[5m])) / 1000000",
+          "legendFormat": "P95 Latency (ms)",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(peretum_request_latency_bucket[5m])) / 1000000",
+          "legendFormat": "P99 Latency (ms)",
+          "refId": "B"
+        }
+      ],
+      "title": "Request Latency (P95/P99)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null}
+            ]
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "id": 3,
+      "options": {
+        "legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom"},
+        "tooltip": {"mode": "single"}
+      },
+      "targets": [
+        {
+          "expr": "rate(peretum_requests_total[1m])",
+          "legendFormat": "{{node_id}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Requests per Second",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "id": 4,
+      "options": {
+        "legend": {"calcs": ["last"], "displayMode": "table", "placement": "bottom"},
+        "tooltip": {"mode": "single"}
+      },
+      "targets": [
+        {
+          "expr": "peretum_cache_hot_hits_total / (peretum_cache_hot_hits_total + peretum_cache_hot_misses_total) * 100",
+          "legendFormat": "Hot Tier Hit Rate %",
+          "refId": "A"
+        },
+        {
+          "expr": "peretum_cache_warm_hits_total / (peretum_cache_warm_hits_total + peretum_cache_warm_misses_total) * 100",
+          "legendFormat": "Warm Tier Hit Rate %",
+          "refId": "B"
+        }
+      ],
+      "title": "Cache Tier Hit Rates",
+      "type": "gauge"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 10},
+              {"color": "red", "value": 50}
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "id": 5,
+      "options": {
+        "legend": {"calcs": ["last"], "displayMode": "table", "placement": "bottom"},
+        "tooltip": {"mode": "single"}
+      },
+      "targets": [
+        {
+          "expr": "rate(peretum_reload_total[5m])",
+          "legendFormat": "Total Reloads/min",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(peretum_delta_reloads_total[5m])",
+          "legendFormat": "Delta Reloads/min",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(peretum_full_reloads_total[5m])",
+          "legendFormat": "Full Reloads/min",
+          "refId": "C"
+        }
+      ],
+      "title": "Config Reloads",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 5}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "id": 6,
+      "options": {
+        "legend": {"calcs": ["last"], "displayMode": "table", "placement": "bottom"},
+        "tooltip": {"mode": "single"}
+      },
+      "targets": [
+        {
+          "expr": "peretum_stream_connects_total",
+          "legendFormat": "Connects",
+          "refId": "A"
+        },
+        {
+          "expr": "peretum_stream_disconnects_total",
+          "legendFormat": "Disconnects",
+          "refId": "B"
+        },
+        {
+          "expr": "peretum_stream_updates_total",
+          "legendFormat": "Config Updates",
+          "refId": "C"
+        },
+        {
+          "expr": "peretum_stream_errors_total",
+          "legendFormat": "Errors",
+          "refId": "D"
+        }
+      ],
+      "title": "Config Streaming",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 1000},
+              {"color": "red", "value": 5000}
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 24},
+      "id": 7,
+      "options": {
+        "legend": {"calcs": ["last"], "displayMode": "table", "placement": "bottom"},
+        "tooltip": {"mode": "single"}
+      },
+      "targets": [
+        {
+          "expr": "peretum_targets_loaded_total",
+          "legendFormat": "Targets Loaded",
+          "refId": "A"
+        },
+        {
+          "expr": "peretum_targets_changed_total",
+          "legendFormat": "Targets Changed",
+          "refId": "B"
+        },
+        {
+          "expr": "peretum_targets_deleted_total",
+          "legendFormat": "Targets Deleted",
+          "refId": "C"
+        },
+        {
+          "expr": "peretum_evictions_total",
+          "legendFormat": "Cache Evictions",
+          "refId": "D"
+        }
+      ],
+      "title": "Target & Cache Stats",
+      "type": "stat"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["peretum", "cdn", "proxy"],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Peretum CDN Overview",
+  "uid": "peretum-overview",
+  "version": 1,
+  "weekStart": ""
+}

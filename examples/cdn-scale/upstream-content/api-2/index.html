@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Upstream API 2</title>
+    <style>
+        body { font-family: monospace; padding: 20px; background: #f5f5f5; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .header { background: #27ae60; color: white; padding: 15px; border-radius: 4px; margin-bottom: 20px; }
+        .info { background: #ecf0f1; padding: 15px; border-radius: 4px; margin: 10px 0; }
+        .endpoint { background: #e8f6f3; padding: 10px; border-radius: 4px; margin: 5px 0; font-family: monospace; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Upstream API 2</h1>
+            <p>Secondary API Origin Server</p>
+        </div>
+        <div class="info">
+            <h3>Server Info</h3>
+            <p><strong>Hostname:</strong> upstream-api-2</p>
+            <p><strong>Region:</strong> US West</p>
+            <p><strong>Weight:</strong> 1 (Secondary)</p>
+        </div>
+        <div class="info">
+            <h3>Endpoints</h3>
+            <div class="endpoint">GET /health - Health check</div>
+            <div class="endpoint">GET /api/users - List users</div>
+            <div class="endpoint">GET /api/users/{id} - Get user</div>
+            <div class="endpoint">POST /api/users - Create user</div>
+            <div class="endpoint">GET /api/products - List products</div>
+        </div>
+    </div>
+</body>
+</html>

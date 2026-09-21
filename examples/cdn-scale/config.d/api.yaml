@@ -1,0 +1,75 @@
+name: "api"
+listen: "api.local"
+host: "api.example.com"
+lb_algorithm: "round_robin"
+upstreams:
+  - url: "http://upstream-api-1:80"
+    weight: 2
+    health_check:
+      path: "/health"
+      interval: "10s"
+      timeout: "3s"
+      expected_status: 200
+  - url: "http://upstream-api-2:80"
+    weight: 1
+    health_check:
+      path: "/health"
+      interval: "10s"
+      timeout: "3s"
+      expected_status: 200
+locations:
+  - path: "/api/"
+    match_type: "prefix"
+    cache: true
+    cache_ttl: "5m"
+    cors:
+      enabled: true
+      allow_origins: ["*"]
+      allow_methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+      allow_headers: ["*"]
+      allow_credentials: true
+      max_age: 3600
+    headers:
+      request_add:
+        X-Proxy: "peretum"
+        X-Edge: "${CDN_EDGE_NODE}"
+      response_add:
+        X-Cache-Status: "enabled"
+        Alt-Svc: 'h3=":8443"; ma=86400'
+    proxy:
+      pass_host_header: true
+      websocket: true
+      connect_timeout: "5s"
+      read_timeout: "30s"
+      send_timeout: "30s"
+    waf:
+      enabled: true
+      rules:
+        - id: "sql-injection"
+          name: "Block SQL injection"
+          enabled: true
+          action:
+            type: "deny"
+            code: 403
+            message: "SQL injection attempt blocked"
+          conditions:
+            - - param: "body"
+                operator: "contains"
+                value: "union select"
+            - - param: "query"
+                operator: "matches"
+                value: "union.*select"
+        - id: "xss-protection"
+          name: "Block XSS attempts"
+          enabled: true
+          action:
+            type: "deny"
+            code: 403
+            message: "XSS attempt blocked"
+          conditions:
+            - - param: "body"
+                operator: "contains"
+                value: "<script"
+            - - param: "query"
+                operator: "contains"
+                value: "alert("

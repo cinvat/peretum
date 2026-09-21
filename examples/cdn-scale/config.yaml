@@ -1,0 +1,40 @@
+# Global proxy configuration for CDN scale demo
+# multi-listener frontends
+listeners:
+  - ":8080"            # plaintext; HTTP/1.1 + h2c
+  - ":8443 ssl quic"   # HTTPS + HTTP/3 on the same port (QUIC)
+
+cache_dir: "/cache"
+max_cache_size: "100MB"
+max_cache_age: "1h"
+max_write_workers: 4
+max_response_body_size: "10MB"
+
+# TLS certificates (auto-generated self-signed if not provided)
+# tls_cert_file: "./certs/server.crt"
+# tls_key_file: "./certs/server.key"
+
+metrics_addr: ":9090"
+
+json_log:
+  enabled: true
+  access_log: "/dev/stdout"
+  error_log: "/dev/stderr"
+  stdout: true
+
+error_page:
+  enabled: true
+  statuses: [403, 404, 500, 502, 503, 504]
+
+waf:
+  enabled: true
+  geolite_dir: "/usr/share/GeoIP"
+  max_body_size: "1MB"
+
+# CDN Scale Configuration
+cdn_scale:
+  enabled: true
+  node_id: "edge-local"           # overridden by env var
+  total_nodes: 3                  # overridden by env var
+  replica_factor: 2
+  control_plane: "control-plane:9001"

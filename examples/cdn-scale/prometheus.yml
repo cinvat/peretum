@@ -1,0 +1,50 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'peretum-cdn-demo'
+    environment: 'local'
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+rule_files: []
+
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Peretum edge nodes
+  - job_name: 'peretum-edges'
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - 'edge-us-east-1:9090'
+          - 'edge-us-west-1:9090'
+          - 'edge-eu-central-1:9090'
+        labels:
+          service: 'peretum'
+          type: 'edge'
+
+  # Control plane
+  - job_name: 'control-plane'
+    static_configs:
+      - targets:
+          - 'control-plane:9001'
+        labels:
+          service: 'peretum'
+          type: 'control-plane'
+
+  # Upstream services
+  - job_name: 'upstreams'
+    static_configs:
+      - targets:
+          - 'upstream-api-1:80'
+          - 'upstream-api-2:80'
+          - 'upstream-static:80'
+        labels:
+          service: 'upstream'

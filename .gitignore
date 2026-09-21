@@ -1,4 +1,6 @@
 /cache
+/cache-*
+/controlplane-data
 .DS_STORE
 coverage.out
 /logs

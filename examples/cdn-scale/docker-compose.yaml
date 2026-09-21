@@ -1,0 +1,230 @@
+version: '3.8'
+
+services:
+  # Control plane - config distribution
+  control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile.controlplane
+    container_name: peretum-control-plane
+    ports:
+      - "9001:9001"   # gRPC
+    volumes:
+      - ./config.d:/config.d:ro
+      - ./controlplane-data:/data
+    environment:
+      - GOMAXPROCS=2
+    networks:
+      - cdn-network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Edge node 1 - US East
+  edge-us-east-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: peretum-edge-us-east-1
+    ports:
+      - "8080:8080"    # HTTP
+      - "8443:8443"    # HTTPS + HTTP/3
+      - "9090:9090"    # Prometheus metrics
+    volumes:
+      - ./config.d:/config.d:ro
+      - ./cache-us-east-1:/cache
+      - ./config.yaml:/config.yaml:ro
+    environment:
+      - GOMAXPROCS=2
+      - PERETUM_CDN_SCALE_ENABLED=true
+      - PERETUM_CDN_SCALE_NODE_ID=edge-us-east-1
+      - PERETUM_CDN_SCALE_TOTAL_NODES=3
+      - PERETUM_CDN_SCALE_REPLICA_FACTOR=2
+      - PERETUM_CDN_SCALE_CONTROL_PLANE=control-plane:9001
+    networks:
+      - cdn-network
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # Edge node 2 - US West
+  edge-us-west-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: peretum-edge-us-west-1
+    ports:
+      - "8081:8080"    # HTTP
+      - "8444:8443"    # HTTPS + HTTP/3
+      - "9091:9090"    # Prometheus metrics
+    volumes:
+      - ./config.d:/config.d:ro
+      - ./cache-us-west-1:/cache
+      - ./config.yaml:/config.yaml:ro
+    environment:
+      - GOMAXPROCS=2
+      - PERETUM_CDN_SCALE_ENABLED=true
+      - PERETUM_CDN_SCALE_NODE_ID=edge-us-west-1
+      - PERETUM_CDN_SCALE_TOTAL_NODES=3
+      - PERETUM_CDN_SCALE_REPLICA_FACTOR=2
+      - PERETUM_CDN_SCALE_CONTROL_PLANE=control-plane:9001
+    networks:
+      - cdn-network
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # Edge node 3 - EU Central
+  edge-eu-central-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: peretum-edge-eu-central-1
+    ports:
+      - "8082:8080"    # HTTP
+      - "8445:8443"    # HTTPS + HTTP/3
+      - "9092:9090"    # Prometheus metrics
+    volumes:
+      - ./config.d:/config.d:ro
+      - ./cache-eu-central-1:/cache
+      - ./config.yaml:/config.yaml:ro
+    environment:
+      - GOMAXPROCS=2
+      - PERETUM_CDN_SCALE_ENABLED=true
+      - PERETUM_CDN_SCALE_NODE_ID=edge-eu-central-1
+      - PERETUM_CDN_SCALE_TOTAL_NODES=3
+      - PERETUM_CDN_SCALE_REPLICA_FACTOR=2
+      - PERETUM_CDN_SCALE_CONTROL_PLANE=control-plane:9001
+    networks:
+      - cdn-network
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # Upstream service 1 - Origin API
+  upstream-api-1:
+    image: nginx:alpine
+    container_name: upstream-api-1
+    ports:
+      - "8001:80"
+    volumes:
+      - ./upstream-content/api-1:/usr/share/nginx/html:ro
+    networks:
+      - cdn-network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # Upstream service 2 - Origin API (different region)
+  upstream-api-2:
+    image: nginx:alpine
+    container_name: upstream-api-2
+    ports:
+      - "8002:80"
+    volumes:
+      - ./upstream-content/api-2:/usr/share/nginx/html:ro
+    networks:
+      - cdn-network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # Upstream service 3 - Static assets
+  upstream-static:
+    image: nginx:alpine
+    container_name: upstream-static
+    ports:
+      - "8003:80"
+    volumes:
+      - ./upstream-content/static:/usr/share/nginx/html:ro
+    networks:
+      - cdn-network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: peretum-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    networks:
+      - cdn-network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: peretum-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ./grafana-dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+      - ./grafana-dashboards:/etc/grafana/provisioning/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    networks:
+      - cdn-network
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  cdn-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  prometheus-data:
+  grafana-data:

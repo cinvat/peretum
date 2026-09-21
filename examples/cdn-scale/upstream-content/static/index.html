@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Static Assets</title>
+    <style>
+        body { font-family: monospace; padding: 20px; background: #f5f5f5; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .header { background: #e74c3c; color: white; padding: 15px; border-radius: 4px; margin-bottom: 20px; }
+        .info { background: #ecf0f1; padding: 15px; border-radius: 4px; margin: 10px 0; }
+        .asset { background: #fef9e7; padding: 10px; border-radius: 4px; margin: 5px 0; font-family: monospace; border-left: 4px solid #f39c12; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Static Assets CDN</h1>
+            <p>Static Content Origin Server</p>
+        </div>
+        <div class="info">
+            <h3>Server Info</h3>
+            <p><strong>Hostname:</strong> upstream-static</p>
+            <p><strong>Region:</strong> Global CDN</p>
+            <p><strong>Cache TTL:</strong> 1 hour (except live streams)</p>
+        </div>
+        <div class="info">
+            <h3>Sample Assets</h3>
+            <div class="asset">/assets/logo.png - Company logo (cached 1h)</div>
+            <div class="asset">/assets/style.css - Main stylesheet (cached 1h)</div>
+            <div class="asset">/assets/app.js - Main JavaScript (cached 1h)</div>
+            <div class="asset">/images/hero.jpg - Hero image (cached 1h)</div>
+            <div class="asset">/live/stream.m3u8 - HLS manifest (NO CACHE)</div>
+            <div class="asset">/live/segment_001.ts - HLS segment (NO CACHE)</div>
+        </div>
+    </div>
+</body>
+</html>

@@ -1,0 +1,13 @@
+# Cache directories
+cache-*
+controlplane-data
+
+# Grafana/Prometheus data
+prometheus-data
+grafana-data
+
+# Logs
+*.log
+
+# OS
+.DS_Store

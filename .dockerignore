@@ -1,0 +1,36 @@
+# Build artifacts
+peretum
+*.test
+*.out
+coverage.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+*.log.*
+
+# Cache
+.cache/
+cache/
+
+# Docker
+.docker/
+docker-compose.override.yml
+
+# Build
+bin/
+dist/
+build/
+
+# Test
+*.test
+*.prof
