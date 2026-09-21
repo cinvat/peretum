@@ -12,6 +12,7 @@ order: 800
 peretum                  # run the proxy (defaults below)
 peretum -t               # check configuration syntax and exit ('config OK')
 peretum -r               # reload the running proxy (SIGHUP to the pid file)
+peretum controlplane     # run the CDN control plane (config distribution)
 ```
 
 The default command runs the proxy with a graceful shutdown: `SIGINT` /
@@ -27,6 +28,32 @@ The default command runs the proxy with a graceful shutdown: `SIGINT` /
 | `--targets <dir>` | Directory of per-target configuration files. | `config.d` |
 | `--pid-file <path>` | Pid file written at startup and read by `--reload`. | `peretum.pid` |
 
+## Subcommands
+
+| Command | Description |
+| --- | --- |
+| `controlplane` | Run the CDN control plane (gRPC config distribution server) |
+
+### `controlplane`
+
+Starts the gRPC control plane that distributes configuration to edge nodes.
+It watches the config directory for changes and streams delta updates to connected edge nodes.
+
+```bash
+peretum controlplane [flags]
+```
+
+| Flag | Description | Default |
+| --- | --- | --- |
+| `--listen` | gRPC listen address | `:9001` |
+| `--config-dir` | Directory of target config files to watch | `config.d` |
+| `--data-dir` | Directory for persistent data (snapshots, state) | `./controlplane-data` |
+
+Example:
+```bash
+peretum controlplane --listen :9001 --config-dir config.d --data-dir ./controlplane-data
+```
+
 ## `--test` (config check)
 
 `checkConfig` validates, without binding ports:
@@ -38,6 +65,7 @@ The default command runs the proxy with a graceful shutdown: `SIGINT` /
   `ssl` + `h2c`);
 - every target's upstream URLs;
 - every per-location `cache_ttl` duration.
+- CDN scale config (`cdn_scale` section) if enabled.
 
 ## `--reload` (hot reload)
 
@@ -46,6 +74,7 @@ Sending `SIGHUP` (via `peretum -r` or `kill -HUP <pid>`) to a running proxy:
 - reloads and re-validates `config.yaml` and `config.d/` — using the same
   `--config`/`--targets` paths the proxy was started with (the working
   directory is not used);
+- **delta reload**: only targets that changed are rebuilt (when CDN scale is enabled);
 - rebuilds the host/location router (targets, upstreams, locations, and the
   target `host` header override) and re-applies TLS certificates
   (`GetConfigForClient` for dynamic per-target certs);
