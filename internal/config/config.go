@@ -45,9 +45,12 @@ type ProxyConfig struct {
 	// Error page plugin: branded HTML error pages for client-facing errors.
 	ErrorPage *ErrorPageConfig `yaml:"error_page"`
 
-	// WAF plugin: global settings. GeoLite DB paths are general and shared
-	// across all per-location WAF configs.
-	WAF *WAFConfig `yaml:"waf"`
+// WAF plugin: global settings. GeoLite DB paths are general and shared
+// across all per-location WAF configs.
+WAF *WAFConfig `yaml:"waf"`
+
+// CDNScale enables CDN-scale features: sharding, delta reload, lazy loading, config streaming.
+CDNScale *CDNScaleConfig `yaml:"cdn_scale"`
 }
 
 // WAFConfig holds the global WAF plugin settings. Geo databases are common
@@ -55,6 +58,15 @@ type ProxyConfig struct {
 type WAFConfig struct {
 	Enabled    bool   `yaml:"enabled"`
 	GeoLiteDir string `yaml:"geolite_dir"`
+}
+
+// CDNScaleConfig holds CDN-scale feature configuration.
+type CDNScaleConfig struct {
+	Enabled       bool   `yaml:"enabled"`
+	NodeID        string `yaml:"node_id"`         // unique ID for this edge node
+	TotalNodes    int    `yaml:"total_nodes"`     // total number of edge nodes
+	ReplicaFactor int    `yaml:"replica_factor"`  // replication factor for sharding
+	ControlPlane  string `yaml:"control_plane"`   // gRPC control plane address for config streaming
 }
 
 type ErrorPageConfig struct {

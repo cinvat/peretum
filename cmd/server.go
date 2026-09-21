@@ -23,6 +23,7 @@ import (
 
 	disk "github.com/cinvat/peretum/internal/cache/disk"
 	"github.com/cinvat/peretum/internal/config"
+	"github.com/cinvat/peretum/internal/cdnscale"
 	"github.com/cinvat/peretum/internal/handler"
 	"github.com/cinvat/peretum/internal/loadbalancer"
 	"github.com/cinvat/peretum/internal/plugin/manager"
@@ -46,6 +47,13 @@ type proxyServer struct {
 	targets     []config.TargetConfig
 	pluginMgr   *manager.PluginManager
 
+	// CDN Scale features
+	configStore   *cdnscale.ConfigVersionStore
+	consistentHash *cdnscale.ConsistentHash
+	configStream   *cdnscale.ConfigStreamClient
+	metrics        *cdnscale.MetricsCollector
+	shardConfig    *ShardConfig
+	
 	// Health checkers for each target (keyed by target name).
 	healthCheckers map[string]*loadbalancer.HealthChecker
 
@@ -77,8 +85,17 @@ type proxyServer struct {
 	mu          sync.Mutex
 }
 
+// ShardConfig holds sharding configuration for CDN scale.
+type ShardConfig struct {
+	Enabled       bool
+	NodeID        string
+	TotalNodes    int
+	ReplicaFactor int
+	LocalNode     string
+}
+
 func newProxyServer(proxyCfg *config.ProxyConfig, targets []config.TargetConfig, diskCache *disk.DiskCache, writeSem chan struct{}, pluginMgr *manager.PluginManager, maxBodySize int64) *proxyServer {
-	return &proxyServer{
+	ps := &proxyServer{
 		router:         router.NewHostRouter(),
 		diskCache:      diskCache,
 		writeSem:       writeSem,
@@ -87,7 +104,46 @@ func newProxyServer(proxyCfg *config.ProxyConfig, targets []config.TargetConfig,
 		pluginMgr:      pluginMgr,
 		maxBodySize:    maxBodySize,
 		healthCheckers: make(map[string]*loadbalancer.HealthChecker),
+		metrics:        &cdnscale.MetricsCollector{},
 	}
+
+	// Initialize CDN scale components if enabled
+	if proxyCfg != nil && proxyCfg.CDNScale != nil && proxyCfg.CDNScale.Enabled {
+		ps.configStore = cdnscale.NewConfigVersionStore(10000)
+		ps.consistentHash = cdnscale.NewConsistentHash(150)
+		ps.metrics = &cdnscale.MetricsCollector{}
+		
+		// Initialize shard config
+		ps.shardConfig = &ShardConfig{
+			Enabled:       true,
+			NodeID:        proxyCfg.CDNScale.NodeID,
+			TotalNodes:    proxyCfg.CDNScale.TotalNodes,
+			ReplicaFactor: proxyCfg.CDNScale.ReplicaFactor,
+			LocalNode:     proxyCfg.CDNScale.NodeID,
+		}
+		
+		// Add local node to consistent hash
+		ps.consistentHash.AddNode(ps.shardConfig.LocalNode, 1)
+		
+		// Initialize config streaming if control plane is configured
+		if proxyCfg.CDNScale.ControlPlane != "" {
+			ps.configStream = cdnscale.NewConfigStreamClient(proxyCfg.CDNScale.ControlPlane)
+			ps.configStream.SetCallbacks(
+				func(update *cdnscale.GlobalConfigUpdate) {
+					klog.Infof("Received global config update from control plane: %s", update.Version)
+				},
+				func(update *cdnscale.TargetConfigUpdate) {
+					klog.Infof("Received target config update from control plane: %s", update.TargetName)
+					ps.RecordTenantReload()
+				},
+				func(targetName string) {
+					klog.Infof("Received target delete from control plane: %s", targetName)
+				},
+			)
+		}
+	}
+
+	return ps
 }
 
 func (ps *proxyServer) buildHostRouter() *router.HostRouter {
@@ -376,21 +432,64 @@ func (ps *proxyServer) reload() error {
 	return ps.reloadFrom(cfgPath, targetsDir)
 }
 
+func (ps *proxyServer) RecordTenantReload() {
+	if ps.metrics != nil {
+		ps.metrics.RecordTargetChange(true, false)
+	}
+}
+
 func (ps *proxyServer) reloadFrom(cfgPath, targetsDir string) error {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
+	startTime := time.Now()
 	klog.Info("reloading configuration...")
 
+	// Load global config
 	proxyCfg, err := config.LoadProxy(cfgPath)
 	if err != nil {
+		ps.metrics.RecordReload(false, time.Since(startTime), err)
 		return fmt.Errorf("proxy config: %w", err)
 	}
+
+	// Load targets with versioning
 	targets, err := config.LoadTargets(targetsDir)
 	if err != nil {
+		ps.metrics.RecordReload(false, time.Since(startTime), err)
 		return fmt.Errorf("targets: %w", err)
 	}
 
+	// Check if global config changed
+	globalChanged := false
+	if ps.configStore != nil {
+		globalChanged, err = ps.configStore.LoadGlobalConfig(cfgPath)
+		if err != nil {
+			ps.metrics.RecordReload(false, time.Since(startTime), err)
+			return err
+		}
+	}
+
+	// Load targets with versioning (delta reload)
+	var changedTargets []string
+	if ps.configStore != nil {
+		_, changedTargets, err = ps.configStore.LoadTargets(targetsDir)
+		if err != nil {
+			ps.metrics.RecordReload(false, time.Since(startTime), err)
+			return err
+		}
+		
+		// Record metrics
+		for _, ct := range changedTargets {
+			if strings.HasSuffix(ct, " (deleted)") {
+				ps.metrics.RecordTargetChange(false, true)
+			} else {
+				ps.metrics.RecordTargetChange(true, false)
+			}
+		}
+	}
+
+	isDelta := len(changedTargets) > 0 && !globalChanged && ps.configStore != nil
+	
 	ps.targets = targets
 	ps.proxyCfg = proxyCfg
 
@@ -426,20 +525,30 @@ func (ps *proxyServer) reloadFrom(cfgPath, targetsDir string) error {
 		}
 	}
 
-	klog.Infof("reloaded: %d targets", len(targets))
-	for _, t := range targets {
-		klog.Infof("  target: %s (lb=%s)", t.Name, t.LBAlgorithm)
-		for _, u := range t.Upstreams {
-			klog.Infof("    upstream: %s (weight=%d)", u.URL, u.Weight)
+	duration := time.Since(startTime)
+	ps.metrics.RecordReload(len(changedTargets) > 0 && !globalChanged, duration, nil)
+
+	if isDelta {
+		klog.Infof("delta reload completed in %v: %d targets changed", duration, len(changedTargets))
+		for _, ct := range changedTargets {
+			klog.Infof("  changed: %s", ct)
 		}
-		for _, loc := range t.Locations {
-			klog.Infof("    location: %s %s (cache=%v)", loc.MatchType, loc.Path, loc.Cache)
-		}
-		if t.TLS != nil && t.TLS.CertFile != "" {
-			klog.Infof("    TLS: %s", t.TLS.CertFile)
-		}
-		if t.Listen != "" {
-			klog.Infof("    host: %s", t.Listen)
+	} else {
+		klog.Infof("full reload completed in %v: %d targets", duration, len(targets))
+		for _, t := range targets {
+			klog.Infof("  target: %s (lb=%s)", t.Name, t.LBAlgorithm)
+			for _, u := range t.Upstreams {
+				klog.Infof("    upstream: %s (weight=%d)", u.URL, u.Weight)
+			}
+			for _, loc := range t.Locations {
+				klog.Infof("    location: %s %s (cache=%v)", loc.MatchType, loc.Path, loc.Cache)
+			}
+			if t.TLS != nil && t.TLS.CertFile != "" {
+				klog.Infof("    TLS: %s", t.TLS.CertFile)
+			}
+			if t.Listen != "" {
+				klog.Infof("    host: %s", t.Listen)
+			}
 		}
 	}
 
