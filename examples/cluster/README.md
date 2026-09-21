@@ -1,6 +1,6 @@
-# CDN Scale Demo
+# Cluster Demo
 
-A complete Docker Compose setup to demonstrate Peretum's CDN-scale features on a single machine.
+A complete Docker Compose setup to demonstrate Peretum's cluster mode features on a single machine.
 
 ## Architecture
 
@@ -30,7 +30,7 @@ A complete Docker Compose setup to demonstrate Peretum's CDN-scale features on a
 ## Quick Start
 
 ```bash
-cd examples/cdn-scale
+cd examples/cluster
 
 # Start the entire cluster
 docker compose up -d
@@ -60,6 +60,7 @@ docker compose logs -f edge-us-east-1
 ## Testing
 
 ### Test cache hit/miss
+
 ```bash
 # First request - MISS
 curl -I http://localhost:8080/api/users
@@ -69,6 +70,7 @@ curl -I http://localhost:8080/api/users
 ```
 
 ### Test live streaming cache bypass
+
 ```bash
 # These paths are excluded from cache (cache_excludes)
 curl -I http://localhost:8080/live/stream.m3u8
@@ -77,6 +79,7 @@ curl -I http://localhost:8080/live/segment_001.ts
 ```
 
 ### Test cache hit header
+
 ```bash
 curl -I http://localhost:8080/api/users
 # X-Cache: HIT
@@ -84,6 +87,7 @@ curl -I http://localhost:8080/api/users
 ```
 
 ### Test health checks
+
 ```bash
 # Upstream health
 curl http://localhost:8001/health
@@ -92,6 +96,7 @@ curl http://localhost:8003/health
 ```
 
 ### View metrics
+
 ```bash
 # Prometheus
 open http://localhost:9090
@@ -102,6 +107,7 @@ open http://localhost:3000
 ```
 
 ### Test control plane
+
 ```bash
 # Check connected edges
 curl -s http://localhost:9001/stats | jq
@@ -113,20 +119,26 @@ Key configuration files:
 
 | File | Description |
 |------|-------------|
-| `config.yaml` | Global proxy config with CDN scale settings |
+| `config.yaml` | Global proxy config with cluster settings |
 | `config.d/api.yaml` | API target with load balancing, WAF, cache |
 | `config.d/static.yaml` | Static assets with cache_excludes for HLS |
 | `config.d/fallback.yaml` | Fallback target (no cache) |
 
-### CDN Scale Config (config.yaml)
+### Cluster Config (config.yaml)
 
 ```yaml
-cdn_scale:
+cluster:
   enabled: true
   node_id: "edge-us-east-1"      # Unique per edge
-  total_nodes: 3                  # Cluster size
-  replica_factor: 2               # Replication
+  replica_factor: 2               # Replication factor
   control_plane: "control-plane:9001"
+```
+
+### Per-node configuration via environment variables
+
+```bash
+NODE_ID=edge-us-east-1
+CONTROL_PLANE=control-plane:9001
 ```
 
 ## Sharding Demo

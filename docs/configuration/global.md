@@ -12,6 +12,8 @@ order: 300
 listeners:
   - ":80"            # plaintext; HTTP/1.1 + h2c
   - ":443 ssl h2 h3"      # HTTPS; HTTP/1.1 + HTTP/2 via ALPN + HTTP/3 (UDP) on the same port (implies TLS)
+  - ":8443 ssl quic"     # HTTPS + HTTP/3 on the same port
+  - ":8443 h3"           # HTTP/3 (UDP) on the same port (implies TLS)
 
 cache_dir: "./cache"
 max_cache_size: "500MB"          # size string; 0 = unlimited
@@ -39,10 +41,9 @@ waf:
   geolite_dir: "./plugins/waf/geolite"       # shared by every location's WAF
   max_body_size: "1MB"                       # max request body to read for "body" param
 
-cdn_scale:
+cluster:
   enabled: true
   node_id: "edge-us-east-1"           # unique ID for this edge node
-  total_nodes: 5                      # total number of edge nodes
   replica_factor: 3                   # replication factor for sharding
   control_plane: "control-plane.example.com:9001"  # gRPC control plane address
 ```
@@ -64,7 +65,7 @@ cdn_scale:
 | `json_log` | object | See [JSON logs](../plugins/jsonlog.md). |
 | `error_page` | object | See [Error pages](../plugins/errorpage.md). |
 | `waf` | object | Global WAF settings: `enabled`, `geolite_dir`, `max_body_size` (see [WAF](../plugins/waf.md)). |
-| `cdn_scale` | object | CDN scale settings: `enabled`, `node_id`, `total_nodes`, `replica_factor`, `control_plane` (see [CDN Scale](../configuration/cdn-scale.md)). |
+| `cluster` | object | Cluster settings: `enabled`, `node_id`, `replica_factor`, `control_plane` (see [Cluster Mode](../configuration/cluster.md)). |
 
 ## Size strings
 

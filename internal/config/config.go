@@ -49,8 +49,8 @@ type ProxyConfig struct {
 // across all per-location WAF configs.
 WAF *WAFConfig `yaml:"waf"`
 
-// CDNScale enables CDN-scale features: sharding, delta reload, lazy loading, config streaming.
-CDNScale *CDNScaleConfig `yaml:"cdn_scale"`
+// Cluster enables CDN-scale features: sharding, delta reload, lazy loading, config streaming.
+Cluster *ClusterConfig `yaml:"cluster"`
 }
 
 // WAFConfig holds the global WAF plugin settings. Geo databases are common
@@ -60,8 +60,8 @@ type WAFConfig struct {
 	GeoLiteDir string `yaml:"geolite_dir"`
 }
 
-// CDNScaleConfig holds CDN-scale feature configuration.
-type CDNScaleConfig struct {
+// ClusterConfig holds CDN-scale feature configuration.
+type ClusterConfig struct {
 	Enabled       bool   `yaml:"enabled"`
 	NodeID        string `yaml:"node_id"`         // unique ID for this edge node
 	TotalNodes    int    `yaml:"total_nodes"`     // total number of edge nodes

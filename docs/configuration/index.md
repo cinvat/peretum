@@ -33,7 +33,7 @@ Peretum uses two kinds of YAML files:
 - [Global configuration (`config.yaml`)](global.md)
 - [Targets & locations (`config.d/*.yaml`)](targets.md)
 - [Listeners, TLS & HTTP/3](listeners.md)
-- [CDN Scale Features](cdn-scale.md)
+- [Cluster Mode](cluster.md)
 
 Reference tables on each page come directly from the configuration types in
 `internal/config/config.go`.

@@ -1,4 +1,4 @@
-package cdnscale
+package cluster
 
 import (
 	"sync/atomic"

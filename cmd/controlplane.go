@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cinvat/peretum/internal/cdnscale"
+	"github.com/cinvat/peretum/internal/cluster"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 )
@@ -38,7 +38,7 @@ It watches the config directory for changes and streams updates to connected edg
 
 func runControlPlane(ctx context.Context, listenAddr, configDir, dataDir string) error {
 	// Create control plane server
-	cp := cdnscale.NewControlPlaneServer(configDir, dataDir)
+	cp := cluster.NewControlPlaneServer(configDir, dataDir)
 	
 	// Create gRPC server
 	grpcServer := grpc.NewServer()

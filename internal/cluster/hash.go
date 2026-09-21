@@ -1,4 +1,4 @@
-package cdnscale
+package cluster
 
 import (
 	"hash/crc32"

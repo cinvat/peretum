@@ -23,7 +23,7 @@ import (
 
 	disk "github.com/cinvat/peretum/internal/cache/disk"
 	"github.com/cinvat/peretum/internal/config"
-	"github.com/cinvat/peretum/internal/cdnscale"
+	"github.com/cinvat/peretum/internal/cluster"
 	"github.com/cinvat/peretum/internal/handler"
 	"github.com/cinvat/peretum/internal/loadbalancer"
 	"github.com/cinvat/peretum/internal/plugin/manager"
@@ -48,10 +48,10 @@ type proxyServer struct {
 	pluginMgr   *manager.PluginManager
 
 	// CDN Scale features
-	configStore   *cdnscale.ConfigVersionStore
-	consistentHash *cdnscale.ConsistentHash
-	configStream   *cdnscale.ConfigStreamClient
-	metrics        *cdnscale.MetricsCollector
+	configStore   *cluster.ConfigVersionStore
+	consistentHash *cluster.ConsistentHash
+	configStream   *cluster.ConfigStreamClient
+	metrics        *cluster.MetricsCollector
 	shardConfig    *ShardConfig
 	
 	// Health checkers for each target (keyed by target name).
@@ -104,35 +104,35 @@ func newProxyServer(proxyCfg *config.ProxyConfig, targets []config.TargetConfig,
 		pluginMgr:      pluginMgr,
 		maxBodySize:    maxBodySize,
 		healthCheckers: make(map[string]*loadbalancer.HealthChecker),
-		metrics:        &cdnscale.MetricsCollector{},
+		metrics:        &cluster.MetricsCollector{},
 	}
 
 	// Initialize CDN scale components if enabled
-	if proxyCfg != nil && proxyCfg.CDNScale != nil && proxyCfg.CDNScale.Enabled {
-		ps.configStore = cdnscale.NewConfigVersionStore(10000)
-		ps.consistentHash = cdnscale.NewConsistentHash(150)
-		ps.metrics = &cdnscale.MetricsCollector{}
+	if proxyCfg != nil && proxyCfg.Cluster != nil && proxyCfg.Cluster.Enabled {
+		ps.configStore = cluster.NewConfigVersionStore(10000)
+		ps.consistentHash = cluster.NewConsistentHash(150)
+		ps.metrics = &cluster.MetricsCollector{}
 		
 		// Initialize shard config
 		ps.shardConfig = &ShardConfig{
 			Enabled:       true,
-			NodeID:        proxyCfg.CDNScale.NodeID,
-			TotalNodes:    proxyCfg.CDNScale.TotalNodes,
-			ReplicaFactor: proxyCfg.CDNScale.ReplicaFactor,
-			LocalNode:     proxyCfg.CDNScale.NodeID,
+			NodeID:        proxyCfg.Cluster.NodeID,
+			TotalNodes:    proxyCfg.Cluster.TotalNodes,
+			ReplicaFactor: proxyCfg.Cluster.ReplicaFactor,
+			LocalNode:     proxyCfg.Cluster.NodeID,
 		}
 		
 		// Add local node to consistent hash
 		ps.consistentHash.AddNode(ps.shardConfig.LocalNode, 1)
 		
 		// Initialize config streaming if control plane is configured
-		if proxyCfg.CDNScale.ControlPlane != "" {
-			ps.configStream = cdnscale.NewConfigStreamClient(proxyCfg.CDNScale.ControlPlane)
+		if proxyCfg.Cluster.ControlPlane != "" {
+			ps.configStream = cluster.NewConfigStreamClient(proxyCfg.Cluster.ControlPlane)
 			ps.configStream.SetCallbacks(
-				func(update *cdnscale.GlobalConfigUpdate) {
+				func(update *cluster.GlobalConfigUpdate) {
 					klog.Infof("Received global config update from control plane: %s", update.Version)
 				},
-				func(update *cdnscale.TargetConfigUpdate) {
+				func(update *cluster.TargetConfigUpdate) {
 					klog.Infof("Received target config update from control plane: %s", update.TargetName)
 					ps.RecordTenantReload()
 				},

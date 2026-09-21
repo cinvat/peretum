@@ -1,21 +1,17 @@
-version: '3.8'
-
 services:
-  # Control plane - config distribution
   control-plane:
-    build:
-      context: .
-      dockerfile: Dockerfile.controlplane
+    build: .
     container_name: peretum-control-plane
     ports:
       - "9001:9001"   # gRPC
     volumes:
       - ./config.d:/config.d:ro
-      - ./controlplane-data:/data
+      - ./data/controlplane:/data
+    command: ["controlplane"]
     environment:
       - GOMAXPROCS=2
     networks:
-      - cdn-network
+      - cluster-network
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:9001/health"]
       interval: 10s
@@ -27,7 +23,8 @@ services:
   edge-us-east-1:
     build:
       context: .
-      dockerfile: Dockerfile
+      args:
+        MODE: edge
     container_name: peretum-edge-us-east-1
     ports:
       - "8080:8080"    # HTTP
@@ -35,17 +32,14 @@ services:
       - "9090:9090"    # Prometheus metrics
     volumes:
       - ./config.d:/config.d:ro
-      - ./cache-us-east-1:/cache
+      - ./cache/us-east-1:/cache
       - ./config.yaml:/config.yaml:ro
     environment:
       - GOMAXPROCS=2
-      - PERETUM_CDN_SCALE_ENABLED=true
-      - PERETUM_CDN_SCALE_NODE_ID=edge-us-east-1
-      - PERETUM_CDN_SCALE_TOTAL_NODES=3
-      - PERETUM_CDN_SCALE_REPLICA_FACTOR=2
-      - PERETUM_CDN_SCALE_CONTROL_PLANE=control-plane:9001
+      - NODE_ID=edge-us-east-1
+      - CONTROL_PLANE=control-plane:9001
     networks:
-      - cdn-network
+      - cluster-network
     depends_on:
       control-plane:
         condition: service_healthy
@@ -60,7 +54,8 @@ services:
   edge-us-west-1:
     build:
       context: .
-      dockerfile: Dockerfile
+      args:
+        MODE: edge
     container_name: peretum-edge-us-west-1
     ports:
       - "8081:8080"    # HTTP
@@ -68,17 +63,14 @@ services:
       - "9091:9090"    # Prometheus metrics
     volumes:
       - ./config.d:/config.d:ro
-      - ./cache-us-west-1:/cache
+      - ./cache/us-west-1:/cache
       - ./config.yaml:/config.yaml:ro
     environment:
       - GOMAXPROCS=2
-      - PERETUM_CDN_SCALE_ENABLED=true
-      - PERETUM_CDN_SCALE_NODE_ID=edge-us-west-1
-      - PERETUM_CDN_SCALE_TOTAL_NODES=3
-      - PERETUM_CDN_SCALE_REPLICA_FACTOR=2
-      - PERETUM_CDN_SCALE_CONTROL_PLANE=control-plane:9001
+      - NODE_ID=edge-us-west-1
+      - CONTROL_PLANE=control-plane:9001
     networks:
-      - cdn-network
+      - cluster-network
     depends_on:
       control-plane:
         condition: service_healthy
@@ -93,7 +85,8 @@ services:
   edge-eu-central-1:
     build:
       context: .
-      dockerfile: Dockerfile
+      args:
+        MODE: edge
     container_name: peretum-edge-eu-central-1
     ports:
       - "8082:8080"    # HTTP
@@ -101,17 +94,14 @@ services:
       - "9092:9090"    # Prometheus metrics
     volumes:
       - ./config.d:/config.d:ro
-      - ./cache-eu-central-1:/cache
+      - ./cache/eu-central-1:/cache
       - ./config.yaml:/config.yaml:ro
     environment:
       - GOMAXPROCS=2
-      - PERETUM_CDN_SCALE_ENABLED=true
-      - PERETUM_CDN_SCALE_NODE_ID=edge-eu-central-1
-      - PERETUM_CDN_SCALE_TOTAL_NODES=3
-      - PERETUM_CDN_SCALE_REPLICA_FACTOR=2
-      - PERETUM_CDN_SCALE_CONTROL_PLANE=control-plane:9001
+      - NODE_ID=edge-eu-central-1
+      - CONTROL_PLANE=control-plane:9001
     networks:
-      - cdn-network
+      - cluster-network
     depends_on:
       control-plane:
         condition: service_healthy
@@ -131,7 +121,7 @@ services:
     volumes:
       - ./upstream-content/api-1:/usr/share/nginx/html:ro
     networks:
-      - cdn-network
+      - cluster-network
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost/health"]
       interval: 10s
@@ -147,7 +137,7 @@ services:
     volumes:
       - ./upstream-content/api-2:/usr/share/nginx/html:ro
     networks:
-      - cdn-network
+      - cluster-network
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost/health"]
       interval: 10s
@@ -163,7 +153,7 @@ services:
     volumes:
       - ./upstream-content/static:/usr/share/nginx/html:ro
     networks:
-      - cdn-network
+      - cluster-network
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost/health"]
       interval: 10s
@@ -186,7 +176,7 @@ services:
       - '--web.console.templates=/etc/prometheus/consoles'
       - '--web.enable-lifecycle'
     networks:
-      - cdn-network
+      - cluster-network
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
       interval: 10s
@@ -209,7 +199,7 @@ services:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_USERS_ALLOW_SIGN_UP=false
     networks:
-      - cdn-network
+      - cluster-network
     depends_on:
       - prometheus
     healthcheck:
@@ -219,7 +209,7 @@ services:
       retries: 5
 
 networks:
-  cdn-network:
+  cluster-network:
     driver: bridge
     ipam:
       config:

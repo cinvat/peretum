@@ -1,12 +1,12 @@
 #!/bin/bash
-# Build and start the CDN scale demo
+# Build and start the Cluster demo
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-echo "=== Peretum CDN Scale Demo ==="
+echo "=== Peretum Cluster Demo ==="
 echo ""
 
 # Build images

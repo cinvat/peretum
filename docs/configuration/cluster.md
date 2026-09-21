@@ -1,12 +1,12 @@
 ---
-label: CDN Scale
+label: Cluster Mode
 icon: cloud
 order: 400
 ---
 
-# CDN Scale Features
+# Cluster Mode
 
-Peretum includes CDN-scale features for high-volume, multi-tenant deployments
+Peretum includes cluster mode features for high-volume, multi-tenant deployments
 across multiple edge nodes. When enabled, these features provide:
 
 - **Delta reloads** — only changed targets are rebuilt on reload
@@ -14,26 +14,24 @@ across multiple edge nodes. When enabled, these features provide:
 - **Tiered config storage** — hot/warm/cold tiers with LRU eviction
 - **Lazy loading** — cold tenants loaded on first request
 - **Config streaming** — xDS-style gRPC config streaming from control plane
-- **Metrics** — Prometheus-compatible metrics for all CDN operations
+- **Metrics** — Prometheus-compatible metrics for all cluster operations
 
-## Enabling CDN Scale
+## Enabling Cluster Mode
 
-Add the `cdn_scale` section to your `config.yaml`:
+Add the `cluster` section to your `config.yaml`:
 
 ```yaml
-cdn_scale:
+cluster:
   enabled: true
   node_id: "edge-us-east-1"           # unique ID for this edge node
-  total_nodes: 5                      # total number of edge nodes
   replica_factor: 3                   # replication factor for sharding
   control_plane: "control-plane.example.com:9001"  # gRPC control plane address
 ```
 
 | Key | Type | Required | Description |
 | --- | --- | --- | --- |
-| `enabled` | bool | yes | Master switch for CDN scale features |
+| `enabled` | bool | yes | Master switch for cluster features |
 | `node_id` | string | yes | Unique ID for this edge node (used for sharding) |
-| `total_nodes` | int | yes | Total number of edge nodes in the cluster |
 | `replica_factor` | int | no | Replication factor for sharding (default: 3) |
 | `control_plane` | string | no | gRPC control plane address for config streaming |
 
@@ -41,7 +39,7 @@ cdn_scale:
 
 ### Delta Reloads
 
-When CDN scale is enabled, `peretum -r` (or `SIGHUP`) performs a **delta reload**:
+When cluster mode is enabled, `peretum -r` (or `SIGHUP`) performs a **delta reload**:
 
 1. Loads new config
 2. Computes SHA256 hashes for each target
@@ -56,12 +54,11 @@ Consistent hashing with virtual nodes distributes tenants across edge nodes:
 
 - Each target is assigned to a primary edge node + replicas
 - Uses CRC32 with virtual nodes (150 per replica by default)
-- `node_id` and `total_nodes` determine placement
+- `node_id` determines placement (no need to know total cluster size)
 
 ```yaml
-cdn_scale:
+cluster:
   node_id: "edge-us-east-1"
-  total_nodes: 5
   replica_factor: 3
 ```
 
@@ -92,7 +89,7 @@ Cold tenants are loaded on first request:
 Connect to a gRPC control plane for real-time config updates:
 
 ```yaml
-cdn_scale:
+cluster:
   control_plane: "control-plane.example.com:9001"
 ```
 
@@ -104,7 +101,10 @@ Features:
 
 Run the control plane:
 ```bash
-peretum controlplane --listen :9001 --config-dir config.d --data-dir ./controlplane-data
+peretum controlplane \
+  --listen :9001 \
+  --config-dir config.d \
+  --data-dir ./controlplane-data
 ```
 
 ### Metrics

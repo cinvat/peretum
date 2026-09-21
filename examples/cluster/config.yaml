@@ -1,4 +1,4 @@
-# Global proxy configuration for CDN scale demo
+# Global proxy configuration for Cluster demo
 # multi-listener frontends
 listeners:
   - ":8080"            # plaintext; HTTP/1.1 + h2c
@@ -31,10 +31,9 @@ waf:
   geolite_dir: "/usr/share/GeoIP"
   max_body_size: "1MB"
 
-# CDN Scale Configuration
-cdn_scale:
+# Cluster Configuration
+cluster:
   enabled: true
-  node_id: "edge-local"           # overridden by env var
-  total_nodes: 3                  # overridden by env var
+  node_id: "edge-local"           # overridden by env var NODE_ID
   replica_factor: 2
   control_plane: "control-plane:9001"

@@ -1,4 +1,4 @@
-package cdnscale
+package cluster
 
 import (
 	"crypto/sha256"
