@@ -42,6 +42,9 @@ type MetricsCollector struct {
 
 // RecordReload records a reload event with duration.
 func (m *MetricsCollector) RecordReload(isDelta bool, duration time.Duration, err error) {
+	if m == nil {
+		return
+	}
 	m.reloadTotal.Add(1)
 	m.reloadDuration.Add(uint64(duration.Nanoseconds()))
 	if err != nil {
@@ -56,6 +59,9 @@ func (m *MetricsCollector) RecordReload(isDelta bool, duration time.Duration, er
 
 // RecordTargetChange records a target change event.
 func (m *MetricsCollector) RecordTargetChange(changed, deleted bool) {
+	if m == nil {
+		return
+	}
 	m.targetsLoaded.Add(1)
 	if changed {
 		m.targetsChanged.Add(1)
@@ -67,6 +73,9 @@ func (m *MetricsCollector) RecordTargetChange(changed, deleted bool) {
 
 // RecordCacheHit records a cache tier hit.
 func (m *MetricsCollector) RecordCacheHit(tier string) {
+	if m == nil {
+		return
+	}
 	switch tier {
 	case "hot":
 		m.hotTierHits.Add(1)
@@ -77,6 +86,9 @@ func (m *MetricsCollector) RecordCacheHit(tier string) {
 
 // RecordCacheMiss records a cache tier miss.
 func (m *MetricsCollector) RecordCacheMiss(tier string) {
+	if m == nil {
+		return
+	}
 	switch tier {
 	case "hot":
 		m.hotTierMisses.Add(1)
@@ -87,11 +99,17 @@ func (m *MetricsCollector) RecordCacheMiss(tier string) {
 
 // RecordEviction records a tenant eviction.
 func (m *MetricsCollector) RecordEviction() {
+	if m == nil {
+		return
+	}
 	m.evictions.Add(1)
 }
 
 // RecordStreamEvent records a config streaming event.
 func (m *MetricsCollector) RecordStreamEvent(eventType string) {
+	if m == nil {
+		return
+	}
 	switch eventType {
 	case "connect":
 		m.streamConnects.Add(1)
@@ -106,6 +124,9 @@ func (m *MetricsCollector) RecordStreamEvent(eventType string) {
 
 // RecordRequest records a request with latency.
 func (m *MetricsCollector) RecordRequest(cached bool, latency time.Duration) {
+	if m == nil {
+		return
+	}
 	m.requestsTotal.Add(1)
 	if cached {
 		m.requestsCached.Add(1)
@@ -139,11 +160,17 @@ func (m *MetricsCollector) RecordRequest(cached bool, latency time.Duration) {
 
 // RecordRequestError records a request error.
 func (m *MetricsCollector) RecordRequestError() {
+	if m == nil {
+		return
+	}
 	m.requestErrors.Add(1)
 }
 
 // GetStats returns all metrics as a map.
 func (m *MetricsCollector) GetStats() map[string]interface{} {
+	if m == nil {
+		return map[string]interface{}{}
+	}
 	return map[string]interface{}{
 		"reload": map[string]interface{}{
 			"total":       m.reloadTotal.Load(),

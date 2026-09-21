@@ -52,6 +52,9 @@ func newRootCommand() *cobra.Command {
 	cmd.PersistentFlags().BoolP("test", "t", false, "check configuration syntax and exit")
 	cmd.PersistentFlags().BoolP("reload", "r", false, "reload the running proxy (send SIGHUP)")
 
+	// Add subcommands
+	cmd.AddCommand(newControlPlaneCommand())
+
 	return cmd
 }
 

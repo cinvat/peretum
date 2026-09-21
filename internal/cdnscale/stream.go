@@ -245,3 +245,257 @@ func (m *MockConfigStreamServer) DeleteTarget(targetName string) {
 		}
 	}
 }
+
+// ControlPlaneServer is the gRPC server that distributes config to edge nodes.
+// It watches the config directory and streams updates to connected edges.
+type ControlPlaneServer struct {
+	mu             sync.RWMutex
+	configDir      string
+	dataDir        string
+	targets        map[string]map[string]interface{}
+	globalConfig   map[string]interface{}
+	targetVersions map[string]string
+	clients        map[string]*clientStream
+	
+	// File watching
+	watcherDone chan struct{}
+}
+
+// clientStream represents a connected edge node.
+type clientStream struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
+	sendCh     chan *ConfigResponse
+	knownVers  map[string]string
+}
+
+// NewControlPlaneServer creates a new control plane server.
+func NewControlPlaneServer(configDir, dataDir string) *ControlPlaneServer {
+	return &ControlPlaneServer{
+		configDir:      configDir,
+		dataDir:        dataDir,
+		targets:        make(map[string]map[string]interface{}),
+		globalConfig:   make(map[string]interface{}),
+		targetVersions: make(map[string]string),
+		clients:        make(map[string]*clientStream),
+		watcherDone:    make(chan struct{}),
+	}
+}
+
+// StreamConfigs is the gRPC streaming endpoint for edges.
+// In production, this would implement the generated gRPC interface.
+func (cp *ControlPlaneServer) StreamConfigs(stream interface{}) error {
+	// This is a placeholder for the gRPC generated code
+	// In production, you'd use the generated gRPC interface
+	
+	ctx := context.Background()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	
+	clientID := fmt.Sprintf("edge-%d", time.Now().UnixNano())
+	
+	cs := &clientStream{
+		ctx:       ctx,
+		cancel:    cancel,
+		sendCh:    make(chan *ConfigResponse, 100),
+		knownVers: make(map[string]string),
+	}
+	
+	cp.mu.Lock()
+	cp.clients[clientID] = cs
+	cp.mu.Unlock()
+	
+	// Send initial snapshot
+	if err := cp.sendSnapshot(clientID); err != nil {
+		return err
+	}
+	
+	// Wait for context cancellation
+	<-ctx.Done()
+	
+	cp.mu.Lock()
+	delete(cp.clients, clientID)
+	cp.mu.Unlock()
+	
+	return nil
+}
+
+// sendSnapshot sends the full config snapshot to a client.
+func (cp *ControlPlaneServer) sendSnapshot(clientID string) error {
+	cp.mu.RLock()
+	cs, ok := cp.clients[clientID]
+	cp.mu.RUnlock()
+	
+	if !ok {
+		return fmt.Errorf("client not found")
+	}
+	
+	cp.mu.RLock()
+	globalConfig := cp.globalConfig
+	targets := make(map[string]map[string]interface{}, len(cp.targets))
+	for k, v := range cp.targets {
+		targets[k] = v
+	}
+	versions := make(map[string]string, len(cp.targetVersions))
+	for k, v := range cp.targetVersions {
+		versions[k] = v
+	}
+	cp.mu.RUnlock()
+	
+	// Build snapshot response
+	resp := &ConfigResponse{
+		GlobalConfig: &GlobalConfigUpdate{
+			Config: globalConfig,
+			Hash:   cp.computeHash(globalConfig),
+			Version: "1",
+		},
+		SnapshotVersion: "1",
+	}
+	
+	for name, config := range targets {
+		resp.TargetUpdates = append(resp.TargetUpdates, &TargetConfigUpdate{
+			TargetName: name,
+			Config:     config,
+			Hash:       versions[name],
+			Version:    versions[name],
+		})
+	}
+	
+	select {
+	case cs.sendCh <- resp:
+		return nil
+	case <-cs.ctx.Done():
+		return cs.ctx.Err()
+	}
+}
+
+// WatchConfigChanges watches the config directory for changes and broadcasts updates.
+func (cp *ControlPlaneServer) WatchConfigChanges(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	defer close(cp.watcherDone)
+	
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cp.scanAndBroadcast()
+		}
+	}
+}
+
+// scanAndBroadcast scans the config directory for changes and broadcasts to clients.
+func (cp *ControlPlaneServer) scanAndBroadcast() {
+	// In production, this would use fsnotify or similar
+	// For now, we just show the structure
+}
+
+// BroadcastGlobalConfig broadcasts a global config update to all clients.
+func (cp *ControlPlaneServer) BroadcastGlobalConfig(config map[string]interface{}) {
+	cp.mu.Lock()
+	cp.globalConfig = config
+	cp.mu.Unlock()
+	
+	cp.broadcastToClients(func(id string, cs *clientStream) error {
+		select {
+		case cs.sendCh <- &ConfigResponse{
+			GlobalConfig: &GlobalConfigUpdate{
+				Config:  config,
+				Hash:    cp.computeHash(config),
+				Version: "1",
+			},
+		}:
+			return nil
+		case <-cs.ctx.Done():
+			return cs.ctx.Err()
+		}
+	})
+}
+
+// BroadcastTargetUpdate broadcasts a target config update to all clients.
+func (cp *ControlPlaneServer) BroadcastTargetUpdate(targetName string, config map[string]interface{}) {
+	cp.mu.Lock()
+	cp.targets[targetName] = config
+	cp.targetVersions[targetName] = cp.computeHash(config)
+	cp.mu.Unlock()
+	
+	cp.broadcastToClients(func(id string, cs *clientStream) error {
+		select {
+		case cs.sendCh <- &ConfigResponse{
+			TargetUpdates: []*TargetConfigUpdate{{
+				TargetName: targetName,
+				Config:     config,
+				Hash:       cp.targetVersions[targetName],
+				Version:    cp.targetVersions[targetName],
+			}},
+		}:
+			return nil
+		case <-cs.ctx.Done():
+			return cs.ctx.Err()
+		}
+	})
+}
+
+// BroadcastTargetDelete broadcasts a target deletion to all clients.
+func (cp *ControlPlaneServer) BroadcastTargetDelete(targetName string) {
+	cp.mu.Lock()
+	delete(cp.targets, targetName)
+	delete(cp.targetVersions, targetName)
+	cp.mu.Unlock()
+	
+	cp.broadcastToClients(func(id string, cs *clientStream) error {
+		select {
+		case cs.sendCh <- &ConfigResponse{
+			TargetDeletes: []string{targetName},
+		}:
+			return nil
+		case <-cs.ctx.Done():
+			return cs.ctx.Err()
+		}
+	})
+}
+
+// broadcastToClients sends a message to all connected clients.
+func (cp *ControlPlaneServer) broadcastToClients(fn func(string, *clientStream) error) {
+	cp.mu.RLock()
+	clients := make([]*clientStream, 0, len(cp.clients))
+	clientIDs := make([]string, 0, len(cp.clients))
+	for id, cs := range cp.clients {
+		clients = append(clients, cs)
+		clientIDs = append(clientIDs, id)
+	}
+	cp.mu.RUnlock()
+	
+	for i, cs := range clients {
+		select {
+		case <-cs.ctx.Done():
+			continue
+		default:
+			if err := fn(clientIDs[i], cs); err != nil {
+				// Client disconnected or channel full
+				cp.mu.Lock()
+				delete(cp.clients, clientIDs[i])
+				cp.mu.Unlock()
+			}
+		}
+	}
+}
+
+// computeHash computes a hash for config versioning.
+func (cp *ControlPlaneServer) computeHash(data interface{}) string {
+	// Simplified hash - in production use proper serialization + SHA256
+	return fmt.Sprintf("%v", data)
+}
+
+// GetStats returns server statistics.
+func (cp *ControlPlaneServer) GetStats() map[string]interface{} {
+	cp.mu.RLock()
+	defer cp.mu.RUnlock()
+	
+	return map[string]interface{}{
+		"connected_clients": len(cp.clients),
+		"targets":           len(cp.targets),
+		"global_config":     cp.globalConfig != nil,
+	}
+}
