@@ -13,10 +13,10 @@ import (
 
 // TargetConfigVersion holds a versioned target configuration.
 type TargetConfigVersion struct {
-	Target     *config.TargetConfig
-	Version    string    // SHA256 hash of the config
-	LoadedAt   time.Time
-	AccessedAt time.Time
+	Target      *config.TargetConfig
+	Version     string // SHA256 hash of the config
+	LoadedAt    time.Time
+	AccessedAt  time.Time
 	AccessCount uint64
 }
 
@@ -26,7 +26,7 @@ type ConfigVersionStore struct {
 	targets      map[string]*TargetConfigVersion // target name -> versioned config
 	globalConfig *config.ProxyConfig
 	globalHash   string
-	
+
 	// Metrics
 	reloadCount     uint64
 	deltaReloads    uint64
@@ -34,11 +34,11 @@ type ConfigVersionStore struct {
 	tenantReloads   uint64
 	lastReloadTime  time.Time
 	lastReloadError string
-	
+
 	// Tiered config
-	hotTier   *LRUCache[string, *TargetConfigVersion] // hot tenants in memory
-	warmTier  map[string][]byte                       // serialized configs (compressed)
-	hotTierSize int
+	hotTier        *LRUCache[string, *TargetConfigVersion] // hot tenants in memory
+	warmTier       map[string][]byte                       // serialized configs (compressed)
+	hotTierSize    int
 	maxHotTierSize int
 }
 
@@ -47,9 +47,9 @@ func NewConfigVersionStore(hotTierSize int) *ConfigVersionStore {
 		hotTierSize = 1000
 	}
 	return &ConfigVersionStore{
-		targets:       make(map[string]*TargetConfigVersion),
-		warmTier:      make(map[string][]byte),
-		hotTier:       NewLRUCache[string, *TargetConfigVersion](hotTierSize),
+		targets:        make(map[string]*TargetConfigVersion),
+		warmTier:       make(map[string][]byte),
+		hotTier:        NewLRUCache[string, *TargetConfigVersion](hotTierSize),
 		maxHotTierSize: hotTierSize,
 	}
 }
@@ -111,7 +111,7 @@ func (cvs *ConfigVersionStore) LoadTargets(targetsDir string) (map[string]*Targe
 		}
 		hash := computeHash(&t)
 		existing := cvs.targets[name]
-		
+
 		if existing == nil || existing.Version != hash {
 			// Config changed or new target
 			changed = append(changed, name)
@@ -152,10 +152,10 @@ func (cvs *ConfigVersionStore) LoadGlobalConfig(cfgPath string) (bool, error) {
 
 	hash := computeGlobalHash(cfg)
 	changed := cvs.globalHash != hash
-	
+
 	cvs.mu.Lock()
 	defer cvs.mu.Unlock()
-	
+
 	cvs.globalConfig = cfg
 	cvs.globalHash = hash
 	return changed, nil
@@ -166,11 +166,11 @@ func (cvs *ConfigVersionStore) GetTarget(name string) (*TargetConfigVersion, boo
 	cvs.mu.RLock()
 	target, ok := cvs.targets[name]
 	cvs.mu.RUnlock()
-	
+
 	if !ok {
 		return nil, false
 	}
-	
+
 	// Update access stats (async to avoid lock contention)
 	go func() {
 		cvs.mu.Lock()
@@ -180,12 +180,12 @@ func (cvs *ConfigVersionStore) GetTarget(name string) (*TargetConfigVersion, boo
 		}
 		cvs.mu.Unlock()
 	}()
-	
+
 	// Also add to hot tier if frequently accessed
 	if target.AccessCount > 10 {
 		cvs.hotTier.Put(name, target)
 	}
-	
+
 	return target, true
 }
 
@@ -193,7 +193,7 @@ func (cvs *ConfigVersionStore) GetTarget(name string) (*TargetConfigVersion, boo
 func (cvs *ConfigVersionStore) GetAllTargets() map[string]*TargetConfigVersion {
 	cvs.mu.RLock()
 	defer cvs.mu.RUnlock()
-	
+
 	result := make(map[string]*TargetConfigVersion, len(cvs.targets))
 	for k, v := range cvs.targets {
 		result[k] = v
@@ -208,11 +208,25 @@ func (cvs *ConfigVersionStore) GetGlobalConfig() *config.ProxyConfig {
 	return cvs.globalConfig
 }
 
+// SetTarget sets or updates a target config.
+func (cvs *ConfigVersionStore) SetTarget(name string, target *config.TargetConfig, version string, loadedAt time.Time) {
+	cvs.mu.Lock()
+	defer cvs.mu.Unlock()
+
+	cvs.targets[name] = &TargetConfigVersion{
+		Target:      target,
+		Version:     version,
+		LoadedAt:    loadedAt,
+		AccessedAt:  time.Now(),
+		AccessCount: 0,
+	}
+}
+
 // RecordReload records a reload event.
 func (cvs *ConfigVersionStore) RecordReload(isDelta bool, err error) {
 	cvs.mu.Lock()
 	defer cvs.mu.Unlock()
-	
+
 	cvs.reloadCount++
 	cvs.lastReloadTime = time.Now()
 	if err != nil {
@@ -238,17 +252,17 @@ func (cvs *ConfigVersionStore) RecordTenantReload() {
 func (cvs *ConfigVersionStore) GetStats() map[string]interface{} {
 	cvs.mu.RLock()
 	defer cvs.mu.RUnlock()
-	
+
 	return map[string]interface{}{
-		"total_reloads":      cvs.reloadCount,
-		"delta_reloads":      cvs.deltaReloads,
-		"full_reloads":       cvs.fullReloads,
-		"tenant_reloads":     cvs.tenantReloads,
-		"last_reload_time":   cvs.lastReloadTime,
-		"last_reload_error":  cvs.lastReloadError,
-		"targets_total":      len(cvs.targets),
-		"hot_tier_size":      cvs.hotTier.Len(),
-		"warm_tier_size":     len(cvs.warmTier),
+		"total_reloads":     cvs.reloadCount,
+		"delta_reloads":     cvs.deltaReloads,
+		"full_reloads":      cvs.fullReloads,
+		"tenant_reloads":    cvs.tenantReloads,
+		"last_reload_time":  cvs.lastReloadTime,
+		"last_reload_error": cvs.lastReloadError,
+		"targets_total":     len(cvs.targets),
+		"hot_tier_size":     cvs.hotTier.Len(),
+		"warm_tier_size":    len(cvs.warmTier),
 	}
 }
 
@@ -257,7 +271,7 @@ func (cvs *ConfigVersionStore) PromoteToHot(name string) {
 	cvs.mu.RLock()
 	target, ok := cvs.targets[name]
 	cvs.mu.RUnlock()
-	
+
 	if ok {
 		cvs.hotTier.Put(name, target)
 	}
@@ -275,18 +289,18 @@ func (cvs *ConfigVersionStore) EvictColdTenants(maxMemoryMB int) int {
 	// In production, you'd check actual memory usage
 	cvs.mu.Lock()
 	defer cvs.mu.Unlock()
-	
+
 	if len(cvs.targets) <= cvs.maxHotTierSize {
 		return 0
 	}
-	
+
 	// Sort by access time (oldest first)
 	type targetInfo struct {
-		name       string
-		accessedAt time.Time
+		name        string
+		accessedAt  time.Time
 		accessCount uint64
 	}
-	
+
 	infos := make([]targetInfo, 0, len(cvs.targets))
 	for name, target := range cvs.targets {
 		infos = append(infos, targetInfo{
@@ -295,7 +309,7 @@ func (cvs *ConfigVersionStore) EvictColdTenants(maxMemoryMB int) int {
 			accessCount: target.AccessCount,
 		})
 	}
-	
+
 	sort.Slice(infos, func(i, j int) bool {
 		// Prioritize by access count (lower = colder), then by access time (older = colder)
 		if infos[i].accessCount != infos[j].accessCount {
@@ -303,7 +317,7 @@ func (cvs *ConfigVersionStore) EvictColdTenants(maxMemoryMB int) int {
 		}
 		return infos[i].accessedAt.Before(infos[j].accessedAt)
 	})
-	
+
 	evicted := 0
 	targetCount := len(cvs.targets)
 	for _, info := range infos {

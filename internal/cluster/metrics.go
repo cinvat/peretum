@@ -8,34 +8,34 @@ import (
 // MetricsCollector collects and exposes metrics for CDN scale operations.
 type MetricsCollector struct {
 	// Reload metrics
-	reloadTotal     atomic.Uint64
-	reloadDuration  atomic.Uint64 // nanoseconds
-	reloadErrors    atomic.Uint64
-	deltaReloads    atomic.Uint64
-	fullReloads     atomic.Uint64
-	
+	reloadTotal    atomic.Uint64
+	reloadDuration atomic.Uint64 // nanoseconds
+	reloadErrors   atomic.Uint64
+	deltaReloads   atomic.Uint64
+	fullReloads    atomic.Uint64
+
 	// Config metrics
-	targetsLoaded    atomic.Uint64
-	targetsChanged   atomic.Uint64
-	targetsDeleted   atomic.Uint64
-	hotTierHits      atomic.Uint64
-	hotTierMisses    atomic.Uint64
-	warmTierHits     atomic.Uint64
-	warmTierMisses   atomic.Uint64
-	evictions        atomic.Uint64
-	
+	targetsLoaded  atomic.Uint64
+	targetsChanged atomic.Uint64
+	targetsDeleted atomic.Uint64
+	hotTierHits    atomic.Uint64
+	hotTierMisses  atomic.Uint64
+	warmTierHits   atomic.Uint64
+	warmTierMisses atomic.Uint64
+	evictions      atomic.Uint64
+
 	// Config streaming
-	streamConnects   atomic.Uint64
+	streamConnects    atomic.Uint64
 	streamDisconnects atomic.Uint64
-	streamUpdates    atomic.Uint64
-	streamErrors     atomic.Uint64
-	
+	streamUpdates     atomic.Uint64
+	streamErrors      atomic.Uint64
+
 	// Request metrics
-	requestsTotal    atomic.Uint64
-	requestsCached   atomic.Uint64
-	requestsProxied  atomic.Uint64
-	requestErrors    atomic.Uint64
-	
+	requestsTotal   atomic.Uint64
+	requestsCached  atomic.Uint64
+	requestsProxied atomic.Uint64
+	requestErrors   atomic.Uint64
+
 	// Latency buckets (in microseconds)
 	latencyBuckets [10]atomic.Uint64 // <1ms, <5ms, <10ms, <50ms, <100ms, <500ms, <1s, <5s, <10s, >10s
 }
@@ -133,7 +133,7 @@ func (m *MetricsCollector) RecordRequest(cached bool, latency time.Duration) {
 	} else {
 		m.requestsProxied.Add(1)
 	}
-	
+
 	us := latency.Microseconds()
 	if us < 1000 {
 		m.latencyBuckets[0].Add(1)
@@ -187,16 +187,16 @@ func (m *MetricsCollector) GetStats() map[string]interface{} {
 			}(),
 		},
 		"targets": map[string]interface{}{
-			"loaded":   m.targetsLoaded.Load(),
-			"changed":  m.targetsChanged.Load(),
-			"deleted":  m.targetsDeleted.Load(),
+			"loaded":  m.targetsLoaded.Load(),
+			"changed": m.targetsChanged.Load(),
+			"deleted": m.targetsDeleted.Load(),
 		},
 		"cache": map[string]interface{}{
-			"hot_hits":   m.hotTierHits.Load(),
-			"hot_misses": m.hotTierMisses.Load(),
-			"warm_hits":  m.warmTierHits.Load(),
+			"hot_hits":    m.hotTierHits.Load(),
+			"hot_misses":  m.hotTierMisses.Load(),
+			"warm_hits":   m.warmTierHits.Load(),
 			"warm_misses": m.warmTierMisses.Load(),
-			"evictions":  m.evictions.Load(),
+			"evictions":   m.evictions.Load(),
 		},
 		"streaming": map[string]interface{}{
 			"connects":    m.streamConnects.Load(),
@@ -205,21 +205,21 @@ func (m *MetricsCollector) GetStats() map[string]interface{} {
 			"errors":      m.streamErrors.Load(),
 		},
 		"requests": map[string]interface{}{
-			"total":     m.requestsTotal.Load(),
-			"cached":    m.requestsCached.Load(),
-			"proxied":   m.requestsProxied.Load(),
-			"errors":    m.requestErrors.Load(),
+			"total":   m.requestsTotal.Load(),
+			"cached":  m.requestsCached.Load(),
+			"proxied": m.requestsProxied.Load(),
+			"errors":  m.requestErrors.Load(),
 			"latency_buckets": map[string]uint64{
-				"<1ms":      m.latencyBuckets[0].Load(),
-				"<5ms":      m.latencyBuckets[1].Load(),
-				"<10ms":     m.latencyBuckets[2].Load(),
-				"<50ms":     m.latencyBuckets[3].Load(),
-				"<100ms":    m.latencyBuckets[4].Load(),
-				"<500ms":    m.latencyBuckets[5].Load(),
-				"<1s":       m.latencyBuckets[6].Load(),
-				"<5s":       m.latencyBuckets[7].Load(),
-				"<10s":      m.latencyBuckets[8].Load(),
-				">10s":      m.latencyBuckets[9].Load(),
+				"<1ms":   m.latencyBuckets[0].Load(),
+				"<5ms":   m.latencyBuckets[1].Load(),
+				"<10ms":  m.latencyBuckets[2].Load(),
+				"<50ms":  m.latencyBuckets[3].Load(),
+				"<100ms": m.latencyBuckets[4].Load(),
+				"<500ms": m.latencyBuckets[5].Load(),
+				"<1s":    m.latencyBuckets[6].Load(),
+				"<5s":    m.latencyBuckets[7].Load(),
+				"<10s":   m.latencyBuckets[8].Load(),
+				">10s":   m.latencyBuckets[9].Load(),
 			},
 		},
 	}

@@ -10,12 +10,12 @@ import (
 // ConsistentHash implements consistent hashing with virtual nodes
 // for distributing tenants across edge nodes.
 type ConsistentHash struct {
-	mu          sync.RWMutex
-	replicas    int
-	hashRing    []uint32          // sorted hash values
-	hashMap     map[uint32]string // hash -> node name
-	nodes       map[string]bool   // node name -> exists
-	weights     map[string]int    // node name -> weight
+	mu       sync.RWMutex
+	replicas int
+	hashRing []uint32          // sorted hash values
+	hashMap  map[uint32]string // hash -> node name
+	nodes    map[string]bool   // node name -> exists
+	weights  map[string]int    // node name -> weight
 }
 
 func NewConsistentHash(replicas int) *ConsistentHash {
