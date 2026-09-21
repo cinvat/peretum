@@ -128,31 +128,19 @@ Key configuration files:
 
 ```yaml
 cluster:
-  enabled: true
-  node_id: "edge-us-east-1"      # Unique per edge
-  replica_factor: 2               # Replication factor
+  enabled: false           # full replication (recommended for CDN)
+  replica_factor: 2        # replication factor for control plane HA
   control_plane: "control-plane:9001"
 ```
 
-### Per-node configuration via environment variables
+## Testing
+
+### Test control plane
 
 ```bash
-NODE_ID=edge-us-east-1
-CONTROL_PLANE=control-plane:9001
+# Check connected edges
+curl -s http://localhost:9001/stats | jq
 ```
-
-## Sharding Demo
-
-Each edge node gets different targets based on consistent hashing:
-
-```bash
-# Check which targets each edge serves
-curl -s http://localhost:9090/metrics | grep peretum_targets_loaded
-curl -s http://localhost:9091/metrics | grep peretum_targets_loaded
-curl -s http://localhost:9092/metrics | grep peretum_targets_loaded
-```
-
-## Cleanup
 
 ```bash
 # Stop and remove everything

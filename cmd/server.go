@@ -48,11 +48,9 @@ type proxyServer struct {
 	pluginMgr   *manager.PluginManager
 
 	// CDN Scale features
-	configStore    *cluster.ConfigVersionStore
-	consistentHash *cluster.ConsistentHash
-	configStream   *cluster.ConfigStreamClient
-	metrics        *cluster.MetricsCollector
-	shardConfig    *ShardConfig
+	configStore  *cluster.ConfigVersionStore
+	configStream *cluster.ConfigStreamClient
+	metrics      *cluster.MetricsCollector
 
 	// Cluster control plane
 	clusterHTTP    *cluster.ControlPlaneHTTP
@@ -89,15 +87,6 @@ type proxyServer struct {
 	mu          sync.Mutex
 }
 
-// ShardConfig holds sharding configuration for CDN scale.
-type ShardConfig struct {
-	Enabled       bool
-	NodeID        string
-	TotalNodes    int
-	ReplicaFactor int
-	LocalNode     string
-}
-
 func newProxyServer(proxyCfg *config.ProxyConfig, targets []config.TargetConfig, diskCache *disk.DiskCache, writeSem chan struct{}, pluginMgr *manager.PluginManager, maxBodySize int64) *proxyServer {
 	ps := &proxyServer{
 		router:         router.NewHostRouter(),
@@ -111,53 +100,45 @@ func newProxyServer(proxyCfg *config.ProxyConfig, targets []config.TargetConfig,
 		metrics:        &cluster.MetricsCollector{},
 	}
 
-	// Initialize cluster features if enabled
-	if proxyCfg != nil && proxyCfg.Cluster != nil && proxyCfg.Cluster.Enabled {
+	// Initialize cluster features (config versioning, streaming, metrics)
+	if proxyCfg != nil && proxyCfg.Cluster != nil {
 		ps.configStore = cluster.NewConfigVersionStore(10000)
-		ps.consistentHash = cluster.NewConsistentHash(150)
 		ps.metrics = &cluster.MetricsCollector{}
 
-		// Initialize shard config (only used if sharding enabled)
-		ps.shardConfig = &ShardConfig{
-			Enabled:       true,
-			NodeID:        proxyCfg.Cluster.NodeID,
-			ReplicaFactor: proxyCfg.Cluster.ReplicaFactor,
-			LocalNode:     proxyCfg.Cluster.NodeID,
-		}
-
-		// Add local node to consistent hash
-		ps.consistentHash.AddNode(ps.shardConfig.LocalNode, 1)
-
 		// Initialize control plane HTTP server for leader election and config sync
-		peerURLs := strings.Split(proxyCfg.Cluster.ControlPlane, ",")
-		ps.clusterHTTP = cluster.NewControlPlaneHTTP(
-			proxyCfg.Cluster.NodeID,
-			ps.cfgPath,
-			ps.configStore,
-			peerURLs,
-		)
+		if proxyCfg.Cluster.ControlPlane != "" {
+			peerURLs := strings.Split(proxyCfg.Cluster.ControlPlane, ",")
+			ps.clusterHTTP = cluster.NewControlPlaneHTTP(
+				"", // nodeID not needed without sharding
+				ps.cfgPath,
+				ps.configStore,
+				peerURLs,
+			)
 
-		// Initialize leader election
-		ps.leaderElection = cluster.NewLeaderElection(
-			proxyCfg.Cluster.NodeID,
-			peerURLs,
-			2*time.Second,
-		)
-		ps.leaderElection.Start(context.Background(),
-			func() {
-				ps.clusterHTTP.SetLeader(true)
-				klog.Infof("Became cluster leader")
-				// Start config streaming from control plane
-				if proxyCfg.Cluster.ControlPlane != "" {
-					ps.startConfigStream()
-				}
-			},
-			func() {
-				ps.clusterHTTP.SetLeader(false)
-				klog.Infof("Lost cluster leadership")
-				ps.stopConfigStream()
-			},
-		)
+			// Initialize leader election (only if multiple control plane URLs)
+			if len(peerURLs) > 1 {
+				ps.leaderElection = cluster.NewLeaderElection(
+					"", // nodeID not needed without sharding
+					peerURLs,
+					2*time.Second,
+				)
+				ps.leaderElection.Start(context.Background(),
+					func() {
+						ps.clusterHTTP.SetLeader(true)
+						klog.Infof("Became cluster leader")
+						ps.startConfigStream()
+					},
+					func() {
+						ps.clusterHTTP.SetLeader(false)
+						klog.Infof("Lost cluster leadership")
+						ps.stopConfigStream()
+					},
+				)
+			} else if proxyCfg.Cluster.ControlPlane != "" {
+				// Single control plane - just start streaming
+				ps.startConfigStream()
+			}
+		}
 	}
 
 	return ps

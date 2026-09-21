@@ -60,12 +60,10 @@ type WAFConfig struct {
 	GeoLiteDir string `yaml:"geolite_dir"`
 }
 
-// ClusterConfig holds CDN-scale feature configuration.
+// ClusterConfig holds cluster feature configuration.
 type ClusterConfig struct {
 	Enabled       bool   `yaml:"enabled"`
-	NodeID        string `yaml:"node_id"`        // unique ID for this edge node
-	TotalNodes    int    `yaml:"total_nodes"`    // total number of edge nodes
-	ReplicaFactor int    `yaml:"replica_factor"` // replication factor for sharding
+	ReplicaFactor int    `yaml:"replica_factor"` // replication factor for control plane
 	ControlPlane  string `yaml:"control_plane"`  // gRPC control plane address for config streaming
 }
 

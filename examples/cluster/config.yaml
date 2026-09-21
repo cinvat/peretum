@@ -33,7 +33,6 @@ waf:
 
 # Cluster Configuration
 cluster:
-  enabled: true
-  node_id: "edge-local"           # overridden by env var NODE_ID
-  replica_factor: 2
+  enabled: false           # full replication (recommended for CDN)
+  replica_factor: 2        # replication factor for control plane HA
   control_plane: "control-plane:9001"
