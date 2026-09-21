@@ -65,7 +65,7 @@ peretum controlplane --listen :9001 --config-dir config.d --data-dir ./controlpl
   `ssl` + `h2c`);
 - every target's upstream URLs;
 - every per-location `cache_ttl` duration.
-- CDN scale config (`cdn_scale` section) if enabled.
+- Cluster config (`cluster` section) if enabled.
 
 ## `--reload` (hot reload)
 
@@ -74,7 +74,7 @@ Sending `SIGHUP` (via `peretum -r` or `kill -HUP <pid>`) to a running proxy:
 - reloads and re-validates `config.yaml` and `config.d/` — using the same
   `--config`/`--targets` paths the proxy was started with (the working
   directory is not used);
-- **delta reload**: only targets that changed are rebuilt (when CDN scale is enabled);
+- **delta reload**: only targets that changed are rebuilt (when Cluster mode is enabled);
 - rebuilds the host/location router (targets, upstreams, locations, and the
   target `host` header override) and re-applies TLS certificates
   (`GetConfigForClient` for dynamic per-target certs);
