@@ -411,16 +411,16 @@ func (ps *proxyServer) ensureLazyStore() error {
 		return nil
 	}
 
-	// First launch: pull the full snapshot from the control plane.
+	// First launch: if control_plane is configured, pull from it (required).
+	// Otherwise, seed from local config.d.
 	if ps.proxyCfg != nil && ps.proxyCfg.Cluster != nil && ps.proxyCfg.Cluster.ControlPlane != "" {
-		if err := ps.pullTargetsFromControlPlane(ctx); err == nil {
-			return nil
-		} else {
-			klog.Warningf("control plane pull failed (%v); seeding from local config.d", err)
+		if err := ps.pullTargetsFromControlPlane(ctx); err != nil {
+			return fmt.Errorf("control plane pull failed: %w", err)
 		}
+		return nil
 	}
 
-	// Fallback: seed from the local config.d targets.
+	// No control plane: seed from local config.d targets.
 	for i := range ps.targets {
 		t := &ps.targets[i]
 		data, err := yaml.Marshal(t)

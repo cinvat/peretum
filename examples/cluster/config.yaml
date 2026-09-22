@@ -37,4 +37,5 @@ cluster:
   replica_factor: 2        # replication factor for control plane HA
   control_plane: "control-plane:9001"
   lazy: true               # materialize target handlers on first request (CDN mode)
+  data_dir: "/cache/targetstore"  # Pebble store directory
   lru_size: 1000           # compiled-handler LRU capacity

@@ -36,6 +36,7 @@ services:
       - ./config.yaml:/config.yaml:ro
     environment:
       - GOMAXPROCS=2
+      - CLUSTER_DATA_DIR=/cache/targetstore
     networks:
       - cluster-network
     depends_on:
@@ -65,6 +66,7 @@ services:
       - ./config.yaml:/config.yaml:ro
     environment:
       - GOMAXPROCS=2
+      - CLUSTER_DATA_DIR=/cache/targetstore
     networks:
       - cluster-network
     depends_on:
@@ -94,6 +96,7 @@ services:
       - ./config.yaml:/config.yaml:ro
     environment:
       - GOMAXPROCS=2
+      - CLUSTER_DATA_DIR=/cache/targetstore
     networks:
       - cluster-network
     depends_on:

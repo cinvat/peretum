@@ -59,9 +59,9 @@ docker compose logs -f edge-us-east-1
 | grafana | 3000 | Visualization (admin/admin) |
 
 Each edge runs in **lazy mode** (`cluster.lazy: true`): target configs are kept in
-the on-disk Pebble store and compiled on the first request to each host. A fresh
-edge pulls the full config snapshot from the control plane's `/sync` endpoint on
-first launch.
+the on-disk Pebble store (`/cache/targetstore` by default) and compiled on the first
+request to each host. A fresh edge pulls the full config snapshot from the control
+plane's `/sync` endpoint on first launch.
 
 ## Testing
 
@@ -141,8 +141,11 @@ cluster:
   replica_factor: 2        # replication factor for control plane HA
   control_plane: "control-plane:9001"
   lazy: true               # materialize target handlers on first request (CDN mode)
+  data_dir: "/cache/targetstore"  # Pebble store directory
   lru_size: 1000           # compiled-handler LRU capacity
 ```
+
+The Pebble store location can also be overridden via the `CLUSTER_DATA_DIR` environment variable (used in the Docker Compose setup).
 
 ## Cleanup
 
