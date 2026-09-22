@@ -12,7 +12,32 @@ type Upstream struct {
 	URL       string
 	Weight    int
 	Healthy   atomic.Bool
-	LastCheck time.Time
+	LastCheck AtomicTime
+}
+
+// AtomicTime lets an upstream's LastCheck be updated concurrently (MarkHealthy
+// in a request goroutine) while probeCandidate reads it without racing.
+type AtomicTime struct {
+	v atomic.Int64 // unix nanoseconds; 0 means the zero time
+}
+
+func (at *AtomicTime) Store(t time.Time) {
+	var n int64
+	if !t.IsZero() {
+		n = t.UnixNano()
+	}
+	at.v.Store(n)
+}
+
+func (at *AtomicTime) Load() time.Time {
+	if n := at.v.Load(); n != 0 {
+		return time.Unix(0, n)
+	}
+	return time.Time{}
+}
+
+func (at *AtomicTime) IsZero() bool {
+	return at.v.Load() == 0
 }
 
 type LoadBalancer interface {
@@ -30,7 +55,7 @@ type LoadBalancer interface {
 func probeCandidate(upstreams []*Upstream) *Upstream {
 	var candidate *Upstream
 	for _, u := range upstreams {
-		if candidate == nil || u.LastCheck.Before(candidate.LastCheck) {
+		if candidate == nil || u.LastCheck.Load().Before(candidate.LastCheck.Load()) {
 			candidate = u
 		}
 	}
@@ -69,7 +94,7 @@ func (rr *roundRobin) MarkHealthy(url string, healthy bool) {
 	for _, u := range rr.upstreams {
 		if u.URL == url {
 			u.Healthy.Store(healthy)
-			u.LastCheck = time.Now()
+			u.LastCheck.Store(time.Now())
 			return
 		}
 	}
@@ -140,7 +165,7 @@ func (wrr *weightedRoundRobin) MarkHealthy(url string, healthy bool) {
 	for _, u := range wrr.upstreams {
 		if u.URL == url {
 			u.Healthy.Store(healthy)
-			u.LastCheck = time.Now()
+			u.LastCheck.Store(time.Now())
 			return
 		}
 	}
@@ -237,7 +262,7 @@ func (m *maglev) MarkHealthy(url string, healthy bool) {
 	for _, u := range m.upstreams {
 		if u.URL == url {
 			u.Healthy.Store(healthy)
-			u.LastCheck = time.Now()
+			u.LastCheck.Store(time.Now())
 			break
 		}
 	}
@@ -288,7 +313,7 @@ func (lc *leastConnections) MarkHealthy(url string, healthy bool) {
 	for _, u := range lc.upstreams {
 		if u.URL == url {
 			u.Healthy.Store(healthy)
-			u.LastCheck = time.Now()
+			u.LastCheck.Store(time.Now())
 			return
 		}
 	}

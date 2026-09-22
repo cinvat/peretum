@@ -5,9 +5,12 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -16,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -31,6 +35,7 @@ import (
 	"github.com/cinvat/peretum/plugins/base"
 	"github.com/cinvat/peretum/plugins/registry"
 	"github.com/quic-go/quic-go/http3"
+	"gopkg.in/yaml.v3"
 	"k8s.io/klog/v2"
 )
 
@@ -58,6 +63,13 @@ type proxyServer struct {
 
 	// Health checkers for each target (keyed by target name).
 	healthCheckers map[string]*loadbalancer.HealthChecker
+
+	// Lazy mode (cluster.lazy): the Pebble target store holds cold configs
+	// off-RAM; lazyLRU caches compiled handlers for hot hosts; lazyRouter is
+	// the live router updated incrementally from control plane updates.
+	targetStore *cluster.TargetStore
+	lazyLRU     *cluster.LRUCache[string, *router.TargetConfigHandler]
+	lazyRouter  *router.HostRouter
 
 	// cfgPath/targetsDir are the config file and target directory the proxy
 	// was started with, so SIGHUP reloads re-read the same sources no matter
@@ -135,8 +147,37 @@ func newProxyServer(proxyCfg *config.ProxyConfig, targets []config.TargetConfig,
 					},
 				)
 			} else if proxyCfg.Cluster.ControlPlane != "" {
-				// Single control plane - just start streaming
+				// Single control plane - just start streaming. A single
+				// control plane is by definition the leader, which also makes
+				// its /sync snapshot endpoint available for lazy edges.
+				ps.clusterHTTP.SetLeader(true)
 				ps.startConfigStream()
+			}
+		}
+
+		// Lazy mode: open the on-disk target store (Pebble) so configs can
+		// stay off-RAM. The store is seeded/pulled from the control plane or
+		// config.d before the first router build (see ensureLazyStore).
+		if proxyCfg.Cluster.Lazy {
+			storeDir := proxyCfg.Cluster.DataDir
+			if storeDir == "" {
+				if proxyCfg.CacheDir != "" {
+					storeDir = filepath.Join(proxyCfg.CacheDir, "targetstore")
+				} else {
+					storeDir = filepath.Join(".peretum", "targetstore")
+				}
+			}
+			ts, err := cluster.OpenTargetStore(storeDir)
+			if err != nil {
+				klog.Errorf("failed to open target store at %s: %v", storeDir, err)
+			} else {
+				ps.targetStore = ts
+				lruSize := proxyCfg.Cluster.LRUSize
+				if lruSize <= 0 {
+					lruSize = 1000
+				}
+				ps.lazyLRU = cluster.NewLRUCache[string, *router.TargetConfigHandler](lruSize)
+				klog.Infof("lazy target loading enabled: store=%s lru_capacity=%d", storeDir, ps.lazyLRU.Capacity())
 			}
 		}
 	}
@@ -145,101 +186,36 @@ func newProxyServer(proxyCfg *config.ProxyConfig, targets []config.TargetConfig,
 }
 
 func (ps *proxyServer) buildHostRouter() *router.HostRouter {
+	// Lazy mode routes hosts through LazyHandler stubs; configs live in the
+	// Pebble store and are materialized on first request.
+	if ps.targetStore != nil {
+		return ps.buildLazyHostRouter()
+	}
+
 	hr := router.NewHostRouter()
-	targets := make(map[string]*router.TargetConfigHandler)
-	var defaultHandler *handler.TargetHandler
+	targets := make(map[string]http.Handler)
+	var defaultHandler http.Handler
 
 	// Build new health checkers for this configuration.
 	newHealthCheckers := make(map[string]*loadbalancer.HealthChecker)
 
 	for i := range ps.targets {
 		target := &ps.targets[i]
-		upstreams, err := target.ParseUpstreams()
+		tch, hc, err := ps.buildTargetConfigHandler(target)
 		if err != nil {
-			klog.Warningf("failed to parse upstreams for %s: %v", target.Name, err)
+			klog.Warningf("failed to build target %s: %v", target.Name, err)
 			continue
 		}
-		var lbUpstreams []*loadbalancer.Upstream
-		for _, u := range upstreams {
-			for _, uc := range target.Upstreams {
-				if u.String() == uc.URL {
-					lbUpstreams = append(lbUpstreams, &loadbalancer.Upstream{
-						URL:    u.String(),
-						Weight: uc.Weight,
-					})
-					break
-				}
-			}
-		}
-		lb := loadbalancer.New(target.LBAlgorithm, lbUpstreams)
-
-		// Create health checker if any upstream has health_check configured.
-		var hcConfig *loadbalancer.HealthCheckConfig
-		for _, uc := range target.Upstreams {
-			if uc.HealthCheck != nil && uc.HealthCheck.Path != "" {
-				interval := 10 * time.Second
-				if uc.HealthCheck.Interval != "" {
-					if d, err := time.ParseDuration(uc.HealthCheck.Interval); err == nil {
-						interval = d
-					}
-				}
-				timeout := 3 * time.Second
-				if uc.HealthCheck.Timeout != "" {
-					if d, err := time.ParseDuration(uc.HealthCheck.Timeout); err == nil {
-						timeout = d
-					}
-				}
-				expectedStatus := uc.HealthCheck.ExpectedStatus
-				if expectedStatus == 0 {
-					expectedStatus = 200
-				}
-				hcConfig = &loadbalancer.HealthCheckConfig{
-					Path:           uc.HealthCheck.Path,
-					Interval:       interval,
-					Timeout:        timeout,
-					ExpectedStatus: expectedStatus,
-					Headers:        uc.HealthCheck.Headers,
-				}
-				break
-			}
-		}
-		if hcConfig != nil {
-			hc := loadbalancer.NewHealthChecker(lb, hcConfig)
+		if hc != nil {
 			newHealthCheckers[target.Name] = hc
-			klog.Infof("enabled active health checks for target %s (path=%s, interval=%v, timeout=%v)", target.Name, hcConfig.Path, hcConfig.Interval, hcConfig.Timeout)
+			klog.Infof("enabled active health checks for target %s", target.Name)
 		}
 
-		var handlers []*handler.TargetHandler
-		var defaultLoc *handler.TargetHandler
-
-		for j := range target.Locations {
-			loc := &target.Locations[j]
-			h := handler.NewTargetHandler(target, loc, ps.diskCache, ps.writeSem, lb, ps.pluginMgr, ps.maxBodySize)
-			handlers = append(handlers, h)
-
-			if loc.Path == "/" && defaultLoc == nil {
-				defaultLoc = h
-			}
-		}
-
-		tch := &router.TargetConfigHandler{
-			Target:     target,
-			Handlers:   handlers,
-			DefaultLoc: defaultLoc,
-		}
-
-		hostKey := target.Name
-		if target.Listen != "" && !strings.HasPrefix(target.Listen, ":") {
-			if idx := strings.Index(target.Listen, ":"); idx != -1 {
-				hostKey = target.Listen[:idx]
-			} else {
-				hostKey = target.Listen
-			}
-		}
+		hostKey := targetHostKey(target)
 		targets[hostKey] = tch
 
-		if defaultHandler == nil {
-			defaultHandler = defaultLoc
+		if defaultHandler == nil && tch.DefaultLoc != nil {
+			defaultHandler = tch.DefaultLoc
 		}
 	}
 
@@ -261,6 +237,298 @@ func (ps *proxyServer) buildHostRouter() *router.HostRouter {
 
 	hr.Reload(targets, defaultHandler)
 	return hr
+}
+
+// buildTargetConfigHandler compiles a target into its per-location handlers.
+// It returns the compiled handler plus an (unstarted) health checker if any
+// upstream has active health checks configured, leaving the checker lifecycle
+// to the caller.
+func (ps *proxyServer) buildTargetConfigHandler(target *config.TargetConfig) (*router.TargetConfigHandler, *loadbalancer.HealthChecker, error) {
+	upstreams, err := target.ParseUpstreams()
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse upstreams: %w", err)
+	}
+
+	var lbUpstreams []*loadbalancer.Upstream
+	for _, u := range upstreams {
+		for _, uc := range target.Upstreams {
+			if u.String() == uc.URL {
+				lbUpstreams = append(lbUpstreams, &loadbalancer.Upstream{
+					URL:    u.String(),
+					Weight: uc.Weight,
+				})
+				break
+			}
+		}
+	}
+	lb := loadbalancer.New(target.LBAlgorithm, lbUpstreams)
+
+	// Create health checker if any upstream has health_check configured.
+	var hc *loadbalancer.HealthChecker
+	for _, uc := range target.Upstreams {
+		if uc.HealthCheck != nil && uc.HealthCheck.Path != "" {
+			hc = loadbalancer.NewHealthChecker(lb, buildHealthCheckConfig(uc.HealthCheck))
+			break
+		}
+	}
+
+	var handlers []*handler.TargetHandler
+	var defaultLoc *handler.TargetHandler
+	for j := range target.Locations {
+		loc := &target.Locations[j]
+		h := handler.NewTargetHandler(target, loc, ps.diskCache, ps.writeSem, lb, ps.pluginMgr, ps.maxBodySize)
+		handlers = append(handlers, h)
+
+		if loc.Path == "/" && defaultLoc == nil {
+			defaultLoc = h
+		}
+	}
+
+	return &router.TargetConfigHandler{
+		Target:     target,
+		Handlers:   handlers,
+		DefaultLoc: defaultLoc,
+	}, hc, nil
+}
+
+// buildHealthCheckConfig normalizes a target's health_check block into the
+// loadbalancer config with defaults applied.
+func buildHealthCheckConfig(uc *config.HealthCheckConfig) *loadbalancer.HealthCheckConfig {
+	interval := 10 * time.Second
+	if uc.Interval != "" {
+		if d, err := time.ParseDuration(uc.Interval); err == nil {
+			interval = d
+		}
+	}
+	timeout := 3 * time.Second
+	if uc.Timeout != "" {
+		if d, err := time.ParseDuration(uc.Timeout); err == nil {
+			timeout = d
+		}
+	}
+	expectedStatus := uc.ExpectedStatus
+	if expectedStatus == 0 {
+		expectedStatus = 200
+	}
+	return &loadbalancer.HealthCheckConfig{
+		Path:           uc.Path,
+		Interval:       interval,
+		Timeout:        timeout,
+		ExpectedStatus: expectedStatus,
+		Headers:        uc.Headers,
+	}
+}
+
+// targetHostKey derives the router host key for a target, honoring the
+// optional host-bearing `listen` field.
+func targetHostKey(target *config.TargetConfig) string {
+	if target.Listen != "" && !strings.HasPrefix(target.Listen, ":") {
+		if idx := strings.Index(target.Listen, ":"); idx != -1 {
+			return target.Listen[:idx]
+		}
+		return target.Listen
+	}
+	return target.Name
+}
+
+// buildLazyHostRouter builds the routing table from the set of *names* stored
+// on disk. Each host is served by a LazyHandler that materializes the target's
+// compiled handlers on first request and keeps them in a bounded LRU.
+func (ps *proxyServer) buildLazyHostRouter() *router.HostRouter {
+	hr := router.NewHostRouter()
+	targets := make(map[string]http.Handler)
+	var def http.Handler
+
+	names, err := ps.targetStore.ListTargets()
+	if err != nil {
+		klog.Errorf("lazy router: list targets from store: %v", err)
+	} else {
+		for name := range names {
+			key := name
+			targets[key] = router.NewLazyHandler(key, ps.lazyLRU, func() (*router.TargetConfigHandler, error) {
+				return ps.materializeTarget(key)
+			})
+			if key == "_default" {
+				def = targets[key]
+			}
+		}
+	}
+	hr.Reload(targets, def)
+	ps.lazyRouter = hr
+	return hr
+}
+
+// materializeTarget loads a target config from the Pebble store, compiles its
+// handlers, and returns the compiled TargetConfigHandler. Active health checks
+// are skipped for lazily loaded targets to avoid lifecycle bookkeeping on LRU
+// eviction; passive upstream health detection still applies.
+func (ps *proxyServer) materializeTarget(name string) (*router.TargetConfigHandler, error) {
+	_, data, ok, err := ps.targetStore.GetTarget(name)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("target %q not in store", name)
+	}
+
+	var t config.TargetConfig
+	if err := yaml.Unmarshal(data, &t); err != nil {
+		return nil, fmt.Errorf("target %s: %w", name, err)
+	}
+	if t.Name == "" {
+		t.Name = name
+	}
+
+	tch, hc, err := ps.buildTargetConfigHandler(&t)
+	if err != nil {
+		return nil, err
+	}
+	if hc != nil {
+		klog.Warningf("active health checks are disabled for lazily loaded target %s", name)
+	}
+	return tch, nil
+}
+
+// ensureLazyStore provisions the Pebble store before the first router build.
+// A non-empty store is used as-is (fast restart). An empty store pulls the
+// full config snapshot from the control plane on first launch; if the control
+// plane is unreachable it falls back to seeding from the local config.d.
+func (ps *proxyServer) ensureLazyStore() error {
+	if ps.targetStore == nil {
+		return nil
+	}
+
+	names, err := ps.targetStore.ListTargets()
+	if err != nil {
+		return fmt.Errorf("target store: %w", err)
+	}
+	if len(names) > 0 {
+		klog.Infof("target store already provisioned with %d targets", len(names))
+		return nil
+	}
+
+	// First launch: pull the full snapshot from the control plane.
+	if ps.proxyCfg != nil && ps.proxyCfg.Cluster != nil && ps.proxyCfg.Cluster.ControlPlane != "" {
+		if err := ps.pullTargetsFromControlPlane(); err == nil {
+			return nil
+		} else {
+			klog.Warningf("control plane pull failed (%v); seeding from local config.d", err)
+		}
+	}
+
+	// Fallback: seed from the local config.d targets.
+	for i := range ps.targets {
+		t := &ps.targets[i]
+		data, err := yaml.Marshal(t)
+		if err != nil {
+			klog.Errorf("seed target %s: %v", t.Name, err)
+			continue
+		}
+		sum := sha256.Sum256(data)
+		if err := ps.targetStore.PutTarget(t.Name, hex.EncodeToString(sum[:]), data); err != nil {
+			klog.Errorf("seed target %s: %v", t.Name, err)
+		}
+	}
+	return nil
+}
+
+// pullTargetsFromControlPlane fetches the full config snapshot from the leader
+// (/sync) and persists it to the local store.
+func (ps *proxyServer) pullTargetsFromControlPlane() error {
+	addr := ps.proxyCfg.Cluster.ControlPlane
+	base := addr
+	if !strings.HasPrefix(base, "http") {
+		base = "http://" + base
+	}
+	url := strings.TrimRight(base, "/") + "/sync"
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("control plane pull: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("control plane pull: %s", resp.Status)
+	}
+
+	var syncResp struct {
+		Targets map[string]struct {
+			Target  *config.TargetConfig `json:"target"`
+			Version string               `json:"version"`
+		} `json:"targets"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&syncResp); err != nil {
+		return fmt.Errorf("control plane pull: decode: %w", err)
+	}
+
+	for name, entry := range syncResp.Targets {
+		if entry.Target == nil {
+			continue
+		}
+		data, err := yaml.Marshal(entry.Target)
+		if err != nil {
+			return fmt.Errorf("control plane pull: marshal %s: %w", name, err)
+		}
+		version := entry.Version
+		if version == "" {
+			sum := sha256.Sum256(data)
+			version = hex.EncodeToString(sum[:])
+		}
+		if err := ps.targetStore.PutTarget(name, version, data); err != nil {
+			return fmt.Errorf("control plane pull: store %s: %w", name, err)
+		}
+	}
+	klog.Infof("pulled %d targets from control plane", len(syncResp.Targets))
+	return nil
+}
+
+// applyTargetUpdate persists a target config update from the control plane
+// and refreshes the lazy router to serve it on the next request.
+func (ps *proxyServer) applyTargetUpdate(update *cluster.TargetConfigUpdate) {
+	if update == nil {
+		return
+	}
+	klog.Infof("Received target config update from control plane: %s", update.TargetName)
+	ps.RecordTenantReload()
+
+	if ps.targetStore == nil {
+		return
+	}
+
+	data, err := yaml.Marshal(update.Config)
+	if err != nil {
+		klog.Errorf("store target update %s: marshal: %v", update.TargetName, err)
+		return
+	}
+	if err := ps.targetStore.PutTarget(update.TargetName, update.Version, data); err != nil {
+		klog.Errorf("store target update %s: %v", update.TargetName, err)
+		return
+	}
+
+	// Invalidate any compiled handler and re-point the router at a fresh stub.
+	key := update.TargetName
+	ps.lazyLRU.Delete(key)
+	if ps.lazyRouter != nil {
+		ps.lazyRouter.Upsert(key, router.NewLazyHandler(key, ps.lazyLRU, func() (*router.TargetConfigHandler, error) {
+			return ps.materializeTarget(key)
+		}))
+	}
+}
+
+// applyTargetDelete removes a target from the store and the lazy router.
+func (ps *proxyServer) applyTargetDelete(name string) {
+	klog.Infof("Received target delete from control plane: %s", name)
+	if ps.targetStore == nil {
+		return
+	}
+	if err := ps.targetStore.DeleteTarget(name); err != nil {
+		klog.Errorf("delete stored target %s: %v", name, err)
+	}
+	ps.lazyLRU.Delete(name)
+	if ps.lazyRouter != nil {
+		ps.lazyRouter.RemoveHost(name)
+	}
 }
 
 // buildFrontendHandler wraps the router with every plugin implementing
@@ -618,6 +886,13 @@ func (ps *proxyServer) listenerSpecs() ([]config.ListenersSpec, error) {
 
 func (ps *proxyServer) start() error {
 	klog.Infof("start() called")
+
+	// Provision the lazy target store (pull/seed on first launch) before the
+	// router is built from it.
+	if err := ps.ensureLazyStore(); err != nil {
+		klog.Errorf("lazy target store init failed: %v", err)
+	}
+
 	ps.router = ps.buildHostRouter()
 	ps.frontend = ps.buildFrontendHandler()
 
@@ -807,6 +1082,14 @@ func (ps *proxyServer) shutdown(ctx context.Context) error {
 		ps.leaderElection.Stop()
 	}
 
+	// Close the lazy target store (flushes pending config writes to Pebble).
+	if ps.targetStore != nil {
+		if err := ps.targetStore.Close(); err != nil {
+			klog.Errorf("target store close error: %v", err)
+		}
+		ps.targetStore = nil
+	}
+
 	signal.Reset(syscall.SIGHUP)
 
 	// Stop all health checkers.
@@ -888,11 +1171,10 @@ func (ps *proxyServer) startConfigStream() {
 			klog.Infof("Received global config update from control plane: %s", update.Version)
 		},
 		func(update *cluster.TargetConfigUpdate) {
-			klog.Infof("Received target config update from control plane: %s", update.TargetName)
-			ps.RecordTenantReload()
+			ps.applyTargetUpdate(update)
 		},
 		func(targetName string) {
-			klog.Infof("Received target delete from control plane: %s", targetName)
+			ps.applyTargetDelete(targetName)
 		},
 	)
 

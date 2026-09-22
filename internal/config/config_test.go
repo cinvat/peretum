@@ -397,3 +397,32 @@ func TestResolveListenAddr(t *testing.T) {
 		}
 	}
 }
+
+func TestParseClusterLazyConfig(t *testing.T) {
+	path := writeTemp(t, "cfg.yaml", `
+listeners:
+  - ":8080"
+cluster:
+  enabled: true
+  lazy: true
+  data_dir: "/var/peretum/store"
+  lru_size: 5000
+  control_plane: "cp:9001"
+`)
+	cfg, err := LoadProxy(path)
+	if err != nil {
+		t.Fatalf("LoadProxy: %v", err)
+	}
+	if cfg.Cluster == nil || !cfg.Cluster.Enabled || !cfg.Cluster.Lazy {
+		t.Fatalf("cluster = %+v", cfg.Cluster)
+	}
+	if cfg.Cluster.DataDir != "/var/peretum/store" {
+		t.Fatalf("data_dir = %q", cfg.Cluster.DataDir)
+	}
+	if cfg.Cluster.LRUSize != 5000 {
+		t.Fatalf("lru_size = %d", cfg.Cluster.LRUSize)
+	}
+	if cfg.Cluster.ControlPlane != "cp:9001" {
+		t.Fatalf("control_plane = %q", cfg.Cluster.ControlPlane)
+	}
+}

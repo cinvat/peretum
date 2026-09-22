@@ -11,8 +11,8 @@ import (
 )
 
 type HostRouter struct {
-	targets        map[string]*TargetConfigHandler
-	defaultHandler *handler.TargetHandler
+	targets        map[string]http.Handler
+	defaultHandler http.Handler
 	mu             sync.RWMutex
 }
 
@@ -24,7 +24,7 @@ type TargetConfigHandler struct {
 
 func NewHostRouter() *HostRouter {
 	return &HostRouter{
-		targets: make(map[string]*TargetConfigHandler),
+		targets: make(map[string]http.Handler),
 	}
 }
 
@@ -101,20 +101,36 @@ func (tch *TargetConfigHandler) ServeHTTP(w http.ResponseWriter, req *http.Reque
 	http.Error(w, "No matching location", http.StatusNotFound)
 }
 
-func (hr *HostRouter) Reload(targets map[string]*TargetConfigHandler, defaultHandler *handler.TargetHandler) {
+func (hr *HostRouter) Reload(targets map[string]http.Handler, defaultHandler http.Handler) {
 	hr.mu.Lock()
 	defer hr.mu.Unlock()
 	hr.targets = targets
 	hr.defaultHandler = defaultHandler
 }
 
-func (hr *HostRouter) GetTargets() map[string]*TargetConfigHandler {
+// Upsert installs (or replaces) a single host handler without rebuilding the
+// whole routing table. Used for incremental lazy-mode updates.
+func (hr *HostRouter) Upsert(host string, h http.Handler) {
+	hr.mu.Lock()
+	defer hr.mu.Unlock()
+	hr.targets[host] = h
+}
+
+// RemoveHost deletes a host from the routing table. In-flight requests hold
+// the old handler pointer, so they finish safely.
+func (hr *HostRouter) RemoveHost(host string) {
+	hr.mu.Lock()
+	defer hr.mu.Unlock()
+	delete(hr.targets, host)
+}
+
+func (hr *HostRouter) GetTargets() map[string]http.Handler {
 	hr.mu.RLock()
 	defer hr.mu.RUnlock()
 	return hr.targets
 }
 
-func (hr *HostRouter) GetDefaultHandler() *handler.TargetHandler {
+func (hr *HostRouter) GetDefaultHandler() http.Handler {
 	hr.mu.RLock()
 	defer hr.mu.RUnlock()
 	return hr.defaultHandler

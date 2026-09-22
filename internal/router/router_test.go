@@ -99,9 +99,9 @@ func TestHostRouterServeHTTP(t *testing.T) {
 
 	hr := NewHostRouter()
 	tch := &TargetConfigHandler{Handlers: []*handler.TargetHandler{hExact}}
-	hr.Reload(map[string]*TargetConfigHandler{
+	hr.Reload(map[string]http.Handler{
 		"svc-a":    tch,
-		"_default": {Handlers: []*handler.TargetHandler{hDefault}},
+		"_default": &TargetConfigHandler{Handlers: []*handler.TargetHandler{hDefault}},
 	}, hDefault)
 
 	// Exact host.
@@ -130,7 +130,7 @@ func TestHostRouterServeHTTP(t *testing.T) {
 
 	// Unknown host, no _default target but a default handler.
 	hr2 := NewHostRouter()
-	hr2.Reload(map[string]*TargetConfigHandler{}, hDefault)
+	hr2.Reload(map[string]http.Handler{}, hDefault)
 	rec4 := httptest.NewRecorder()
 	req4 := httptest.NewRequest(http.MethodGet, "http://unknown.svc/", nil)
 	hr2.ServeHTTP(rec4, req4)
@@ -155,7 +155,7 @@ func TestReload(t *testing.T) {
 	def := testTargetHandler(t, ts, "def", &config.LocationConfig{Path: "/", MatchType: config.MatchPrefix})
 
 	hr := NewHostRouter()
-	targets := map[string]*TargetConfigHandler{"x": {Handlers: []*handler.TargetHandler{h}}}
+	targets := map[string]http.Handler{"x": &TargetConfigHandler{Handlers: []*handler.TargetHandler{h}}}
 	hr.Reload(targets, def)
 
 	if got := hr.GetTargets(); len(got) != 1 || got["x"] == nil {

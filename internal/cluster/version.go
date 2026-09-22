@@ -171,20 +171,19 @@ func (cvs *ConfigVersionStore) GetTarget(name string) (*TargetConfigVersion, boo
 		return nil, false
 	}
 
-	// Update access stats (async to avoid lock contention)
+	// Update access stats and promote to the hot tier under the lock.
+	// This is async (not inline) to avoid holding the lock for every request.
 	go func() {
 		cvs.mu.Lock()
+		defer cvs.mu.Unlock()
 		if t, ok := cvs.targets[name]; ok {
 			t.AccessedAt = time.Now()
 			t.AccessCount++
+			if t.AccessCount > 10 {
+				cvs.hotTier.Put(name, t)
+			}
 		}
-		cvs.mu.Unlock()
 	}()
-
-	// Also add to hot tier if frequently accessed
-	if target.AccessCount > 10 {
-		cvs.hotTier.Put(name, target)
-	}
 
 	return target, true
 }

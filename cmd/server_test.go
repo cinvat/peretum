@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cinvat/peretum/internal/cluster"
 	"github.com/cinvat/peretum/internal/config"
 	"github.com/cinvat/peretum/internal/plugin/manager"
 	"github.com/cinvat/peretum/internal/router"
@@ -1606,5 +1608,171 @@ func TestServeErrorShutdownFailureLogs(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("start() never returned after serve/shutdown failure")
+	}
+}
+
+// --- Lazy mode (cluster.lazy) tests ---
+
+func lazyTestStore(t *testing.T) *cluster.TargetStore {
+	t.Helper()
+	store, err := cluster.OpenTargetStore(filepath.Join(t.TempDir(), "store"))
+	if err != nil {
+		t.Fatalf("OpenTargetStore: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	return store
+}
+
+func lazyEchoUpstream(t *testing.T, body string) string {
+	t.Helper()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, body)
+	}))
+	t.Cleanup(ts.Close)
+	return ts.URL
+}
+
+func TestLazyModeServesFromStore(t *testing.T) {
+	store := lazyTestStore(t)
+	url := lazyEchoUpstream(t, "lazy-upstream")
+
+	targetYAML := fmt.Sprintf("name: svc.lazy\nupstreams:\n  - url: %s\nlocations:\n  - path: /\n", url)
+	if err := store.PutTarget("svc.lazy", "v1", []byte(targetYAML)); err != nil {
+		t.Fatalf("PutTarget: %v", err)
+	}
+
+	ps := &proxyServer{targetStore: store}
+	ps.lazyLRU = cluster.NewLRUCache[string, *router.TargetConfigHandler](16)
+	ps.router = ps.buildHostRouter()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://svc.lazy/", nil)
+	ps.router.ServeHTTP(rec, req)
+	if rec.Body.String() != "lazy-upstream" {
+		t.Fatalf("lazy serve body = %q", rec.Body.String())
+	}
+}
+
+func TestPullTargetsFromControlPlane(t *testing.T) {
+	url := lazyEchoUpstream(t, "snap-upstream")
+
+	snap := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"targets": map[string]interface{}{
+				"svc.snap": map[string]interface{}{
+					"target": map[string]interface{}{
+						"name":      "svc.snap",
+						"upstreams": []interface{}{map[string]interface{}{"url": url}},
+						"locations": []interface{}{map[string]interface{}{"path": "/"}},
+					},
+					"version": "abc",
+				},
+			},
+		})
+	}))
+	defer snap.Close()
+
+	store := lazyTestStore(t)
+	ps := &proxyServer{
+		targetStore: store,
+		proxyCfg:    &config.ProxyConfig{Cluster: &config.ClusterConfig{ControlPlane: snap.URL}},
+	}
+
+	if err := ps.ensureLazyStore(); err != nil {
+		t.Fatalf("ensureLazyStore: %v", err)
+	}
+	names, err := store.ListTargets()
+	if err != nil {
+		t.Fatalf("ListTargets: %v", err)
+	}
+	if len(names) != 1 || names["svc.snap"] != "abc" {
+		t.Fatalf("store after pull = %v", names)
+	}
+
+	ps.lazyLRU = cluster.NewLRUCache[string, *router.TargetConfigHandler](16)
+	ps.router = ps.buildHostRouter()
+	rec := httptest.NewRecorder()
+	ps.router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc.snap/", nil))
+	if rec.Body.String() != "snap-upstream" {
+		t.Fatalf("pulled target body = %q", rec.Body.String())
+	}
+}
+
+func TestEnsureLazyStoreSeedsFromLocalTargets(t *testing.T) {
+	store := lazyTestStore(t)
+	ps := &proxyServer{
+		targetStore: store,
+		targets: []config.TargetConfig{{
+			Name:      "t1",
+			Upstreams: []config.UpstreamConfig{{URL: "http://x:1"}},
+			Locations: []config.LocationConfig{{Path: "/"}},
+		}},
+	}
+	if err := ps.ensureLazyStore(); err != nil {
+		t.Fatalf("ensureLazyStore: %v", err)
+	}
+	names, _ := store.ListTargets()
+	if len(names) != 1 || names["t1"] == "" {
+		t.Fatalf("seeded store = %v", names)
+	}
+
+	// Already provisioned: a second run must leave the store alone even when
+	// the local targets slice is now empty.
+	ps.targets = nil
+	if err := ps.ensureLazyStore(); err != nil {
+		t.Fatalf("ensureLazyStore (provisioned): %v", err)
+	}
+	names, _ = store.ListTargets()
+	if len(names) != 1 {
+		t.Fatalf("store changed after re-provision = %v", names)
+	}
+}
+
+func TestEnsureLazyStoreSkipsWithoutStore(t *testing.T) {
+	ps := &proxyServer{}
+	if err := ps.ensureLazyStore(); err != nil {
+		t.Fatalf("ensureLazyStore with nil store = %v", err)
+	}
+}
+
+func TestLazyControlPlaneUpdateAndDelete(t *testing.T) {
+	store := lazyTestStore(t)
+	url := lazyEchoUpstream(t, "updated-body")
+
+	ps := &proxyServer{targetStore: store}
+	ps.lazyLRU = cluster.NewLRUCache[string, *router.TargetConfigHandler](16)
+	ps.router = ps.buildHostRouter()
+
+	ps.applyTargetUpdate(&cluster.TargetConfigUpdate{
+		TargetName: "svc.upd",
+		Version:    "v2",
+		Config: map[string]interface{}{
+			"name":      "svc.upd",
+			"upstreams": []interface{}{map[string]interface{}{"url": url}},
+			"locations": []interface{}{map[string]interface{}{"path": "/"}},
+		},
+	})
+
+	ver, _, ok, err := store.GetTarget("svc.upd")
+	if err != nil || !ok || ver != "v2" {
+		t.Fatalf("store after update = ok %v version %q err %v", ok, ver, err)
+	}
+	if ps.lazyRouter.GetTargets()["svc.upd"] == nil {
+		t.Fatal("router missing target after update")
+	}
+
+	rec := httptest.NewRecorder()
+	ps.router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc.upd/", nil))
+	if rec.Body.String() != "updated-body" {
+		t.Fatalf("updated target body = %q", rec.Body.String())
+	}
+
+	ps.applyTargetDelete("svc.upd")
+	if _, _, ok, _ := store.GetTarget("svc.upd"); ok {
+		t.Fatal("target still in store after delete")
+	}
+	if ps.lazyRouter.GetTargets()["svc.upd"] != nil {
+		t.Fatal("target still routed after delete")
 	}
 }

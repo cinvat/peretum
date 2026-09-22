@@ -124,13 +124,16 @@ func TestRoundRobinUnhealthyRecoversViaProbe(t *testing.T) {
 func TestProbeCandidate(t *testing.T) {
 	old := time.Unix(100, 0)
 	recent := time.Unix(200, 0)
-	ups := []*Upstream{{URL: "a", LastCheck: old}, {URL: "b", LastCheck: recent}}
+	ups := []*Upstream{{URL: "a"}, {URL: "b"}}
+	ups[0].LastCheck.Store(old)
+	ups[1].LastCheck.Store(recent)
 	if u := probeCandidate(ups); u == nil || u.URL != "a" {
 		t.Fatalf("expected oldest check candidate a, got %+v", u)
 	}
 
 	// Never-probed upstreams (zero LastCheck) win as the probe candidate.
-	newer := []*Upstream{{URL: "x", LastCheck: recent}, {URL: "y"}}
+	newer := []*Upstream{{URL: "x"}, {URL: "y"}}
+	newer[0].LastCheck.Store(recent)
 	if u := probeCandidate(newer); u == nil || u.URL != "y" {
 		t.Fatalf("expected never-checked candidate y, got %+v", u)
 	}

@@ -43,9 +43,10 @@ waf:
 
 cluster:
   enabled: true
-  node_id: "edge-us-east-1"           # unique ID for this edge node
-  replica_factor: 3                   # replication factor for sharding
-  control_plane: "control-plane.example.com:9001"  # gRPC control plane address
+  replica_factor: 3                   # replication factor for control plane HA
+  control_plane: "control-plane.example.com:9001"  # control plane address (HTTP :9001)
+  lazy: true                          # keep target configs on disk, compile on first request
+  lru_size: 1000                      # compiled-handler LRU capacity
 ```
 
 ## Reference
@@ -65,7 +66,7 @@ cluster:
 | `json_log` | object | See [JSON logs](../plugins/jsonlog.md). |
 | `error_page` | object | See [Error pages](../plugins/errorpage.md). |
 | `waf` | object | Global WAF settings: `enabled`, `geolite_dir`, `max_body_size` (see [WAF](../plugins/waf.md)). |
-| `cluster` | object | Cluster settings: `enabled`, `node_id`, `replica_factor`, `control_plane` (see [Cluster Mode](../configuration/cluster.md)). |
+| `cluster` | object | Cluster settings: `enabled`, `replica_factor`, `control_plane`, `lazy`, `data_dir`, `lru_size` (see [Cluster Mode](../configuration/cluster.md)). |
 
 ## Size strings
 

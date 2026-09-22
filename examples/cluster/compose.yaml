@@ -3,7 +3,7 @@ services:
     build: .
     container_name: peretum-control-plane
     ports:
-      - "9001:9001"   # gRPC
+      - "9001:9001"   # control plane HTTP
     volumes:
       - ./config.d:/config.d:ro
       - ./data/controlplane:/data
@@ -36,8 +36,6 @@ services:
       - ./config.yaml:/config.yaml:ro
     environment:
       - GOMAXPROCS=2
-      - NODE_ID=edge-us-east-1
-      - CONTROL_PLANE=control-plane:9001
     networks:
       - cluster-network
     depends_on:
@@ -67,8 +65,6 @@ services:
       - ./config.yaml:/config.yaml:ro
     environment:
       - GOMAXPROCS=2
-      - NODE_ID=edge-us-west-1
-      - CONTROL_PLANE=control-plane:9001
     networks:
       - cluster-network
     depends_on:
@@ -98,8 +94,6 @@ services:
       - ./config.yaml:/config.yaml:ro
     environment:
       - GOMAXPROCS=2
-      - NODE_ID=edge-eu-central-1
-      - CONTROL_PLANE=control-plane:9001
     networks:
       - cluster-network
     depends_on:

@@ -32,12 +32,13 @@ The default command runs the proxy with a graceful shutdown: `SIGINT` /
 
 | Command | Description |
 | --- | --- |
-| `controlplane` | Run the CDN control plane (gRPC config distribution server) |
+| `controlplane` | Run the CDN control plane (HTTP config snapshot server) |
 
 ### `controlplane`
 
-Starts the gRPC control plane that distributes configuration to edge nodes.
-It watches the config directory for changes and streams delta updates to connected edge nodes.
+Starts the HTTP control plane that serves config snapshots to edge nodes. Edges
+pull the full config from `/sync` on first launch (lazy mode) and the control
+plane keeps its snapshot store in sync with the config directory.
 
 ```bash
 peretum controlplane [flags]
@@ -45,7 +46,7 @@ peretum controlplane [flags]
 
 | Flag | Description | Default |
 | --- | --- | --- |
-| `--listen` | gRPC listen address | `:9001` |
+| `--listen` | HTTP listen address | `:9001` |
 | `--config-dir` | Directory of target config files to watch | `config.d` |
 | `--data-dir` | Directory for persistent data (snapshots, state) | `./controlplane-data` |
 

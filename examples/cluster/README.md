@@ -7,15 +7,16 @@ A complete Docker Compose setup to demonstrate Peretum's cluster mode features o
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Control Plane                            │
-│  (Config Distribution - gRPC :9001)                             │
+│  (Config Distribution - HTTP :9001, /sync snapshots)            │
 └──────────────────────────┬──────────────────────────────────────┘
-                           │ gRPC streaming
+                           │ full snapshot on first launch + streaming updates
         ┌──────────────────┼──────────────────┐
         ▼                  ▼                  ▼
 ┌───────────────┐   ┌───────────────┐   ┌───────────────┐
 │  Edge US East │   │ Edge US West  │   │ Edge EU Cent  │
 │  :8080/:8443  │   │  :8081/:8444  │   │  :8082/:8445  │
 │  Metrics:9090 │   │ Metrics:9091  │   │ Metrics:9092  │
+│  Pebble + LRU │   │ Pebble + LRU  │   │ Pebble + LRU  │
 └───────┬───────┘   └───────┬───────┘   └───────┬───────┘
         │                   │                   │
         └───────────────────┼───────────────────┘
@@ -47,7 +48,7 @@ docker compose logs -f edge-us-east-1
 
 | Service | Ports | Description |
 |---------|-------|-------------|
-| control-plane | 9001 | gRPC config distribution |
+| control-plane | 9001 | HTTP control plane (config snapshots) |
 | edge-us-east-1 | 8080/8443/9090 | Edge node 1 (US East) |
 | edge-us-west-1 | 8081/8444/9091 | Edge node 2 (US West) |
 | edge-eu-central-1 | 8082/8445/9092 | Edge node 3 (EU Central) |
@@ -57,16 +58,29 @@ docker compose logs -f edge-us-east-1
 | prometheus | 9090 | Metrics collection |
 | grafana | 3000 | Visualization (admin/admin) |
 
+Each edge runs in **lazy mode** (`cluster.lazy: true`): target configs are kept in
+the on-disk Pebble store and compiled on the first request to each host. A fresh
+edge pulls the full config snapshot from the control plane's `/sync` endpoint on
+first launch.
+
 ## Testing
 
-### Test cache hit/miss
+### Test lazy materialization
 
 ```bash
-# First request - MISS
+# First request - compiles the target handler from the Pebble store, cache MISS
 curl -I http://localhost:8080/api/users
 
 # Second request - HIT (cached)
 curl -I http://localhost:8080/api/users
+```
+
+### Test cache hit header
+
+```bash
+curl -I http://localhost:8080/api/users
+# X-Cache: HIT
+# X-Cache-Status: enabled
 ```
 
 ### Test live streaming cache bypass
@@ -76,14 +90,6 @@ curl -I http://localhost:8080/api/users
 curl -I http://localhost:8080/live/stream.m3u8
 curl -I http://localhost:8080/live/segment_001.ts
 # Both return Cache-Control: no-store
-```
-
-### Test cache hit header
-
-```bash
-curl -I http://localhost:8080/api/users
-# X-Cache: HIT
-# X-Cache-Status: enabled
 ```
 
 ### Test health checks
@@ -109,8 +115,11 @@ open http://localhost:3000
 ### Test control plane
 
 ```bash
-# Check connected edges
+# Check control plane snapshot stats
 curl -s http://localhost:9001/stats | jq
+
+# Pull the full target snapshot the way an edge does on first launch
+curl -s http://localhost:9001/sync
 ```
 
 ## Configuration
@@ -128,19 +137,14 @@ Key configuration files:
 
 ```yaml
 cluster:
-  enabled: false           # full replication (recommended for CDN)
+  enabled: true            # enable cluster features
   replica_factor: 2        # replication factor for control plane HA
   control_plane: "control-plane:9001"
+  lazy: true               # materialize target handlers on first request (CDN mode)
+  lru_size: 1000           # compiled-handler LRU capacity
 ```
 
-## Testing
-
-### Test control plane
-
-```bash
-# Check connected edges
-curl -s http://localhost:9001/stats | jq
-```
+## Cleanup
 
 ```bash
 # Stop and remove everything
