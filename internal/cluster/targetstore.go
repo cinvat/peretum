@@ -2,10 +2,11 @@ package cluster
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 
 	"github.com/cockroachdb/pebble"
 )
@@ -15,6 +16,9 @@ const (
 	versionKeyPrefix = "v/"
 	globalKey        = "g"
 )
+
+// ErrNotFound is returned when a key is not found in the store.
+var ErrNotFound = errors.New("not found")
 
 // TargetStore is the local persistent store on an edge node. Target configs
 // live on disk (backed by Pebble) instead of RAM, which lets a single edge
@@ -32,7 +36,6 @@ const (
 // name -> version index after a restart.
 type TargetStore struct {
 	db *pebble.DB
-	mu sync.Mutex
 }
 
 // OpenTargetStore opens (or creates) the Pebble-backed store at dir.
@@ -49,30 +52,24 @@ func OpenTargetStore(dir string) (*TargetStore, error) {
 
 // Close flushes and closes the store.
 func (ts *TargetStore) Close() error {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
 	return ts.db.Close()
 }
 
 // PutGlobal stores the global config blob.
-func (ts *TargetStore) PutGlobal(data []byte) error {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
+func (ts *TargetStore) PutGlobal(ctx context.Context, data []byte) error {
+	_ = ctx
 	return ts.db.Set([]byte(globalKey), data, pebble.NoSync)
 }
 
 // GetGlobal returns the stored global config and whether it exists.
-func (ts *TargetStore) GetGlobal() ([]byte, bool, error) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
+func (ts *TargetStore) GetGlobal(ctx context.Context) ([]byte, bool, error) {
+	_ = ctx // Pebble doesn't support context cancellation yet
 	return ts.get(globalKey)
 }
 
 // PutTarget stores a target config blob and its version atomically.
-func (ts *TargetStore) PutTarget(name, version string, data []byte) error {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-
+func (ts *TargetStore) PutTarget(ctx context.Context, name, version string, data []byte) error {
+	_ = ctx
 	b := ts.db.NewBatch()
 	defer b.Close()
 	if err := b.Set([]byte(targetKeyPrefix+name), data, pebble.NoSync); err != nil {
@@ -85,9 +82,8 @@ func (ts *TargetStore) PutTarget(name, version string, data []byte) error {
 }
 
 // GetTarget returns the version and YAML blob for a target.
-func (ts *TargetStore) GetTarget(name string) (version string, data []byte, ok bool, err error) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
+func (ts *TargetStore) GetTarget(ctx context.Context, name string) (version string, data []byte, ok bool, err error) {
+	_ = ctx
 
 	data, ok, err = ts.get(targetKeyPrefix + name)
 	if err != nil || !ok {
@@ -101,10 +97,8 @@ func (ts *TargetStore) GetTarget(name string) (version string, data []byte, ok b
 }
 
 // DeleteTarget removes a target and its version.
-func (ts *TargetStore) DeleteTarget(name string) error {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-
+func (ts *TargetStore) DeleteTarget(ctx context.Context, name string) error {
+	_ = ctx
 	b := ts.db.NewBatch()
 	defer b.Close()
 	if err := b.Delete([]byte(targetKeyPrefix+name), pebble.NoSync); err != nil {
@@ -119,17 +113,16 @@ func (ts *TargetStore) DeleteTarget(name string) error {
 // ListTargets returns every stored target name mapped to its version. It
 // walks only the version keys, so restart index rebuilds stay fast even with
 // millions of configs.
-func (ts *TargetStore) ListTargets() (map[string]string, error) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
+func (ts *TargetStore) ListTargets(ctx context.Context) (map[string]string, error) {
+	_ = ctx
 
-	names := make(map[string]string)
 	iter, err := ts.db.NewIter(nil)
 	if err != nil {
 		return nil, err
 	}
 	defer iter.Close()
 
+	names := make(map[string]string)
 	prefix := []byte(versionKeyPrefix)
 	for valid := iter.SeekGE(prefix); valid; valid = iter.Next() {
 		key := iter.Key()
@@ -142,15 +135,29 @@ func (ts *TargetStore) ListTargets() (map[string]string, error) {
 	return names, nil
 }
 
-// TargetCount returns the number of stored targets.
-func (ts *TargetStore) TargetCount() (int, error) {
-	names, err := ts.ListTargets()
+// TargetCount returns the number of stored targets without allocating the full map.
+func (ts *TargetStore) TargetCount(ctx context.Context) (int, error) {
+	_ = ctx
+
+	iter, err := ts.db.NewIter(nil)
 	if err != nil {
 		return 0, err
 	}
-	return len(names), nil
+	defer iter.Close()
+
+	count := 0
+	prefix := []byte(versionKeyPrefix)
+	for valid := iter.SeekGE(prefix); valid; valid = iter.Next() {
+		if !bytes.HasPrefix(iter.Key(), prefix) {
+			break
+		}
+		count++
+	}
+	return count, nil
 }
 
+// get retrieves a value by key. The returned slice is a copy safe to use after
+// the closer is closed.
 func (ts *TargetStore) get(key string) ([]byte, bool, error) {
 	value, closer, err := ts.db.Get([]byte(key))
 	if err == pebble.ErrNotFound {

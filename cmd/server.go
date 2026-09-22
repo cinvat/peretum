@@ -35,6 +35,7 @@ import (
 	"github.com/cinvat/peretum/plugins/base"
 	"github.com/cinvat/peretum/plugins/registry"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/samber/lo"
 	"gopkg.in/yaml.v3"
 	"k8s.io/klog/v2"
 )
@@ -249,16 +250,18 @@ func (ps *proxyServer) buildTargetConfigHandler(target *config.TargetConfig) (*r
 		return nil, nil, fmt.Errorf("parse upstreams: %w", err)
 	}
 
+	// Build URL -> UpstreamConfig map for O(1) lookup instead of O(n*m) nested loop
+	ucByURL := lo.SliceToMap(target.Upstreams, func(uc config.UpstreamConfig) (string, config.UpstreamConfig) {
+		return uc.URL, uc
+	})
+
 	var lbUpstreams []*loadbalancer.Upstream
 	for _, u := range upstreams {
-		for _, uc := range target.Upstreams {
-			if u.String() == uc.URL {
-				lbUpstreams = append(lbUpstreams, &loadbalancer.Upstream{
-					URL:    u.String(),
-					Weight: uc.Weight,
-				})
-				break
-			}
+		if uc, ok := ucByURL[u.String()]; ok {
+			lbUpstreams = append(lbUpstreams, &loadbalancer.Upstream{
+				URL:    u.String(),
+				Weight: uc.Weight,
+			})
 		}
 	}
 	lb := loadbalancer.New(target.LBAlgorithm, lbUpstreams)
@@ -339,14 +342,14 @@ func (ps *proxyServer) buildLazyHostRouter() *router.HostRouter {
 	targets := make(map[string]http.Handler)
 	var def http.Handler
 
-	names, err := ps.targetStore.ListTargets()
+	names, err := ps.targetStore.ListTargets(context.Background())
 	if err != nil {
 		klog.Errorf("lazy router: list targets from store: %v", err)
 	} else {
 		for name := range names {
 			key := name
-			targets[key] = router.NewLazyHandler(key, ps.lazyLRU, func() (*router.TargetConfigHandler, error) {
-				return ps.materializeTarget(key)
+			targets[key] = router.NewLazyHandler(key, ps.lazyLRU, func(ctx context.Context) (*router.TargetConfigHandler, error) {
+				return ps.materializeTarget(ctx, key)
 			})
 			if key == "_default" {
 				def = targets[key]
@@ -362,8 +365,8 @@ func (ps *proxyServer) buildLazyHostRouter() *router.HostRouter {
 // handlers, and returns the compiled TargetConfigHandler. Active health checks
 // are skipped for lazily loaded targets to avoid lifecycle bookkeeping on LRU
 // eviction; passive upstream health detection still applies.
-func (ps *proxyServer) materializeTarget(name string) (*router.TargetConfigHandler, error) {
-	_, data, ok, err := ps.targetStore.GetTarget(name)
+func (ps *proxyServer) materializeTarget(ctx context.Context, name string) (*router.TargetConfigHandler, error) {
+	_, data, ok, err := ps.targetStore.GetTarget(ctx, name)
 	if err != nil {
 		return nil, err
 	}
@@ -398,7 +401,8 @@ func (ps *proxyServer) ensureLazyStore() error {
 		return nil
 	}
 
-	names, err := ps.targetStore.ListTargets()
+	ctx := context.Background()
+	names, err := ps.targetStore.ListTargets(ctx)
 	if err != nil {
 		return fmt.Errorf("target store: %w", err)
 	}
@@ -409,7 +413,7 @@ func (ps *proxyServer) ensureLazyStore() error {
 
 	// First launch: pull the full snapshot from the control plane.
 	if ps.proxyCfg != nil && ps.proxyCfg.Cluster != nil && ps.proxyCfg.Cluster.ControlPlane != "" {
-		if err := ps.pullTargetsFromControlPlane(); err == nil {
+		if err := ps.pullTargetsFromControlPlane(ctx); err == nil {
 			return nil
 		} else {
 			klog.Warningf("control plane pull failed (%v); seeding from local config.d", err)
@@ -425,7 +429,7 @@ func (ps *proxyServer) ensureLazyStore() error {
 			continue
 		}
 		sum := sha256.Sum256(data)
-		if err := ps.targetStore.PutTarget(t.Name, hex.EncodeToString(sum[:]), data); err != nil {
+		if err := ps.targetStore.PutTarget(ctx, t.Name, hex.EncodeToString(sum[:]), data); err != nil {
 			klog.Errorf("seed target %s: %v", t.Name, err)
 		}
 	}
@@ -434,7 +438,7 @@ func (ps *proxyServer) ensureLazyStore() error {
 
 // pullTargetsFromControlPlane fetches the full config snapshot from the leader
 // (/sync) and persists it to the local store.
-func (ps *proxyServer) pullTargetsFromControlPlane() error {
+func (ps *proxyServer) pullTargetsFromControlPlane(ctx context.Context) error {
 	addr := ps.proxyCfg.Cluster.ControlPlane
 	base := addr
 	if !strings.HasPrefix(base, "http") {
@@ -442,8 +446,12 @@ func (ps *proxyServer) pullTargetsFromControlPlane() error {
 	}
 	url := strings.TrimRight(base, "/") + "/sync"
 
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Get(url)
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("control plane pull: %w", err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("control plane pull: %w", err)
 	}
@@ -475,7 +483,7 @@ func (ps *proxyServer) pullTargetsFromControlPlane() error {
 			sum := sha256.Sum256(data)
 			version = hex.EncodeToString(sum[:])
 		}
-		if err := ps.targetStore.PutTarget(name, version, data); err != nil {
+		if err := ps.targetStore.PutTarget(ctx, name, version, data); err != nil {
 			return fmt.Errorf("control plane pull: store %s: %w", name, err)
 		}
 	}
@@ -501,7 +509,7 @@ func (ps *proxyServer) applyTargetUpdate(update *cluster.TargetConfigUpdate) {
 		klog.Errorf("store target update %s: marshal: %v", update.TargetName, err)
 		return
 	}
-	if err := ps.targetStore.PutTarget(update.TargetName, update.Version, data); err != nil {
+	if err := ps.targetStore.PutTarget(context.Background(), update.TargetName, update.Version, data); err != nil {
 		klog.Errorf("store target update %s: %v", update.TargetName, err)
 		return
 	}
@@ -510,8 +518,8 @@ func (ps *proxyServer) applyTargetUpdate(update *cluster.TargetConfigUpdate) {
 	key := update.TargetName
 	ps.lazyLRU.Delete(key)
 	if ps.lazyRouter != nil {
-		ps.lazyRouter.Upsert(key, router.NewLazyHandler(key, ps.lazyLRU, func() (*router.TargetConfigHandler, error) {
-			return ps.materializeTarget(key)
+		ps.lazyRouter.Upsert(key, router.NewLazyHandler(key, ps.lazyLRU, func(ctx context.Context) (*router.TargetConfigHandler, error) {
+			return ps.materializeTarget(ctx, key)
 		}))
 	}
 }
@@ -522,7 +530,7 @@ func (ps *proxyServer) applyTargetDelete(name string) {
 	if ps.targetStore == nil {
 		return
 	}
-	if err := ps.targetStore.DeleteTarget(name); err != nil {
+	if err := ps.targetStore.DeleteTarget(context.Background(), name); err != nil {
 		klog.Errorf("delete stored target %s: %v", name, err)
 	}
 	ps.lazyLRU.Delete(name)

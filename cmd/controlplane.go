@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/cinvat/peretum/internal/cluster"
+	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/cobra"
 )
 
@@ -42,6 +44,11 @@ func runControlPlane(ctx context.Context, listenAddr, configDir, dataDir string)
 		return fmt.Errorf("failed to create data dir %s: %w", dataDir, err)
 	}
 
+	// Ensure config directory exists
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create config dir %s: %w", configDir, err)
+	}
+
 	// The control plane is by definition the leader with no HA peers unless
 	// the caller provides a comma-separated control_plane list; here a single
 	// node always serves snapshots.
@@ -54,23 +61,14 @@ func runControlPlane(ctx context.Context, listenAddr, configDir, dataDir string)
 		fmt.Fprintf(os.Stderr, "warn: no target configs loaded yet: %v\n", err)
 	}
 
-	// Keep the snapshot store in sync with config.d changes.
-	watchCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-watchCtx.Done():
-				return
-			case <-ticker.C:
-			}
-			if _, _, err := configStore.LoadTargets(configDir); err != nil {
-				fmt.Fprintf(os.Stderr, "warn: config reload failed: %v\n", err)
-			}
-		}
-	}()
+	// Watch config directory for changes using fsnotify
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warn: failed to create fsnotify watcher: %v; falling back to polling\n", err)
+		go pollConfigChanges(ctx, configStore, configDir)
+	} else {
+		go watchConfigChanges(ctx, watcher, configDir, configStore)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", cph.Health)
@@ -112,11 +110,70 @@ func runControlPlane(ctx context.Context, listenAddr, configDir, dataDir string)
 	}
 
 	// Graceful shutdown
-	shutdownCtx, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel2()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		return err
 	}
+
+	// Close watcher
+	if watcher != nil {
+		watcher.Close()
+	}
+
 	return nil
+}
+
+func watchConfigChanges(ctx context.Context, watcher *fsnotify.Watcher, configDir string, configStore *cluster.ConfigVersionStore) {
+	if err := watcher.Add(configDir); err != nil {
+		fmt.Fprintf(os.Stderr, "warn: failed to watch config dir: %v\n", err)
+		return
+	}
+
+	debounce := time.NewTimer(500 * time.Millisecond)
+	if !debounce.Stop() {
+		<-debounce.C
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			// Only react to write/create/remove/rename of .yaml files
+			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
+				if filepath.Ext(event.Name) == ".yaml" || filepath.Ext(event.Name) == ".yml" {
+					debounce.Reset(500 * time.Millisecond)
+				}
+			}
+		case <-watcher.Errors:
+			// Log error but continue watching
+		case <-debounce.C:
+			_, _, err := configStore.LoadTargets(configDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "warn: config reload failed: %v\n", err)
+			} else {
+				fmt.Fprintf(os.Stderr, "config reloaded from %s\n", configDir)
+			}
+		}
+	}
+}
+
+func pollConfigChanges(ctx context.Context, configStore *cluster.ConfigVersionStore, configDir string) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, _, err := configStore.LoadTargets(configDir); err != nil {
+				fmt.Fprintf(os.Stderr, "warn: config reload failed: %v\n", err)
+			}
+		}
+	}
 }

@@ -29,7 +29,6 @@ func NewHostRouter() *HostRouter {
 }
 
 func (hr *HostRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	klog.Infof("HostRouter ServeHTTP: host=%s, path=%s", req.Host, req.URL.Path)
 	host := req.Host
 	if idx := strings.Index(host, ":"); idx != -1 {
 		host = host[:idx]
@@ -37,17 +36,15 @@ func (hr *HostRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	hr.mu.RLock()
 	tch, ok := hr.targets[host]
+	if !ok {
+		tch, ok = hr.targets["_default"]
+	}
+	def := hr.defaultHandler
 	hr.mu.RUnlock()
 
-	if !ok {
-		hr.mu.RLock()
-		tch, ok = hr.targets["_default"]
-		hr.mu.RUnlock()
-	}
-
-	if !ok && hr.defaultHandler != nil {
+	if !ok && def != nil {
 		klog.Infof("Using default handler for host: %s", host)
-		hr.defaultHandler.ServeHTTP(w, req)
+		def.ServeHTTP(w, req)
 		return
 	}
 
@@ -101,6 +98,7 @@ func (tch *TargetConfigHandler) ServeHTTP(w http.ResponseWriter, req *http.Reque
 	http.Error(w, "No matching location", http.StatusNotFound)
 }
 
+// Reload atomically replaces the entire routing table.
 func (hr *HostRouter) Reload(targets map[string]http.Handler, defaultHandler http.Handler) {
 	hr.mu.Lock()
 	defer hr.mu.Unlock()
@@ -111,6 +109,9 @@ func (hr *HostRouter) Reload(targets map[string]http.Handler, defaultHandler htt
 // Upsert installs (or replaces) a single host handler without rebuilding the
 // whole routing table. Used for incremental lazy-mode updates.
 func (hr *HostRouter) Upsert(host string, h http.Handler) {
+	if host == "" || h == nil {
+		return
+	}
 	hr.mu.Lock()
 	defer hr.mu.Unlock()
 	hr.targets[host] = h
@@ -119,15 +120,24 @@ func (hr *HostRouter) Upsert(host string, h http.Handler) {
 // RemoveHost deletes a host from the routing table. In-flight requests hold
 // the old handler pointer, so they finish safely.
 func (hr *HostRouter) RemoveHost(host string) {
+	if host == "" {
+		return
+	}
 	hr.mu.Lock()
 	defer hr.mu.Unlock()
 	delete(hr.targets, host)
 }
 
+// GetTargets returns a copy of the routing table to prevent external mutation.
 func (hr *HostRouter) GetTargets() map[string]http.Handler {
 	hr.mu.RLock()
 	defer hr.mu.RUnlock()
-	return hr.targets
+
+	result := make(map[string]http.Handler, len(hr.targets))
+	for k, v := range hr.targets {
+		result[k] = v
+	}
+	return result
 }
 
 func (hr *HostRouter) GetDefaultHandler() http.Handler {

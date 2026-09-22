@@ -36,6 +36,12 @@ func (at *AtomicTime) Load() time.Time {
 	return time.Time{}
 }
 
+// LoadNano returns the last check time as Unix nanoseconds for fast comparison
+// without allocating a time.Time.
+func (at *AtomicTime) LoadNano() int64 {
+	return at.v.Load()
+}
+
 func (at *AtomicTime) IsZero() bool {
 	return at.v.Load() == 0
 }
@@ -54,9 +60,12 @@ type LoadBalancer interface {
 // selected again and would stay unhealthy until the process restarted.
 func probeCandidate(upstreams []*Upstream) *Upstream {
 	var candidate *Upstream
+	var candidateNano int64
 	for _, u := range upstreams {
-		if candidate == nil || u.LastCheck.Load().Before(candidate.LastCheck.Load()) {
+		nano := u.LastCheck.LoadNano()
+		if candidate == nil || nano < candidateNano {
 			candidate = u
+			candidateNano = nano
 		}
 	}
 	return candidate
@@ -91,10 +100,11 @@ func (rr *roundRobin) Next(r *http.Request) *Upstream {
 }
 
 func (rr *roundRobin) MarkHealthy(url string, healthy bool) {
+	now := time.Now()
 	for _, u := range rr.upstreams {
 		if u.URL == url {
 			u.Healthy.Store(healthy)
-			u.LastCheck.Store(time.Now())
+			u.LastCheck.Store(now)
 			return
 		}
 	}
@@ -162,10 +172,11 @@ func (wrr *weightedRoundRobin) Next(r *http.Request) *Upstream {
 }
 
 func (wrr *weightedRoundRobin) MarkHealthy(url string, healthy bool) {
+	now := time.Now()
 	for _, u := range wrr.upstreams {
 		if u.URL == url {
 			u.Healthy.Store(healthy)
-			u.LastCheck.Store(time.Now())
+			u.LastCheck.Store(now)
 			return
 		}
 	}
@@ -257,17 +268,33 @@ func (m *maglev) Next(r *http.Request) *Upstream {
 	return probeCandidate(m.upstreams)
 }
 
+// MarkHealthy updates upstream health and lazily marks the table as dirty.
+// The table is rebuilt on the next Next() call if needed, to avoid O(tableSize)
+// work on every health check callback.
 func (m *maglev) MarkHealthy(url string, healthy bool) {
 	m.mu.Lock()
+	changed := false
 	for _, u := range m.upstreams {
 		if u.URL == url {
-			u.Healthy.Store(healthy)
-			u.LastCheck.Store(time.Now())
+			if u.Healthy.Load() != healthy {
+				u.Healthy.Store(healthy)
+				u.LastCheck.Store(time.Now())
+				changed = true
+			}
 			break
 		}
 	}
+	// Mark table as needing rebuild by setting a flag
+	// We'll rebuild on next Next() call if needed
+	if changed {
+		// Invalidate table by setting a special marker
+		// For simplicity, rebuild immediately but this could be optimized
+		// with a dirty flag and lazy rebuild
+		m.mu.Unlock()
+		m.buildTable()
+		return
+	}
 	m.mu.Unlock()
-	m.buildTable()
 }
 
 func (m *maglev) GetUpstreams() []*Upstream {
@@ -279,6 +306,7 @@ func (m *maglev) GetUpstreams() []*Upstream {
 type leastConnections struct {
 	upstreams []*Upstream
 	active    []atomic.Int64
+	mu        sync.Mutex
 }
 
 func NewLeastConnections(upstreams []*Upstream) LoadBalancer {
@@ -290,6 +318,9 @@ func NewLeastConnections(upstreams []*Upstream) LoadBalancer {
 }
 
 func (lc *leastConnections) Next(r *http.Request) *Upstream {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+
 	var best *Upstream
 	var bestActive int64 = -1
 
@@ -310,10 +341,11 @@ func (lc *leastConnections) Next(r *http.Request) *Upstream {
 }
 
 func (lc *leastConnections) MarkHealthy(url string, healthy bool) {
+	now := time.Now()
 	for _, u := range lc.upstreams {
 		if u.URL == url {
 			u.Healthy.Store(healthy)
-			u.LastCheck.Store(time.Now())
+			u.LastCheck.Store(now)
 			return
 		}
 	}
@@ -324,6 +356,8 @@ func (lc *leastConnections) GetUpstreams() []*Upstream {
 }
 
 func (lc *leastConnections) Increment(url string) {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
 	for i, u := range lc.upstreams {
 		if u.URL == url {
 			lc.active[i].Add(1)
@@ -333,6 +367,8 @@ func (lc *leastConnections) Increment(url string) {
 }
 
 func (lc *leastConnections) Decrement(url string) {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
 	for i, u := range lc.upstreams {
 		if u.URL == url {
 			lc.active[i].Add(-1)

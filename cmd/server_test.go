@@ -1633,11 +1633,12 @@ func lazyEchoUpstream(t *testing.T, body string) string {
 }
 
 func TestLazyModeServesFromStore(t *testing.T) {
+	ctx := context.Background()
 	store := lazyTestStore(t)
 	url := lazyEchoUpstream(t, "lazy-upstream")
 
 	targetYAML := fmt.Sprintf("name: svc.lazy\nupstreams:\n  - url: %s\nlocations:\n  - path: /\n", url)
-	if err := store.PutTarget("svc.lazy", "v1", []byte(targetYAML)); err != nil {
+	if err := store.PutTarget(ctx, "svc.lazy", "v1", []byte(targetYAML)); err != nil {
 		t.Fatalf("PutTarget: %v", err)
 	}
 
@@ -1682,7 +1683,8 @@ func TestPullTargetsFromControlPlane(t *testing.T) {
 	if err := ps.ensureLazyStore(); err != nil {
 		t.Fatalf("ensureLazyStore: %v", err)
 	}
-	names, err := store.ListTargets()
+	ctx := context.Background()
+	names, err := store.ListTargets(ctx)
 	if err != nil {
 		t.Fatalf("ListTargets: %v", err)
 	}
@@ -1700,6 +1702,7 @@ func TestPullTargetsFromControlPlane(t *testing.T) {
 }
 
 func TestEnsureLazyStoreSeedsFromLocalTargets(t *testing.T) {
+	ctx := context.Background()
 	store := lazyTestStore(t)
 	ps := &proxyServer{
 		targetStore: store,
@@ -1712,7 +1715,7 @@ func TestEnsureLazyStoreSeedsFromLocalTargets(t *testing.T) {
 	if err := ps.ensureLazyStore(); err != nil {
 		t.Fatalf("ensureLazyStore: %v", err)
 	}
-	names, _ := store.ListTargets()
+	names, _ := store.ListTargets(ctx)
 	if len(names) != 1 || names["t1"] == "" {
 		t.Fatalf("seeded store = %v", names)
 	}
@@ -1723,7 +1726,7 @@ func TestEnsureLazyStoreSeedsFromLocalTargets(t *testing.T) {
 	if err := ps.ensureLazyStore(); err != nil {
 		t.Fatalf("ensureLazyStore (provisioned): %v", err)
 	}
-	names, _ = store.ListTargets()
+	names, _ = store.ListTargets(ctx)
 	if len(names) != 1 {
 		t.Fatalf("store changed after re-provision = %v", names)
 	}
@@ -1754,7 +1757,7 @@ func TestLazyControlPlaneUpdateAndDelete(t *testing.T) {
 		},
 	})
 
-	ver, _, ok, err := store.GetTarget("svc.upd")
+	ver, _, ok, err := store.GetTarget(context.Background(), "svc.upd")
 	if err != nil || !ok || ver != "v2" {
 		t.Fatalf("store after update = ok %v version %q err %v", ok, ver, err)
 	}
@@ -1769,7 +1772,7 @@ func TestLazyControlPlaneUpdateAndDelete(t *testing.T) {
 	}
 
 	ps.applyTargetDelete("svc.upd")
-	if _, _, ok, _ := store.GetTarget("svc.upd"); ok {
+	if _, _, ok, _ := store.GetTarget(context.Background(), "svc.upd"); ok {
 		t.Fatal("target still in store after delete")
 	}
 	if ps.lazyRouter.GetTargets()["svc.upd"] != nil {

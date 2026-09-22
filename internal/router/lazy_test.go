@@ -1,11 +1,13 @@
 package router
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cinvat/peretum/internal/cluster"
 	"github.com/cinvat/peretum/internal/config"
@@ -26,7 +28,7 @@ func TestLazyHandlerLoadsOnce(t *testing.T) {
 	lru := cluster.NewLRUCache[string, *TargetConfigHandler](4)
 	loads := 0
 	var mu sync.Mutex
-	lh := NewLazyHandler("svc-a", lru, func() (*TargetConfigHandler, error) {
+	lh := NewLazyHandler("svc-a", lru, func(ctx context.Context) (*TargetConfigHandler, error) {
 		mu.Lock()
 		loads++
 		mu.Unlock()
@@ -59,7 +61,7 @@ func TestLazyHandlerConcurrentCoalescing(t *testing.T) {
 	lru := cluster.NewLRUCache[string, *TargetConfigHandler](4)
 	loads := 0
 	var mu sync.Mutex
-	lh := NewLazyHandler("svc-b", lru, func() (*TargetConfigHandler, error) {
+	lh := NewLazyHandler("svc-b", lru, func(ctx context.Context) (*TargetConfigHandler, error) {
 		mu.Lock()
 		loads++
 		mu.Unlock()
@@ -97,8 +99,8 @@ func TestLazyHandlerReloadsAfterEviction(t *testing.T) {
 	lru := cluster.NewLRUCache[string, *TargetConfigHandler](1)
 	counts := make(map[string]int)
 	var mu sync.Mutex
-	makeLoad := func(name, body string) func() (*TargetConfigHandler, error) {
-		return func() (*TargetConfigHandler, error) {
+	makeLoad := func(name, body string) func(context.Context) (*TargetConfigHandler, error) {
+		return func(ctx context.Context) (*TargetConfigHandler, error) {
 			mu.Lock()
 			counts[name]++
 			mu.Unlock()
@@ -138,7 +140,7 @@ func TestLazyHandlerReloadsAfterEviction(t *testing.T) {
 func TestLazyHandlerLoadFailureRetries(t *testing.T) {
 	lru := cluster.NewLRUCache[string, *TargetConfigHandler](4)
 	loads := 0
-	lh := NewLazyHandler("svc-c", lru, func() (*TargetConfigHandler, error) {
+	lh := NewLazyHandler("svc-c", lru, func(ctx context.Context) (*TargetConfigHandler, error) {
 		loads++
 		if loads == 1 {
 			return nil, fmt.Errorf("boom")
@@ -159,6 +161,68 @@ func TestLazyHandlerLoadFailureRetries(t *testing.T) {
 	}
 	if loads != 2 {
 		t.Fatalf("loads = %d, want 2", loads)
+	}
+}
+
+func TestLazyHandlerContextCancellation(t *testing.T) {
+	lru := cluster.NewLRUCache[string, *TargetConfigHandler](4)
+	loadStarted := make(chan struct{})
+	var loadStartedOnce sync.Once
+
+	lh := NewLazyHandler("svc-d", lru, func(ctx context.Context) (*TargetConfigHandler, error) {
+		loadStartedOnce.Do(func() { close(loadStarted) })
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+		return lazyEchoHandler(t, "context-body"), nil
+	})
+
+	// Start a request and cancel it before load completes
+	ctx, cancel := context.WithCancel(context.Background())
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://svc-d/", nil).WithContext(ctx)
+
+	go func() {
+		<-loadStarted
+		cancel()
+	}()
+	lh.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestTimeout {
+		t.Fatalf("canceled request status = %d, want %d", rec.Code, http.StatusRequestTimeout)
+	}
+
+	// Wait for first materialize to fully complete (including defer cleanup)
+	time.Sleep(50 * time.Millisecond)
+
+	// Next request should succeed (load will retry)
+	rec2 := httptest.NewRecorder()
+	lh.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "http://svc-d/", nil))
+	if rec2.Code != http.StatusOK || rec2.Body.String() != "context-body" {
+		t.Fatalf("retry after cancel = status %d body %q", rec2.Code, rec2.Body.String())
+	}
+}
+
+func TestLazyHandlerPanicRecovery(t *testing.T) {
+	lru := cluster.NewLRUCache[string, *TargetConfigHandler](4)
+	lh := NewLazyHandler("svc-e", lru, func(ctx context.Context) (*TargetConfigHandler, error) {
+		panic("materialize panic")
+	})
+
+	// First request should get 502 (or 503) and not hang
+	rec := httptest.NewRecorder()
+	lh.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-e/", nil))
+	if rec.Code != http.StatusServiceUnavailable && rec.Code != http.StatusBadGateway {
+		t.Fatalf("panic on first request status = %d, want 502/503", rec.Code)
+	}
+
+	// Second request should retry (materialize will be called again)
+	rec2 := httptest.NewRecorder()
+	lh.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "http://svc-e/", nil))
+	if rec2.Code != http.StatusServiceUnavailable && rec2.Code != http.StatusBadGateway {
+		t.Fatalf("panic on second request status = %d, want 502/503", rec2.Code)
 	}
 }
 

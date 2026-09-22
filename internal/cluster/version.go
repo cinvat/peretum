@@ -54,39 +54,66 @@ func NewConfigVersionStore(hotTierSize int) *ConfigVersionStore {
 	}
 }
 
-// computeHash computes SHA256 hash of a target config.
+// computeHash computes SHA256 hash of a target config using a deterministic
+// encoding of all relevant fields.
 func computeHash(target *config.TargetConfig) string {
-	// Create a deterministic string representation
-	s := fmt.Sprintf("%s|%s|%d|%d",
-		target.Name,
-		target.Listen,
-		len(target.Upstreams),
-		len(target.Locations),
-	)
+	// Use a more robust encoding that covers all config fields
+	h := sha256.New()
+	h.Write([]byte(target.Name))
+	h.Write([]byte(target.Listen))
+	h.Write([]byte(target.LBAlgorithm))
+
 	for _, u := range target.Upstreams {
-		hc := ""
+		h.Write([]byte(u.URL))
+		h.Write([]byte(fmt.Sprintf("%d", u.Weight)))
 		if u.HealthCheck != nil {
-			hc = u.HealthCheck.Path
+			h.Write([]byte(u.HealthCheck.Path))
+			h.Write([]byte(u.HealthCheck.Interval))
+			h.Write([]byte(u.HealthCheck.Timeout))
+			h.Write([]byte(fmt.Sprintf("%d", u.HealthCheck.ExpectedStatus)))
+			for k, v := range u.HealthCheck.Headers {
+				h.Write([]byte(k))
+				h.Write([]byte(v))
+			}
 		}
-		s += fmt.Sprintf("|%s|%d|%s", u.URL, u.Weight, hc)
 	}
+
 	for _, loc := range target.Locations {
-		s += fmt.Sprintf("|%s|%s|%v|%s", loc.Path, loc.MatchType, loc.Cache, loc.CacheTTL)
+		h.Write([]byte(loc.Path))
+		h.Write([]byte(string(loc.MatchType)))
+		h.Write([]byte(fmt.Sprintf("%v", loc.Cache)))
+		if loc.CacheTTL != "" {
+			h.Write([]byte(loc.CacheTTL))
+		}
+		for _, exc := range loc.CacheExcludes {
+			h.Write([]byte(exc))
+		}
 	}
-	hash := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(hash[:])
+
+	if target.TLS != nil {
+		h.Write([]byte(target.TLS.CertFile))
+		h.Write([]byte(target.TLS.KeyFile))
+	}
+
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // computeGlobalHash computes hash of global proxy config.
 func computeGlobalHash(cfg *config.ProxyConfig) string {
-	s := fmt.Sprintf("%v|%v|%v|%v",
-		cfg.Listeners,
-		cfg.CacheDir,
-		cfg.MaxCacheSize,
-		cfg.MaxCacheAge,
-	)
-	hash := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(hash[:])
+	h := sha256.New()
+	for _, l := range cfg.Listeners {
+		h.Write([]byte(l))
+	}
+	h.Write([]byte(cfg.CacheDir))
+	h.Write([]byte(cfg.MaxCacheSize))
+	h.Write([]byte(cfg.MaxCacheAge))
+	h.Write([]byte(fmt.Sprintf("%d", cfg.MaxWriteWorkers)))
+	h.Write([]byte(cfg.MaxResponseBodySize))
+	if cfg.TLSCertFile != "" {
+		h.Write([]byte(cfg.TLSCertFile))
+		h.Write([]byte(cfg.TLSKeyFile))
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // LoadTargets loads targets and computes their versions.
@@ -161,41 +188,49 @@ func (cvs *ConfigVersionStore) LoadGlobalConfig(cfgPath string) (bool, error) {
 	return changed, nil
 }
 
-// GetTarget returns a target config by name, updating access stats.
+// GetTarget returns a copy of the target config by name, updating access stats
+// synchronously to avoid races. The returned TargetConfigVersion is safe to use
+// after the call returns.
 func (cvs *ConfigVersionStore) GetTarget(name string) (*TargetConfigVersion, bool) {
-	cvs.mu.RLock()
-	target, ok := cvs.targets[name]
-	cvs.mu.RUnlock()
+	cvs.mu.Lock()
+	defer cvs.mu.Unlock()
 
+	target, ok := cvs.targets[name]
 	if !ok {
 		return nil, false
 	}
 
-	// Update access stats and promote to the hot tier under the lock.
-	// This is async (not inline) to avoid holding the lock for every request.
-	go func() {
-		cvs.mu.Lock()
-		defer cvs.mu.Unlock()
-		if t, ok := cvs.targets[name]; ok {
-			t.AccessedAt = time.Now()
-			t.AccessCount++
-			if t.AccessCount > 10 {
-				cvs.hotTier.Put(name, t)
-			}
-		}
-	}()
+	// Update access stats and promote to hot tier under the lock
+	target.AccessedAt = time.Now()
+	target.AccessCount++
+	if target.AccessCount > 10 {
+		cvs.hotTier.Put(name, target)
+	}
 
-	return target, true
+	// Return a shallow copy to prevent external mutation
+	return &TargetConfigVersion{
+		Target:      target.Target,
+		Version:     target.Version,
+		LoadedAt:    target.LoadedAt,
+		AccessedAt:  target.AccessedAt,
+		AccessCount: target.AccessCount,
+	}, true
 }
 
-// GetAllTargets returns all current targets.
+// GetAllTargets returns all current targets as copies.
 func (cvs *ConfigVersionStore) GetAllTargets() map[string]*TargetConfigVersion {
 	cvs.mu.RLock()
 	defer cvs.mu.RUnlock()
 
 	result := make(map[string]*TargetConfigVersion, len(cvs.targets))
 	for k, v := range cvs.targets {
-		result[k] = v
+		result[k] = &TargetConfigVersion{
+			Target:      v.Target,
+			Version:     v.Version,
+			LoadedAt:    v.LoadedAt,
+			AccessedAt:  v.AccessedAt,
+			AccessCount: v.AccessCount,
+		}
 	}
 	return result
 }
@@ -293,7 +328,7 @@ func (cvs *ConfigVersionStore) EvictColdTenants(maxMemoryMB int) int {
 		return 0
 	}
 
-	// Sort by access time (oldest first)
+	// Sort by access count (lower = colder), then by access time (older = colder)
 	type targetInfo struct {
 		name        string
 		accessedAt  time.Time
@@ -301,6 +336,7 @@ func (cvs *ConfigVersionStore) EvictColdTenants(maxMemoryMB int) int {
 	}
 
 	infos := make([]targetInfo, 0, len(cvs.targets))
+	now := time.Now()
 	for name, target := range cvs.targets {
 		infos = append(infos, targetInfo{
 			name:        name,
@@ -310,7 +346,6 @@ func (cvs *ConfigVersionStore) EvictColdTenants(maxMemoryMB int) int {
 	}
 
 	sort.Slice(infos, func(i, j int) bool {
-		// Prioritize by access count (lower = colder), then by access time (older = colder)
 		if infos[i].accessCount != infos[j].accessCount {
 			return infos[i].accessCount < infos[j].accessCount
 		}
@@ -324,7 +359,7 @@ func (cvs *ConfigVersionStore) EvictColdTenants(maxMemoryMB int) int {
 			break
 		}
 		// Don't evict if recently accessed (within 5 minutes)
-		if time.Since(info.accessedAt) < 5*time.Minute {
+		if now.Sub(info.accessedAt) < 5*time.Minute {
 			continue
 		}
 		// Move to warm tier (serialize)
