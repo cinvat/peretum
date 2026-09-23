@@ -9,12 +9,11 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/pebble"
-	"gopkg.in/yaml.v3"
 )
 
 const (
-	targetKeyPrefix  = "t/"
-	versionKeyPrefix = "v/"
+	hostKeyPrefix    = "h/" // hostname -> target YAML
+	versionKeyPrefix = "v/" // hostname -> version
 	globalKey        = "g"
 )
 
@@ -30,11 +29,11 @@ var ErrNotFound = errors.New("not found")
 // Key layout:
 //
 //	g/            -> global config JSON
-//	t/<name>      -> raw YAML of the target config
-//	v/<name>      -> version string for the target
+//	h/<hostname>  -> raw YAML of the target config (keyed by hostname)
+//	v/<hostname>  -> version string for the target
 //
-// The separate version key allows a fast key-only scan to rebuild the
-// name -> version index after a restart.
+// The hostname is the key, enabling O(1) lookup by Host header.
+// A single target can be stored under multiple hostnames.
 type TargetStore struct {
 	db *pebble.DB
 }
@@ -68,71 +67,53 @@ func (ts *TargetStore) GetGlobal(ctx context.Context) ([]byte, bool, error) {
 	return ts.get(globalKey)
 }
 
-// PutTarget stores a target config blob and its version atomically.
-func (ts *TargetStore) PutTarget(ctx context.Context, name, version string, data []byte) error {
+// PutTargetByHost stores a target config blob under a hostname key.
+// A target can be stored under multiple hostnames.
+func (ts *TargetStore) PutTargetByHost(ctx context.Context, hostname, version string, data []byte) error {
 	_ = ctx
 	b := ts.db.NewBatch()
 	defer b.Close()
-	if err := b.Set([]byte(targetKeyPrefix+name), data, pebble.NoSync); err != nil {
+	if err := b.Set([]byte(hostKeyPrefix+hostname), data, pebble.NoSync); err != nil {
 		return err
 	}
-	if err := b.Set([]byte(versionKeyPrefix+name), []byte(version), pebble.NoSync); err != nil {
+	if err := b.Set([]byte(versionKeyPrefix+hostname), []byte(version), pebble.NoSync); err != nil {
 		return err
 	}
 	return b.Commit(pebble.NoSync)
 }
 
-// GetTarget returns the version and YAML blob for a target.
-func (ts *TargetStore) GetTarget(ctx context.Context, name string) (version string, data []byte, ok bool, err error) {
+// GetTargetByHost returns the version and YAML blob for a target by hostname.
+func (ts *TargetStore) GetTargetByHost(ctx context.Context, hostname string) (version string, data []byte, ok bool, err error) {
 	_ = ctx
 
-	data, ok, err = ts.get(targetKeyPrefix + name)
+	data, ok, err = ts.get(hostKeyPrefix + hostname)
 	if err != nil || !ok {
 		return "", data, ok, err
 	}
-	ver, _, verr := ts.get(versionKeyPrefix + name)
+	ver, _, verr := ts.get(versionKeyPrefix + hostname)
 	if verr != nil {
 		return "", data, ok, verr
 	}
 	return strings.TrimSpace(string(ver)), data, ok, nil
 }
 
-// GetTargetListen returns the listen field for a target without full unmarshal.
-// Returns empty string if not set or on error.
-func (ts *TargetStore) GetTargetListen(ctx context.Context, name string) (string, error) {
-	_ = ctx
-	_, yamlData, ok, err := ts.GetTarget(ctx, name)
-	if err != nil || !ok {
-		return "", err
-	}
-	// Quick YAML parse for just the listen field
-	var cfg struct {
-		Listen string `yaml:"listen"`
-	}
-	if err := yaml.Unmarshal(yamlData, &cfg); err != nil {
-		return "", err
-	}
-	return cfg.Listen, nil
-}
-
-// DeleteTarget removes a target and its version.
-func (ts *TargetStore) DeleteTarget(ctx context.Context, name string) error {
+// DeleteTargetByHost removes a target by hostname.
+func (ts *TargetStore) DeleteTargetByHost(ctx context.Context, hostname string) error {
 	_ = ctx
 	b := ts.db.NewBatch()
 	defer b.Close()
-	if err := b.Delete([]byte(targetKeyPrefix+name), pebble.NoSync); err != nil {
+	if err := b.Delete([]byte(hostKeyPrefix+hostname), pebble.NoSync); err != nil {
 		return err
 	}
-	if err := b.Delete([]byte(versionKeyPrefix+name), pebble.NoSync); err != nil {
+	if err := b.Delete([]byte(versionKeyPrefix+hostname), pebble.NoSync); err != nil {
 		return err
 	}
 	return b.Commit(pebble.NoSync)
 }
 
-// ListTargets returns every stored target name mapped to its version. It
-// walks only the version keys, so restart index rebuilds stay fast even with
-// millions of configs.
-func (ts *TargetStore) ListTargets(ctx context.Context) (map[string]string, error) {
+// ListHosts returns every stored hostname mapped to its version.
+// Walks only the version keys for fast restart index rebuild.
+func (ts *TargetStore) ListHosts(ctx context.Context) (map[string]string, error) {
 	_ = ctx
 
 	iter, err := ts.db.NewIter(nil)
@@ -141,21 +122,21 @@ func (ts *TargetStore) ListTargets(ctx context.Context) (map[string]string, erro
 	}
 	defer iter.Close()
 
-	names := make(map[string]string)
+	hosts := make(map[string]string)
 	prefix := []byte(versionKeyPrefix)
 	for valid := iter.SeekGE(prefix); valid; valid = iter.Next() {
 		key := iter.Key()
 		if !bytes.HasPrefix(key, prefix) {
 			break
 		}
-		name := string(key[len(prefix):])
-		names[name] = strings.TrimSpace(string(iter.Value()))
+		host := string(key[len(prefix):])
+		hosts[host] = strings.TrimSpace(string(iter.Value()))
 	}
-	return names, nil
+	return hosts, nil
 }
 
-// TargetCount returns the number of stored targets without allocating the full map.
-func (ts *TargetStore) TargetCount(ctx context.Context) (int, error) {
+// HostCount returns the number of stored hostnames.
+func (ts *TargetStore) HostCount(ctx context.Context) (int, error) {
 	_ = ctx
 
 	iter, err := ts.db.NewIter(nil)

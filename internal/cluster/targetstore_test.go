@@ -14,23 +14,23 @@ func TestTargetStoreRoundTrip(t *testing.T) {
 		t.Fatalf("OpenTargetStore: %v", err)
 	}
 
-	if _, _, ok, err := ts.GetTarget(ctx, "missing"); err != nil || ok {
-		t.Fatalf("GetTarget(missing) = ok %v, err %v", ok, err)
+	if _, _, ok, err := ts.GetTargetByHost(ctx, "missing"); err != nil || ok {
+		t.Fatalf("GetTargetByHost(missing) = ok %v, err %v", ok, err)
 	}
 	if _, ok, err := ts.GetGlobal(ctx); err != nil || ok {
 		t.Fatalf("GetGlobal(missing) = ok %v, err %v", ok, err)
 	}
 
-	yaml := []byte("name: t\nupstreams:\n  - url: http://x:1\n")
-	if err := ts.PutTarget(ctx, "t", "v1", yaml); err != nil {
-		t.Fatalf("PutTarget: %v", err)
+	yaml := []byte("name: t\nlisten: t\nupstreams:\n  - url: http://x:1\n")
+	if err := ts.PutTargetByHost(ctx, "t", "v1", yaml); err != nil {
+		t.Fatalf("PutTargetByHost: %v", err)
 	}
 	if err := ts.PutGlobal(ctx, []byte(`{"listeners":[":8080"]}`)); err != nil {
 		t.Fatalf("PutGlobal: %v", err)
 	}
 
-	if version, got, ok, err := ts.GetTarget(ctx, "t"); err != nil || !ok {
-		t.Fatalf("GetTarget(t) = ok %v, err %v", ok, err)
+	if version, got, ok, err := ts.GetTargetByHost(ctx, "t"); err != nil || !ok {
+		t.Fatalf("GetTargetByHost(t) = ok %v, err %v", ok, err)
 	} else if version != "v1" {
 		t.Fatalf("version = %q, want v1", version)
 	} else if string(got) != string(yaml) {
@@ -43,23 +43,23 @@ func TestTargetStoreRoundTrip(t *testing.T) {
 		t.Fatalf("global = %q", got)
 	}
 
-	names, err := ts.ListTargets(ctx)
+	hosts, err := ts.ListHosts(ctx)
 	if err != nil {
-		t.Fatalf("ListTargets: %v", err)
+		t.Fatalf("ListHosts: %v", err)
 	}
-	if len(names) != 1 || names["t"] != "v1" {
-		t.Fatalf("ListTargets = %v", names)
+	if len(hosts) != 1 || hosts["t"] != "v1" {
+		t.Fatalf("ListHosts = %v", hosts)
 	}
 
-	if err := ts.DeleteTarget(ctx, "t"); err != nil {
-		t.Fatalf("DeleteTarget: %v", err)
+	if err := ts.DeleteTargetByHost(ctx, "t"); err != nil {
+		t.Fatalf("DeleteTargetByHost: %v", err)
 	}
-	if _, _, ok, _ := ts.GetTarget(ctx, "t"); ok {
+	if _, _, ok, _ := ts.GetTargetByHost(ctx, "t"); ok {
 		t.Fatal("target t should be deleted")
 	}
-	names, _ = ts.ListTargets(ctx)
-	if len(names) != 0 {
-		t.Fatalf("ListTargets after delete = %v", names)
+	hosts, _ = ts.ListHosts(ctx)
+	if len(hosts) != 0 {
+		t.Fatalf("ListHosts after delete = %v", hosts)
 	}
 
 	if err := ts.Close(); err != nil {
@@ -75,11 +75,11 @@ func TestTargetStoreReopenPersists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	if err := ts.PutTarget(ctx, "a", "v1", []byte("name: a")); err != nil {
-		t.Fatalf("PutTarget: %v", err)
+	if err := ts.PutTargetByHost(ctx, "a", "v1", []byte("name: a\nlisten: a")); err != nil {
+		t.Fatalf("PutTargetByHost: %v", err)
 	}
-	if err := ts.PutTarget(ctx, "b", "v2", []byte("name: b")); err != nil {
-		t.Fatalf("PutTarget: %v", err)
+	if err := ts.PutTargetByHost(ctx, "b", "v2", []byte("name: b\nlisten: b")); err != nil {
+		t.Fatalf("PutTargetByHost: %v", err)
 	}
 	if err := ts.Close(); err != nil {
 		t.Fatalf("close: %v", err)
@@ -91,16 +91,16 @@ func TestTargetStoreReopenPersists(t *testing.T) {
 	}
 	defer ts2.Close()
 
-	names, err := ts2.ListTargets(ctx)
+	hosts, err := ts2.ListHosts(ctx)
 	if err != nil {
-		t.Fatalf("ListTargets: %v", err)
+		t.Fatalf("ListHosts: %v", err)
 	}
-	if len(names) != 2 || names["a"] != "v1" || names["b"] != "v2" {
-		t.Fatalf("ListTargets after reopen = %v", names)
+	if len(hosts) != 2 || hosts["a"] != "v1" || hosts["b"] != "v2" {
+		t.Fatalf("ListHosts after reopen = %v", hosts)
 	}
-	count, err := ts2.TargetCount(ctx)
+	count, err := ts2.HostCount(ctx)
 	if err != nil || count != 2 {
-		t.Fatalf("TargetCount = %d, err %v", count, err)
+		t.Fatalf("HostCount = %d, err %v", count, err)
 	}
 }
 
@@ -114,16 +114,16 @@ func TestTargetStoreManyNames(t *testing.T) {
 
 	const n = 500
 	for i := 0; i < n; i++ {
-		if err := ts.PutTarget(ctx, uniqueName(i), "v", []byte("{}")); err != nil {
-			t.Fatalf("PutTarget(%d): %v", i, err)
+		if err := ts.PutTargetByHost(ctx, uniqueName(i), "v", []byte("{}")); err != nil {
+			t.Fatalf("PutTargetByHost(%d): %v", i, err)
 		}
 	}
-	names, err := ts.ListTargets(ctx)
+	hosts, err := ts.ListHosts(ctx)
 	if err != nil {
-		t.Fatalf("ListTargets: %v", err)
+		t.Fatalf("ListHosts: %v", err)
 	}
-	if len(names) != n {
-		t.Fatalf("ListTargets = %d names, want %d", len(names), n)
+	if len(hosts) != n {
+		t.Fatalf("ListHosts = %d names, want %d", len(hosts), n)
 	}
 }
 
@@ -142,22 +142,22 @@ func TestTargetStoreConcurrent(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			name := uniqueName(i)
-			if err := ts.PutTarget(ctx, name, "v1", []byte("{}")); err != nil {
-				t.Errorf("PutTarget(%d): %v", i, err)
+			if err := ts.PutTargetByHost(ctx, name, "v1", []byte("{}")); err != nil {
+				t.Errorf("PutTargetByHost(%d): %v", i, err)
 			}
-			if _, _, ok, err := ts.GetTarget(ctx, name); err != nil || !ok {
-				t.Errorf("GetTarget(%d): ok=%v err=%v", i, ok, err)
+			if _, _, ok, err := ts.GetTargetByHost(ctx, name); err != nil || !ok {
+				t.Errorf("GetTargetByHost(%d): ok=%v err=%v", i, ok, err)
 			}
 		}(i)
 	}
 	wg.Wait()
 
-	names, err := ts.ListTargets(ctx)
+	hosts, err := ts.ListHosts(ctx)
 	if err != nil {
-		t.Fatalf("ListTargets: %v", err)
+		t.Fatalf("ListHosts: %v", err)
 	}
-	if len(names) != n {
-		t.Fatalf("ListTargets = %d names, want %d", len(names), n)
+	if len(hosts) != n {
+		t.Fatalf("ListHosts = %d names, want %d", len(hosts), n)
 	}
 }
 

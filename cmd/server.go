@@ -334,33 +334,27 @@ func targetHostKey(target *config.TargetConfig) string {
 	return target.Name
 }
 
-// buildLazyHostRouter builds the routing table from the set of *names* stored
+// buildLazyHostRouter builds the routing table from the set of hostnames stored
 // on disk. Each host is served by a LazyHandler that materializes the target's
 // compiled handlers on first request and keeps them in a bounded LRU.
-// The router key is derived from the target's listen field (like eager mode),
-// falling back to the target name.
+// The router key is the hostname directly (O(1) lookup by Host header).
 func (ps *proxyServer) buildLazyHostRouter() *router.HostRouter {
 	hr := router.NewHostRouter()
 	targets := make(map[string]http.Handler)
 	var def http.Handler
 
-	names, err := ps.targetStore.ListTargets(context.Background())
+	hosts, err := ps.targetStore.ListHosts(context.Background())
 	if err != nil {
-		klog.Errorf("lazy router: list targets from store: %v", err)
+		klog.Errorf("lazy router: list hosts from store: %v", err)
 	} else {
-		for name := range names {
-			// Derive router key from listen field (same as eager mode)
-			listen, err := ps.targetStore.GetTargetListen(context.Background(), name)
-			if err != nil {
-				klog.Warningf("lazy router: get listen for %s: %v", name, err)
-			}
-			key := targetHostKeyFromListen(listen, name)
-
-			targets[key] = router.NewLazyHandler(key, ps.lazyLRU, func(ctx context.Context) (*router.TargetConfigHandler, error) {
-				return ps.materializeTarget(ctx, name)
+		for hostname := range hosts {
+			// In lazy mode, the router key is the hostname itself.
+			// The LazyHandler will use this same hostname to fetch from store.
+			targets[hostname] = router.NewLazyHandler(hostname, ps.lazyLRU, func(ctx context.Context) (*router.TargetConfigHandler, error) {
+				return ps.materializeTarget(ctx, hostname)
 			})
-			if key == "_default" {
-				def = targets[key]
+			if hostname == "_default" {
+				def = targets[hostname]
 			}
 		}
 	}
@@ -369,37 +363,23 @@ func (ps *proxyServer) buildLazyHostRouter() *router.HostRouter {
 	return hr
 }
 
-// targetHostKeyFromListen derives the router host key from listen + name.
-// Mirrors targetHostKey logic but takes listen as separate arg.
-func targetHostKeyFromListen(listen, name string) string {
-	if listen != "" && !strings.HasPrefix(listen, ":") {
-		if idx := strings.Index(listen, ":"); idx != -1 {
-			return listen[:idx]
-		}
-		return listen
-	}
-	return name
-}
-
-// materializeTarget loads a target config from the Pebble store, compiles its
-// handlers, and returns the compiled TargetConfigHandler. Active health checks
-// are skipped for lazily loaded targets to avoid lifecycle bookkeeping on LRU
-// eviction; passive upstream health detection still applies.
-func (ps *proxyServer) materializeTarget(ctx context.Context, name string) (*router.TargetConfigHandler, error) {
-	_, data, ok, err := ps.targetStore.GetTarget(ctx, name)
+// materializeTarget loads a target config from the Pebble store by hostname,
+// compiles its handlers, and returns the compiled TargetConfigHandler.
+func (ps *proxyServer) materializeTarget(ctx context.Context, hostname string) (*router.TargetConfigHandler, error) {
+	_, data, ok, err := ps.targetStore.GetTargetByHost(ctx, hostname)
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
-		return nil, fmt.Errorf("target %q not in store", name)
+		return nil, fmt.Errorf("target for hostname %q not in store", hostname)
 	}
 
 	var t config.TargetConfig
 	if err := yaml.Unmarshal(data, &t); err != nil {
-		return nil, fmt.Errorf("target %s: %w", name, err)
+		return nil, fmt.Errorf("target for hostname %s: %w", hostname, err)
 	}
 	if t.Name == "" {
-		t.Name = name
+		t.Name = hostname
 	}
 
 	tch, hc, err := ps.buildTargetConfigHandler(&t)
@@ -407,7 +387,7 @@ func (ps *proxyServer) materializeTarget(ctx context.Context, name string) (*rou
 		return nil, err
 	}
 	if hc != nil {
-		klog.Warningf("active health checks are disabled for lazily loaded target %s", name)
+		klog.Warningf("active health checks are disabled for lazily loaded target %s", hostname)
 	}
 	return tch, nil
 }
@@ -422,12 +402,12 @@ func (ps *proxyServer) ensureLazyStore() error {
 	}
 
 	ctx := context.Background()
-	names, err := ps.targetStore.ListTargets(ctx)
+	hosts, err := ps.targetStore.ListHosts(ctx)
 	if err != nil {
 		return fmt.Errorf("target store: %w", err)
 	}
-	if len(names) > 0 {
-		klog.Infof("target store already provisioned with %d targets", len(names))
+	if len(hosts) > 0 {
+		klog.Infof("target store already provisioned with %d targets", len(hosts))
 		return nil
 	}
 
@@ -441,6 +421,7 @@ func (ps *proxyServer) ensureLazyStore() error {
 	}
 
 	// No control plane: seed from local config.d targets.
+	// Store each target under its hostname(s) from the listen field.
 	for i := range ps.targets {
 		t := &ps.targets[i]
 		data, err := yaml.Marshal(t)
@@ -449,11 +430,42 @@ func (ps *proxyServer) ensureLazyStore() error {
 			continue
 		}
 		sum := sha256.Sum256(data)
-		if err := ps.targetStore.PutTarget(ctx, t.Name, hex.EncodeToString(sum[:]), data); err != nil {
-			klog.Errorf("seed target %s: %v", t.Name, err)
+		version := hex.EncodeToString(sum[:])
+
+		// Determine hostnames from listen field (comma-separated)
+		hostnames := parseHostnames(t.Listen, t.Name)
+		for _, hostname := range hostnames {
+			if err := ps.targetStore.PutTargetByHost(ctx, hostname, version, data); err != nil {
+				klog.Errorf("seed target %s for hostname %s: %v", t.Name, hostname, err)
+			}
 		}
 	}
 	return nil
+}
+
+// parseHostnames extracts hostnames from the listen field.
+// If listen is empty or port-only (starts with ":"), falls back to target name.
+// Multiple hostnames can be comma-separated.
+func parseHostnames(listen, fallback string) []string {
+	if listen == "" || strings.HasPrefix(listen, ":") {
+		return []string{fallback}
+	}
+	var hosts []string
+	for _, h := range strings.Split(listen, ",") {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		// Strip port if present
+		if idx := strings.Index(h, ":"); idx != -1 {
+			h = h[:idx]
+		}
+		hosts = append(hosts, h)
+	}
+	if len(hosts) == 0 {
+		return []string{fallback}
+	}
+	return hosts
 }
 
 // pullTargetsFromControlPlane fetches the full config snapshot from the leader
@@ -503,8 +515,13 @@ func (ps *proxyServer) pullTargetsFromControlPlane(ctx context.Context) error {
 			sum := sha256.Sum256(data)
 			version = hex.EncodeToString(sum[:])
 		}
-		if err := ps.targetStore.PutTarget(ctx, name, version, data); err != nil {
-			return fmt.Errorf("control plane pull: store %s: %w", name, err)
+
+		// Store under hostname(s) from listen field
+		hostnames := parseHostnames(entry.Target.Listen, name)
+		for _, hostname := range hostnames {
+			if err := ps.targetStore.PutTargetByHost(ctx, hostname, version, data); err != nil {
+				return fmt.Errorf("control plane pull: store %s: %w", hostname, err)
+			}
 		}
 	}
 	klog.Infof("pulled %d targets from control plane", len(syncResp.Targets))
@@ -529,18 +546,26 @@ func (ps *proxyServer) applyTargetUpdate(update *cluster.TargetConfigUpdate) {
 		klog.Errorf("store target update %s: marshal: %v", update.TargetName, err)
 		return
 	}
-	if err := ps.targetStore.PutTarget(context.Background(), update.TargetName, update.Version, data); err != nil {
-		klog.Errorf("store target update %s: %v", update.TargetName, err)
+
+	// Determine hostnames from the updated config's listen field
+	targetConfig := update.Config
+	if targetConfig == nil {
 		return
 	}
+	hostnames := parseHostnames(targetConfig["listen"].(string), update.TargetName)
+	for _, hostname := range hostnames {
+		if err := ps.targetStore.PutTargetByHost(context.Background(), hostname, update.Version, data); err != nil {
+			klog.Errorf("store target update %s for hostname %s: %v", update.TargetName, hostname, err)
+			return
+		}
 
-	// Invalidate any compiled handler and re-point the router at a fresh stub.
-	key := update.TargetName
-	ps.lazyLRU.Delete(key)
-	if ps.lazyRouter != nil {
-		ps.lazyRouter.Upsert(key, router.NewLazyHandler(key, ps.lazyLRU, func(ctx context.Context) (*router.TargetConfigHandler, error) {
-			return ps.materializeTarget(ctx, key)
-		}))
+		// Invalidate any compiled handler and re-point the router at a fresh stub.
+		ps.lazyLRU.Delete(hostname)
+		if ps.lazyRouter != nil {
+			ps.lazyRouter.Upsert(hostname, router.NewLazyHandler(hostname, ps.lazyLRU, func(ctx context.Context) (*router.TargetConfigHandler, error) {
+				return ps.materializeTarget(ctx, hostname)
+			}))
+		}
 	}
 }
 
@@ -550,7 +575,10 @@ func (ps *proxyServer) applyTargetDelete(name string) {
 	if ps.targetStore == nil {
 		return
 	}
-	if err := ps.targetStore.DeleteTarget(context.Background(), name); err != nil {
+	// In lazy mode, targets are stored by hostname. We don't know the hostnames
+	// from just the name, so we delete by name as fallback.
+	// Ideally the control plane would send the hostnames in the delete message.
+	if err := ps.targetStore.DeleteTargetByHost(context.Background(), name); err != nil {
 		klog.Errorf("delete stored target %s: %v", name, err)
 	}
 	ps.lazyLRU.Delete(name)
