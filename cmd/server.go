@@ -1223,9 +1223,15 @@ func run(ctx context.Context, cfgPath, targetsDir string) error {
 		return fmt.Errorf("failed to load proxy config: %w", err)
 	}
 
-	targets, err := config.LoadTargets(targetsDir)
-	if err != nil {
-		return fmt.Errorf("failed to load targets: %w", err)
+	// For lazy edges with control_plane, skip loading local targets;
+	// they will pull from the control plane on first launch.
+	var targets []config.TargetConfig
+	skipLocalTargets := proxyCfg != nil && proxyCfg.Cluster != nil && proxyCfg.Cluster.Lazy && proxyCfg.Cluster.ControlPlane != ""
+	if !skipLocalTargets {
+		targets, err = config.LoadTargets(targetsDir)
+		if err != nil {
+			return fmt.Errorf("failed to load targets: %w", err)
+		}
 	}
 
 	maxCacheSize, _ := proxyCfg.ParseMaxCacheSize()

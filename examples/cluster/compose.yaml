@@ -1,13 +1,14 @@
 services:
   control-plane:
-    build: .
+    image: peretum:0.0.0-alpha0
     container_name: peretum-control-plane
     ports:
       - "9001:9001"   # control plane HTTP
     volumes:
       - ./config.d:/config.d:ro
       - ./data/controlplane:/data
-    command: ["controlplane"]
+    command:
+      - controlplane
     environment:
       - GOMAXPROCS=2
     networks:
@@ -21,17 +22,13 @@ services:
 
   # Edge node 1 - US East
   edge-us-east-1:
-    build:
-      context: .
-      args:
-        MODE: edge
+    image: peretum:0.0.0-alpha0
     container_name: peretum-edge-us-east-1
     ports:
       - "8080:8080"    # HTTP
       - "8443:8443"    # HTTPS + HTTP/3
       - "9090:9090"    # Prometheus metrics
     volumes:
-      - ./config.d:/config.d:ro
       - ./cache/us-east-1:/cache
       - ./config.yaml:/config.yaml:ro
     environment:
@@ -51,17 +48,13 @@ services:
 
   # Edge node 2 - US West
   edge-us-west-1:
-    build:
-      context: .
-      args:
-        MODE: edge
+    image: peretum:0.0.0-alpha0
     container_name: peretum-edge-us-west-1
     ports:
       - "8081:8080"    # HTTP
       - "8444:8443"    # HTTPS + HTTP/3
       - "9091:9090"    # Prometheus metrics
     volumes:
-      - ./config.d:/config.d:ro
       - ./cache/us-west-1:/cache
       - ./config.yaml:/config.yaml:ro
     environment:
@@ -81,17 +74,13 @@ services:
 
   # Edge node 3 - EU Central
   edge-eu-central-1:
-    build:
-      context: .
-      args:
-        MODE: edge
+    image: peretum:0.0.0-alpha0
     container_name: peretum-edge-eu-central-1
     ports:
       - "8082:8080"    # HTTP
       - "8445:8443"    # HTTPS + HTTP/3
       - "9092:9090"    # Prometheus metrics
     volumes:
-      - ./config.d:/config.d:ro
       - ./cache/eu-central-1:/cache
       - ./config.yaml:/config.yaml:ro
     environment:
@@ -159,13 +148,13 @@ services:
 
   # Prometheus for metrics
   prometheus:
-    image: prom/prometheus:v2.52.0
+    image: prom/prometheus:latest
     container_name: peretum-prometheus
     ports:
       - "9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus-data:/prometheus
+      - ./data/prometheus:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
@@ -182,7 +171,7 @@ services:
 
   # Grafana for visualization
   grafana:
-    image: grafana/grafana:10.2.2
+    image: grafana/grafana:latest
     container_name: peretum-grafana
     ports:
       - "3000:3000"
@@ -190,7 +179,7 @@ services:
       - ./grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
       - ./grafana-dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
       - ./grafana-dashboards:/etc/grafana/provisioning/dashboards:ro
-      - grafana-data:/var/lib/grafana
+      - ./data/grafana:/var/lib/grafana
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
@@ -211,7 +200,3 @@ networks:
     ipam:
       config:
         - subnet: 172.20.0.0/16
-
-volumes:
-  prometheus-data:
-  grafana-data:
