@@ -337,6 +337,8 @@ func targetHostKey(target *config.TargetConfig) string {
 // buildLazyHostRouter builds the routing table from the set of *names* stored
 // on disk. Each host is served by a LazyHandler that materializes the target's
 // compiled handlers on first request and keeps them in a bounded LRU.
+// The router key is derived from the target's listen field (like eager mode),
+// falling back to the target name.
 func (ps *proxyServer) buildLazyHostRouter() *router.HostRouter {
 	hr := router.NewHostRouter()
 	targets := make(map[string]http.Handler)
@@ -347,9 +349,15 @@ func (ps *proxyServer) buildLazyHostRouter() *router.HostRouter {
 		klog.Errorf("lazy router: list targets from store: %v", err)
 	} else {
 		for name := range names {
-			key := name
+			// Derive router key from listen field (same as eager mode)
+			listen, err := ps.targetStore.GetTargetListen(context.Background(), name)
+			if err != nil {
+				klog.Warningf("lazy router: get listen for %s: %v", name, err)
+			}
+			key := targetHostKeyFromListen(listen, name)
+
 			targets[key] = router.NewLazyHandler(key, ps.lazyLRU, func(ctx context.Context) (*router.TargetConfigHandler, error) {
-				return ps.materializeTarget(ctx, key)
+				return ps.materializeTarget(ctx, name)
 			})
 			if key == "_default" {
 				def = targets[key]
@@ -359,6 +367,18 @@ func (ps *proxyServer) buildLazyHostRouter() *router.HostRouter {
 	hr.Reload(targets, def)
 	ps.lazyRouter = hr
 	return hr
+}
+
+// targetHostKeyFromListen derives the router host key from listen + name.
+// Mirrors targetHostKey logic but takes listen as separate arg.
+func targetHostKeyFromListen(listen, name string) string {
+	if listen != "" && !strings.HasPrefix(listen, ":") {
+		if idx := strings.Index(listen, ":"); idx != -1 {
+			return listen[:idx]
+		}
+		return listen
+	}
+	return name
 }
 
 // materializeTarget loads a target config from the Pebble store, compiles its

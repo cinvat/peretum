@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/pebble"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -94,6 +95,24 @@ func (ts *TargetStore) GetTarget(ctx context.Context, name string) (version stri
 		return "", data, ok, verr
 	}
 	return strings.TrimSpace(string(ver)), data, ok, nil
+}
+
+// GetTargetListen returns the listen field for a target without full unmarshal.
+// Returns empty string if not set or on error.
+func (ts *TargetStore) GetTargetListen(ctx context.Context, name string) (string, error) {
+	_ = ctx
+	_, yamlData, ok, err := ts.GetTarget(ctx, name)
+	if err != nil || !ok {
+		return "", err
+	}
+	// Quick YAML parse for just the listen field
+	var cfg struct {
+		Listen string `yaml:"listen"`
+	}
+	if err := yaml.Unmarshal(yamlData, &cfg); err != nil {
+		return "", err
+	}
+	return cfg.Listen, nil
 }
 
 // DeleteTarget removes a target and its version.
