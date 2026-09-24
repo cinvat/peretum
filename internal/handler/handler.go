@@ -483,8 +483,8 @@ func (th *TargetHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			preq.Out.URL.Path = path
 			preq.Out.URL.RawQuery = rawQuery
 
-			if th.target.Host != "" {
-				preq.Out.Host = th.target.Host
+			if th.target.HostHeader != "" {
+				preq.Out.Host = th.target.HostHeader
 			} else if th.location.Proxy != nil && th.location.Proxy.PassHostHeader {
 				preq.Out.Host = r.Host
 			} else {
@@ -652,8 +652,8 @@ func (th *TargetHandler) serveGRPC(w http.ResponseWriter, r *http.Request) {
 		Rewrite: func(preq *httputil.ProxyRequest) {
 			preq.Out.URL.Scheme = upstreamURL[:strings.Index(upstreamURL, "://")]
 			preq.Out.URL.Host = upstreamURL[strings.Index(upstreamURL, "://")+3:]
-			if th.target.Host != "" {
-				preq.Out.Host = th.target.Host
+			if th.target.HostHeader != "" {
+				preq.Out.Host = th.target.HostHeader
 			} else if th.location.Proxy != nil && th.location.Proxy.PassHostHeader {
 				preq.Out.Host = r.Host
 			} else {
@@ -697,7 +697,7 @@ func (th *TargetHandler) pinnedUpstream() string {
 }
 
 func (th *TargetHandler) targetName() string {
-	return th.target.Name
+	return th.target.ServerName
 }
 
 // logError routes an operational error to registered error hooks (e.g.

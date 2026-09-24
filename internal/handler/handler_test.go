@@ -191,9 +191,9 @@ func setupHandler(t *testing.T, f fixture) (*TargetHandler, *disk.DiskCache) {
 		sem = make(chan struct{}, maxWriteWorkers)
 	}
 
-	target := &config.TargetConfig{Name: f.targetName}
+	target := &config.TargetConfig{ServerName: f.targetName}
 	if f.targetHost != "" {
-		target.Host = f.targetHost
+		target.HostHeader = f.targetHost
 	}
 	if len(f.upstreams) > 0 {
 		target.Upstreams = f.upstreams

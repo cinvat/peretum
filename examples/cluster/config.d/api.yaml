@@ -1,6 +1,5 @@
-name: "api"
-listen: "api.local"
-host: "api.example.com"
+server_name: "api"
+host_header: "api.example.com"
 lb_algorithm: "round_robin"
 upstreams:
   - url: "http://upstream-api-1:80"

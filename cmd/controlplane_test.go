@@ -19,7 +19,7 @@ func TestRunControlPlaneServesSnapshots(t *testing.T) {
 	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeFile(t, filepath.Join(cfgDir, "api.yaml"), `name: api
+	writeFile(t, filepath.Join(cfgDir, "api.yaml"), `server_name: api
 upstreams:
   - url: http://api:1
 locations:
@@ -75,7 +75,7 @@ locations:
 
 	// Single target snapshot
 	resp, err = http.Post(base+"/sync/target", "application/json",
-		strings.NewReader(`{"name":"api"}`))
+		strings.NewReader(`{"server_name":"api"}`))
 	if err != nil {
 		t.Fatalf("POST /sync/target: %v", err)
 	}
@@ -87,7 +87,7 @@ locations:
 	resp.Body.Close()
 
 	resp, err = http.Post(base+"/sync/target", "application/json",
-		strings.NewReader(`{"name":"missing"}`))
+		strings.NewReader(`{"server_name":"missing"}`))
 	if err != nil {
 		t.Fatalf("POST /sync/target (missing): %v", err)
 	}

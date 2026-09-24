@@ -204,12 +204,12 @@ func (ps *proxyServer) buildHostRouter() *router.HostRouter {
 		target := &ps.targets[i]
 		tch, hc, err := ps.buildTargetConfigHandler(target)
 		if err != nil {
-			klog.Warningf("failed to build target %s: %v", target.Name, err)
+			klog.Warningf("failed to build target %s: %v", target.ServerName, err)
 			continue
 		}
 		if hc != nil {
-			newHealthCheckers[target.Name] = hc
-			klog.Infof("enabled active health checks for target %s", target.Name)
+			newHealthCheckers[target.ServerName] = hc
+			klog.Infof("enabled active health checks for target %s", target.ServerName)
 		}
 
 		hostKey := targetHostKey(target)
@@ -322,16 +322,10 @@ func buildHealthCheckConfig(uc *config.HealthCheckConfig) *loadbalancer.HealthCh
 	}
 }
 
-// targetHostKey derives the router host key for a target, honoring the
-// optional host-bearing `listen` field.
+// targetHostKey derives the router host key for a target.
+// Uses server_name as the hostname key.
 func targetHostKey(target *config.TargetConfig) string {
-	if target.Listen != "" && !strings.HasPrefix(target.Listen, ":") {
-		if idx := strings.Index(target.Listen, ":"); idx != -1 {
-			return target.Listen[:idx]
-		}
-		return target.Listen
-	}
-	return target.Name
+	return target.ServerName
 }
 
 // buildLazyHostRouter builds the routing table from the set of hostnames stored
@@ -378,9 +372,6 @@ func (ps *proxyServer) materializeTarget(ctx context.Context, hostname string) (
 	if err := yaml.Unmarshal(data, &t); err != nil {
 		return nil, fmt.Errorf("target for hostname %s: %w", hostname, err)
 	}
-	if t.Name == "" {
-		t.Name = hostname
-	}
 
 	tch, hc, err := ps.buildTargetConfigHandler(&t)
 	if err != nil {
@@ -426,17 +417,17 @@ func (ps *proxyServer) ensureLazyStore() error {
 		t := &ps.targets[i]
 		data, err := yaml.Marshal(t)
 		if err != nil {
-			klog.Errorf("seed target %s: %v", t.Name, err)
+			klog.Errorf("seed target %s: %v", t.ServerName, err)
 			continue
 		}
 		sum := sha256.Sum256(data)
 		version := hex.EncodeToString(sum[:])
 
-		// Determine hostnames from listen field (comma-separated)
-		hostnames := parseHostnames(t.Listen, t.Name)
+		// Determine hostnames from server_name field (comma-separated)
+		hostnames := parseServerNames(t.ServerName)
 		for _, hostname := range hostnames {
 			if err := ps.targetStore.PutTargetByHost(ctx, hostname, version, data); err != nil {
-				klog.Errorf("seed target %s for hostname %s: %v", t.Name, hostname, err)
+				klog.Errorf("seed target %s for hostname %s: %v", t.ServerName, hostname, err)
 			}
 		}
 	}
@@ -446,12 +437,14 @@ func (ps *proxyServer) ensureLazyStore() error {
 // parseHostnames extracts hostnames from the listen field.
 // If listen is empty or port-only (starts with ":"), falls back to target name.
 // Multiple hostnames can be comma-separated.
-func parseHostnames(listen, fallback string) []string {
-	if listen == "" || strings.HasPrefix(listen, ":") {
-		return []string{fallback}
+// parseServerNames extracts hostnames from the server_name field.
+// server_name can be comma-separated for multiple hostnames.
+func parseServerNames(serverName string) []string {
+	if serverName == "" {
+		return nil
 	}
 	var hosts []string
-	for _, h := range strings.Split(listen, ",") {
+	for _, h := range strings.Split(serverName, ",") {
 		h = strings.TrimSpace(h)
 		if h == "" {
 			continue
@@ -461,9 +454,6 @@ func parseHostnames(listen, fallback string) []string {
 			h = h[:idx]
 		}
 		hosts = append(hosts, h)
-	}
-	if len(hosts) == 0 {
-		return []string{fallback}
 	}
 	return hosts
 }
@@ -516,9 +506,11 @@ func (ps *proxyServer) pullTargetsFromControlPlane(ctx context.Context) error {
 			version = hex.EncodeToString(sum[:])
 		}
 
-		// Store under hostname(s) from listen field
-		hostnames := parseHostnames(entry.Target.Listen, name)
+		// Store under hostname(s) from server_name field
+		klog.Infof("pull: name=%s, target.ServerName=%s", name, entry.Target.ServerName)
+		hostnames := parseServerNames(entry.Target.ServerName)
 		for _, hostname := range hostnames {
+			klog.Infof("pull: storing hostname=%s", hostname)
 			if err := ps.targetStore.PutTargetByHost(ctx, hostname, version, data); err != nil {
 				return fmt.Errorf("control plane pull: store %s: %w", hostname, err)
 			}
@@ -547,12 +539,12 @@ func (ps *proxyServer) applyTargetUpdate(update *cluster.TargetConfigUpdate) {
 		return
 	}
 
-	// Determine hostnames from the updated config's listen field
+	// Determine hostnames from the updated config's server_name field
 	targetConfig := update.Config
 	if targetConfig == nil {
 		return
 	}
-	hostnames := parseHostnames(targetConfig["listen"].(string), update.TargetName)
+	hostnames := parseServerNames(targetConfig["server_name"].(string))
 	for _, hostname := range hostnames {
 		if err := ps.targetStore.PutTargetByHost(context.Background(), hostname, update.Version, data); err != nil {
 			klog.Errorf("store target update %s for hostname %s: %v", update.TargetName, hostname, err)
@@ -621,11 +613,11 @@ func (ps *proxyServer) buildTLSConfig() *tls.Config {
 		if target.TLS != nil && target.TLS.CertFile != "" && target.TLS.KeyFile != "" {
 			cert, err := tls.LoadX509KeyPair(target.TLS.CertFile, target.TLS.KeyFile)
 			if err != nil {
-				klog.Warningf("failed to load TLS cert for target %s: %v", target.Name, err)
+				klog.Warningf("failed to load TLS cert for target %s: %v", target.ServerName, err)
 				continue
 			}
 			certs = append(certs, cert)
-			klog.Infof("loaded TLS cert for target: %s", target.Name)
+			klog.Infof("loaded TLS cert for target: %s", target.ServerName)
 		}
 	}
 
@@ -858,7 +850,7 @@ func (ps *proxyServer) reloadFrom(cfgPath, targetsDir string) error {
 	} else {
 		klog.Infof("full reload completed in %v: %d targets", duration, len(targets))
 		for _, t := range targets {
-			klog.Infof("  target: %s (lb=%s)", t.Name, t.LBAlgorithm)
+			klog.Infof("  target: %s (lb=%s)", t.ServerName, t.LBAlgorithm)
 			for _, u := range t.Upstreams {
 				klog.Infof("    upstream: %s (weight=%d)", u.URL, u.Weight)
 			}
@@ -868,8 +860,8 @@ func (ps *proxyServer) reloadFrom(cfgPath, targetsDir string) error {
 			if t.TLS != nil && t.TLS.CertFile != "" {
 				klog.Infof("    TLS: %s", t.TLS.CertFile)
 			}
-			if t.Listen != "" {
-				klog.Infof("    host: %s", t.Listen)
+			if t.ServerName != "" {
+				klog.Infof("    server_name: %s", t.ServerName)
 			}
 		}
 	}
@@ -1409,7 +1401,7 @@ func buildPluginConfigs(proxyCfg *config.ProxyConfig, targets []config.TargetCon
 
 	// Collect plugin configs from all locations across all targets
 	for _, target := range targets {
-		klog.V(2).Infof("buildPluginConfigs: target=%s, locations=%d", target.Name, len(target.Locations))
+		klog.V(2).Infof("buildPluginConfigs: target=%s, locations=%d", target.ServerName, len(target.Locations))
 		for _, loc := range target.Locations {
 			klog.V(2).Infof("buildPluginConfigs: loc=%s, Compression=%v, Optimize=%v, Rewrite=%v, CORS=%v, Headers=%v",
 				loc.Path, loc.Compression, loc.Optimize, loc.Rewrite, loc.CORS, loc.Headers)
@@ -1538,7 +1530,7 @@ func buildWAFLocations(targets []config.TargetConfig) []any {
 				continue
 			}
 			out = append(out, map[string]any{
-				"target":   target.Name,
+				"target":   target.ServerName,
 				"location": loc.Path,
 				"waf":      wafLocationToMap(loc.WAF),
 			})

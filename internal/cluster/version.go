@@ -59,8 +59,8 @@ func NewConfigVersionStore(hotTierSize int) *ConfigVersionStore {
 func computeHash(target *config.TargetConfig) string {
 	// Use a more robust encoding that covers all config fields
 	h := sha256.New()
-	h.Write([]byte(target.Name))
-	h.Write([]byte(target.Listen))
+	h.Write([]byte(target.ServerName))
+	h.Write([]byte(target.HostHeader))
 	h.Write([]byte(target.LBAlgorithm))
 
 	for _, u := range target.Upstreams {
@@ -132,9 +132,9 @@ func (cvs *ConfigVersionStore) LoadTargets(targetsDir string) (map[string]*Targe
 
 	for _, target := range targets {
 		t := target // copy to get pointer
-		name := t.Name
+		name := t.ServerName
 		if name == "" {
-			continue // skip targets without name
+			continue // skip targets without server_name
 		}
 		hash := computeHash(&t)
 		existing := cvs.targets[name]

@@ -23,8 +23,8 @@ func testTargetHandler(t *testing.T, ts *httptest.Server, name string, loc *conf
 	lb := loadbalancer.NewRoundRobin([]*loadbalancer.Upstream{{URL: ts.URL}})
 	return handler.NewTargetHandler(
 		&config.TargetConfig{
-			Name:      name,
-			Upstreams: []config.UpstreamConfig{{URL: ts.URL}},
+			ServerName: name,
+			Upstreams:  []config.UpstreamConfig{{URL: ts.URL}},
 		},
 		loc,
 		nil, nil, lb, nil, 0,

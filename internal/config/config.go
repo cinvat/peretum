@@ -92,16 +92,12 @@ type JSONLogConfig struct {
 }
 
 type TargetConfig struct {
-	Name   string `yaml:"name"`
-	Listen string `yaml:"listen"`
-	// Host overrides the upstream Host header for every location of this
-	// target when set, taking precedence over pass_host_header. Empty means
-	// the default behavior (pass_host_header or the upstream host).
-	Host        string           `yaml:"host"`
-	Upstreams   []UpstreamConfig `yaml:"upstreams"`
-	LBAlgorithm string           `yaml:"lb_algorithm"`
-	Locations   []LocationConfig `yaml:"locations"`
-	TLS         *TargetTLSConfig `yaml:"tls"`
+	ServerName  string           `yaml:"server_name" json:"server_name"`
+	HostHeader  string           `yaml:"host_header" json:"host_header"`
+	Upstreams   []UpstreamConfig `yaml:"upstreams" json:"upstreams"`
+	LBAlgorithm string           `yaml:"lb_algorithm" json:"lb_algorithm"`
+	Locations   []LocationConfig `yaml:"locations" json:"locations"`
+	TLS         *TargetTLSConfig `yaml:"tls" json:"tls"`
 }
 
 type TargetTLSConfig struct {

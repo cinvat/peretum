@@ -1,6 +1,5 @@
-name: "fallback"
-listen: ""
-host: ""
+server_name: "fallback"
+host_header: ""
 lb_algorithm: "round_robin"
 upstreams:
   - url: "http://upstream-api-1:80"

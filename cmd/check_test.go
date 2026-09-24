@@ -13,7 +13,7 @@ func TestCheckConfig(t *testing.T) {
 		writeFile(t, filepath.Join(dir, "config.yaml"), runConfigYAML(":8081", filepath.Join(dir, "cache"), false))
 		tdir := filepath.Join(dir, "targets")
 		os.Mkdir(tdir, 0o700)
-		writeFile(t, filepath.Join(tdir, "t.yaml"), "name: tg\nupstreams:\n  - url: http://x:1\nlocations:\n  - path: /\n")
+		writeFile(t, filepath.Join(tdir, "t.yaml"), "server_name: tg\nupstreams:\n  - url: http://x:1\nlocations:\n  - path: /\n")
 		if err := checkConfig(filepath.Join(dir, "config.yaml"), tdir); err != nil {
 			t.Fatalf("checkConfig: %v", err)
 		}
@@ -48,7 +48,7 @@ func TestCheckConfig(t *testing.T) {
 		dir := t.TempDir()
 		tdir := filepath.Join(dir, "targets")
 		os.Mkdir(tdir, 0o700)
-		writeFile(t, filepath.Join(tdir, "t.yaml"), "name: tg\nlocations:\n  - path: /\n")
+		writeFile(t, filepath.Join(tdir, "t.yaml"), "server_name: tg\nlocations:\n  - path: /\n")
 		writeFile(t, filepath.Join(dir, "config.yaml"), "listen: :8081\nmax_write_workers: -1\nmax_response_body_size: \"-1\"\n")
 		if err := checkConfig(filepath.Join(dir, "config.yaml"), tdir); err != nil {
 			t.Fatalf("checkConfig: %v", err)
@@ -65,7 +65,7 @@ func TestCheckConfig(t *testing.T) {
 		dir := t.TempDir()
 		tdir := filepath.Join(dir, "targets")
 		os.Mkdir(tdir, 0o700)
-		writeFile(t, filepath.Join(tdir, "t.yaml"), "name: tg\nlocations:\n  - path: /\n")
+		writeFile(t, filepath.Join(tdir, "t.yaml"), "server_name: tg\nlocations:\n  - path: /\n")
 		writeFile(t, filepath.Join(dir, "config.yaml"), "listen: :8081\nlisteners:\n  - \":80 h2 http3\"\n  - \":443 ssl h2 h3\"\n")
 		if err := checkConfig(filepath.Join(dir, "config.yaml"), tdir); err != nil {
 			t.Fatalf("checkConfig: %v", err)
@@ -90,7 +90,7 @@ func TestCheckConfig(t *testing.T) {
 		writeFile(t, filepath.Join(dir, "config.yaml"), runConfigYAML(":8081", filepath.Join(dir, "cache"), false))
 		tdir := filepath.Join(dir, "targets")
 		os.Mkdir(tdir, 0o700)
-		writeFile(t, filepath.Join(tdir, "t.yaml"), "name: tg\nupstreams:\n  - url: hostonly\nlocations:\n  - path: /\n")
+		writeFile(t, filepath.Join(tdir, "t.yaml"), "server_name: tg\nupstreams:\n  - url: hostonly\nlocations:\n  - path: /\n")
 		if err := checkConfig(filepath.Join(dir, "config.yaml"), tdir); err == nil || !strings.Contains(err.Error(), "target tg") {
 			t.Fatalf("err = %v", err)
 		}
@@ -100,7 +100,7 @@ func TestCheckConfig(t *testing.T) {
 		writeFile(t, filepath.Join(dir, "config.yaml"), runConfigYAML(":8081", filepath.Join(dir, "cache"), false))
 		tdir := filepath.Join(dir, "targets")
 		os.Mkdir(tdir, 0o700)
-		writeFile(t, filepath.Join(tdir, "t.yaml"), "name: tg\nupstreams:\n  - url: http://x:1\nlocations:\n  - path: /\n    cache_ttl: bogus\n")
+		writeFile(t, filepath.Join(tdir, "t.yaml"), "server_name: tg\nupstreams:\n  - url: http://x:1\nlocations:\n  - path: /\n    cache_ttl: bogus\n")
 		if err := checkConfig(filepath.Join(dir, "config.yaml"), tdir); err == nil || !strings.Contains(err.Error(), "cache_ttl") {
 			t.Fatalf("err = %v", err)
 		}
@@ -110,7 +110,7 @@ func TestCheckConfig(t *testing.T) {
 		writeFile(t, filepath.Join(dir, "config.yaml"), "listen: :8081\n")
 		tdir := filepath.Join(dir, "targets")
 		os.Mkdir(tdir, 0o700)
-		writeFile(t, filepath.Join(tdir, "t.yaml"), "name: tg\nlocations:\n  - path: /\n")
+		writeFile(t, filepath.Join(tdir, "t.yaml"), "server_name: tg\nlocations:\n  - path: /\n")
 		if err := checkConfig(filepath.Join(dir, "config.yaml"), tdir); err != nil {
 			t.Fatalf("checkConfig: %v", err)
 		}

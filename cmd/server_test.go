@@ -91,7 +91,7 @@ func (closedPacketConn) SetWriteDeadline(t time.Time) error { return nil }
 
 func TestNewProxyServer(t *testing.T) {
 	cfg := &config.ProxyConfig{Listeners: []string{":8081"}}
-	tgt := []config.TargetConfig{{Name: "tg"}}
+	tgt := []config.TargetConfig{{ServerName: "tg"}}
 	dc := newDiskCache(t, t.TempDir())
 	sem := make(chan struct{}, 8)
 	pm := manager.NewPluginManager()
@@ -105,35 +105,29 @@ func TestNewProxyServer(t *testing.T) {
 func TestBuildHostRouter(t *testing.T) {
 	targets := []config.TargetConfig{
 		{
-			Name:      "a",
-			Upstreams: []config.UpstreamConfig{{URL: "http://a:1", Weight: 1}},
-			Locations: []config.LocationConfig{
-				{Path: "/", Cache: true},
-				{Path: "/", Cache: true},
-			},
+			ServerName: "a",
+			Upstreams:  []config.UpstreamConfig{{URL: "http://a:1", Weight: 1}},
+			Locations:  []config.LocationConfig{{Path: "/", Cache: true}, {Path: "/", Cache: true}},
 		},
 		{
-			Name:      "b",
-			Listen:    "b.example:8080",
-			Upstreams: []config.UpstreamConfig{{URL: "http://b:2"}},
-			Locations: []config.LocationConfig{{Path: "/api"}},
+			ServerName: "b.example",
+			Upstreams:  []config.UpstreamConfig{{URL: "http://b:2"}},
+			Locations:  []config.LocationConfig{{Path: "/api"}},
 		},
 		{
-			Name:      "c",
-			Listen:    "plainhost",
-			Upstreams: []config.UpstreamConfig{{URL: "http://c:3"}},
-			Locations: []config.LocationConfig{{Path: "/", Cache: true}},
+			ServerName: "plainhost",
+			Upstreams:  []config.UpstreamConfig{{URL: "http://c:3"}},
+			Locations:  []config.LocationConfig{{Path: "/", Cache: true}},
 		},
 		{
-			Name:      "d",
-			Listen:    ":9090",
-			Upstreams: []config.UpstreamConfig{{URL: "http://d:4"}},
-			Locations: []config.LocationConfig{{Path: "/x"}},
+			ServerName: "d",
+			Upstreams:  []config.UpstreamConfig{{URL: "http://d:4"}},
+			Locations:  []config.LocationConfig{{Path: "/x"}},
 		},
 		{
-			Name:      "bad",
-			Upstreams: []config.UpstreamConfig{{URL: "not-a-url"}},
-			Locations: []config.LocationConfig{{Path: "/"}},
+			ServerName: "bad",
+			Upstreams:  []config.UpstreamConfig{{URL: "not-a-url"}},
+			Locations:  []config.LocationConfig{{Path: "/"}},
 		},
 	}
 	ps := &proxyServer{targets: targets}
@@ -163,11 +157,11 @@ func TestBuildTLSConfig(t *testing.T) {
 	ps := &proxyServer{
 		proxyCfg: &config.ProxyConfig{},
 		targets: []config.TargetConfig{
-			{Name: "notls"},
-			{Name: "empty", TLS: &config.TargetTLSConfig{CertFile: "", KeyFile: ""}},
-			{Name: "nokey", TLS: &config.TargetTLSConfig{CertFile: cert}},
-			{Name: "badpair", TLS: &config.TargetTLSConfig{CertFile: bad, KeyFile: bad}},
-			{Name: "good", TLS: &config.TargetTLSConfig{CertFile: cert, KeyFile: key}},
+			{ServerName: "notls"},
+			{ServerName: "empty", TLS: &config.TargetTLSConfig{CertFile: "", KeyFile: ""}},
+			{ServerName: "nokey", TLS: &config.TargetTLSConfig{CertFile: cert}},
+			{ServerName: "badpair", TLS: &config.TargetTLSConfig{CertFile: bad, KeyFile: bad}},
+			{ServerName: "good", TLS: &config.TargetTLSConfig{CertFile: cert, KeyFile: key}},
 		},
 	}
 	tc := ps.buildTLSConfig()
@@ -240,7 +234,7 @@ func TestBuildTLSConfigGlobal(t *testing.T) {
 		ps := &proxyServer{
 			proxyCfg: &config.ProxyConfig{TLSCertFile: cert, TLSKeyFile: key},
 			targets: []config.TargetConfig{
-				{Name: "good", TLS: &config.TargetTLSConfig{CertFile: cert, KeyFile: key}},
+				{ServerName: "good", TLS: &config.TargetTLSConfig{CertFile: cert, KeyFile: key}},
 			},
 		}
 		tc := ps.buildTLSConfig()
@@ -253,7 +247,7 @@ func TestBuildTLSConfigGlobal(t *testing.T) {
 		ps := &proxyServer{
 			proxyCfg: &config.ProxyConfig{},
 			targets: []config.TargetConfig{
-				{Name: "a", TLS: nil},
+				{ServerName: "a", TLS: nil},
 			},
 		}
 		if tc := ps.buildTLSConfig(); tc != nil {
@@ -279,8 +273,8 @@ func TestTLSRequested(t *testing.T) {
 		{"http3Addr", &config.ProxyConfig{Listeners: []string{":8443 quic"}}, nil, true},
 		{"globalCert", &config.ProxyConfig{TLSCertFile: "c.pem"}, nil, true},
 		{"globalKey", &config.ProxyConfig{TLSKeyFile: "k.pem"}, nil, true},
-		{"targetTLS", &config.ProxyConfig{}, []config.TargetConfig{{Name: "t", TLS: &config.TargetTLSConfig{CertFile: "c.pem"}}}, true},
-		{"targetNoTLS", &config.ProxyConfig{}, []config.TargetConfig{{Name: "t"}}, false},
+		{"targetTLS", &config.ProxyConfig{}, []config.TargetConfig{{ServerName: "t", TLS: &config.TargetTLSConfig{CertFile: "c.pem"}}}, true},
+		{"targetNoTLS", &config.ProxyConfig{}, []config.TargetConfig{{ServerName: "t"}}, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -433,7 +427,7 @@ func TestReloadFrom(t *testing.T) {
 	}
 	writeFile(t, cfgPath, runConfigYAML(":9999", filepath.Join(dir, "cache"), false))
 	writeFile(t, filepath.Join(targetsDir, "t.yaml"),
-		"name: tg\nupstreams:\n  - url: http://x:1\nlocations:\n  - path: /\n    cache: true\n")
+		"server_name: tg\nupstreams:\n  - url: http://x:1\nlocations:\n  - path: /\n    cache: true\n")
 
 	t.Run("ProxyConfigError", func(t *testing.T) {
 		ps := &proxyServer{}
@@ -459,7 +453,7 @@ func TestReloadFrom(t *testing.T) {
 		if len(ps.proxyCfg.Listeners) != 1 || ps.proxyCfg.Listeners[0] != ":9999" {
 			t.Fatalf("proxyCfg.Listeners = %v", ps.proxyCfg.Listeners)
 		}
-		if len(ps.targets) != 1 || ps.targets[0].Name != "tg" {
+		if len(ps.targets) != 1 || ps.targets[0].ServerName != "tg" {
 			t.Fatalf("targets = %+v", ps.targets)
 		}
 		if got := ps.router.GetDefaultHandler(); got == nil {
@@ -485,7 +479,7 @@ func TestReloadFrom(t *testing.T) {
 			t.Fatal(err)
 		}
 		writeFile(t, filepath.Join(tdir, "tls.yaml"),
-			fmt.Sprintf("name: tls\nlisten: :8443\nupstreams:\n  - url: http://y:1\nlocations:\n  - path: /\ntls:\n  cert_file: %s\n  key_file: %s\n", cert, key))
+			fmt.Sprintf("server_name: tls\n\nupstreams:\n  - url: http://y:1\nlocations:\n  - path: /\ntls:\n  cert_file: %s\n  key_file: %s\n", cert, key))
 		ps := &proxyServer{router: router.NewHostRouter(), srv: &http.Server{}, h3Srv: &http3.Server{}}
 		if err := ps.reloadFrom(cfgPath, tdir); err != nil {
 			t.Fatalf("reloadFrom: %v", err)
@@ -508,7 +502,7 @@ func TestReloadUsesStoredPaths(t *testing.T) {
 	}
 	writeFile(t, cfgPath, runConfigYAML(":9999", filepath.Join(dir, "cache"), false))
 	writeFile(t, filepath.Join(targetsDir, "t.yaml"),
-		"name: tg\nupstreams:\n  - url: http://x:1\nlocations:\n  - path: /\n")
+		"server_name: tg\nupstreams:\n  - url: http://x:1\nlocations:\n  - path: /\n")
 
 	ps := &proxyServer{router: router.NewHostRouter()}
 	// Run from a working directory that has no config.yaml/config.d, so a
@@ -522,7 +516,7 @@ func TestReloadUsesStoredPaths(t *testing.T) {
 	if len(ps.proxyCfg.Listeners) != 1 || ps.proxyCfg.Listeners[0] != ":9999" {
 		t.Fatalf("proxyCfg.Listeners = %v", ps.proxyCfg.Listeners)
 	}
-	if len(ps.targets) != 1 || ps.targets[0].Name != "tg" {
+	if len(ps.targets) != 1 || ps.targets[0].ServerName != "tg" {
 		t.Fatalf("targets = %+v", ps.targets)
 	}
 }
@@ -582,11 +576,10 @@ func TestStartServeAndSIGHUPReloadError(t *testing.T) {
 	proxyCfg := &config.ProxyConfig{Listeners: []string{fmt.Sprintf("127.0.0.1:%d", port)}, CacheDir: dir}
 	targets := []config.TargetConfig{
 		{
-			Name:      "tg",
-			Listen:    "tls-echo:8443",
-			Upstreams: []config.UpstreamConfig{{URL: up.URL}},
-			TLS:       &config.TargetTLSConfig{CertFile: "dummy.pem"},
-			Locations: []config.LocationConfig{{Path: "/", Cache: true}},
+			ServerName: "tg",
+			Upstreams:  []config.UpstreamConfig{{URL: up.URL}},
+			TLS:        &config.TargetTLSConfig{CertFile: "dummy.pem"},
+			Locations:  []config.LocationConfig{{Path: "/", Cache: true}},
 		},
 	}
 	ps := newProxyServer(proxyCfg, targets, dc, make(chan struct{}, 8), nil, 0)
@@ -659,7 +652,7 @@ func TestRunCacheError(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(targetsDir, "t.yaml"),
-		"name: tg\nupstreams:\n  - url: http://x:1\nlocations:\n  - path: /\n")
+		"server_name: tg\nupstreams:\n  - url: http://x:1\nlocations:\n  - path: /\n")
 	writeFile(t, cfgPath, runConfigYAML(":0", "/dev/null/cache", false))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -684,7 +677,7 @@ func TestRunListenError(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(targetsDir, "t.yaml"),
-		"name: tg\nupstreams:\n  - url: http://x:1\nlocations:\n  - path: /\n")
+		"server_name: tg\nupstreams:\n  - url: http://x:1\nlocations:\n  - path: /\n")
 	writeFile(t, cfgPath, runConfigYAML(fmt.Sprintf("127.0.0.1:%d", port), filepath.Join(dir, "cache"), false))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -703,7 +696,7 @@ func TestRunPluginInitError(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(targetsDir, "t.yaml"),
-		"name: tg\nupstreams:\n  - url: http://x:1\nlocations:\n  - path: /\n")
+		"server_name: tg\nupstreams:\n  - url: http://x:1\nlocations:\n  - path: /\n")
 	var b strings.Builder
 	b.WriteString(runConfigYAML(":0", filepath.Join(dir, "cache"), false))
 	fmt.Fprintf(&b, "json_log:\n  enabled: true\n  access_log: \"/dev/null/a.jsonl\"\n  error_log: \"/dev/null/e.jsonl\"\n  stdout: false\n")
@@ -738,7 +731,7 @@ func TestRunShutdownError(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(targetsDir, "t.yaml"),
-		fmt.Sprintf("name: tg\nupstreams:\n  - url: %s\nlocations:\n  - path: /\n", up.URL))
+		fmt.Sprintf("server_name: tg\nupstreams:\n  - url: %s\nlocations:\n  - path: /\n", up.URL))
 	writeFile(t, cfgPath, runConfigYAML(fmt.Sprintf("127.0.0.1:%d", port), filepath.Join(dir, "cache"), false))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -792,7 +785,7 @@ func TestRunConfiguredWorkersAndBodyLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(targetsDir, "t.yaml"),
-		fmt.Sprintf("name: tg\nupstreams:\n  - url: %s\nlocations:\n  - path: /\n    cache: true\n", up.URL))
+		fmt.Sprintf("server_name: tg\nupstreams:\n  - url: %s\nlocations:\n  - path: /\n    cache: true\n", up.URL))
 	cfg := runConfigYAML(fmt.Sprintf("127.0.0.1:%d", port), filepath.Join(dir, "cache"), false)
 	cfg += "max_write_workers: -1\nmax_response_body_size: \"50B\"\n"
 	writeFile(t, cfgPath, cfg)
@@ -847,7 +840,7 @@ func TestRunUnlimitedBodyAndWorkers(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(targetsDir, "t.yaml"),
-		fmt.Sprintf("name: tg\nupstreams:\n  - url: %s\nlocations:\n  - path: /\n    cache: true\n", up.URL))
+		fmt.Sprintf("server_name: tg\nupstreams:\n  - url: %s\nlocations:\n  - path: /\n    cache: true\n", up.URL))
 	cfg := runConfigYAML(fmt.Sprintf("127.0.0.1:%d", port), filepath.Join(dir, "cache"), false)
 	cfg += "max_write_workers: -1\nmax_response_body_size: \"-1\"\n"
 	writeFile(t, cfgPath, cfg)
@@ -894,7 +887,7 @@ func TestRunServeAndGracefulShutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(targetsDir, "t.yaml"),
-		fmt.Sprintf("name: tg\nupstreams:\n  - url: %s\nlocations:\n  - path: /\n    cache: true\n", up.URL))
+		fmt.Sprintf("server_name: tg\nupstreams:\n  - url: %s\nlocations:\n  - path: /\n    cache: true\n", up.URL))
 	writeFile(t, cfgPath, runConfigYAML(fmt.Sprintf("127.0.0.1:%d", port), filepath.Join(dir, "cache"), true))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -933,7 +926,7 @@ func TestRunServeTLS(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(targetsDir, "t.yaml"),
-		fmt.Sprintf("name: tg\nupstreams:\n  - url: %s\nlocations:\n  - path: /\n", up.URL))
+		fmt.Sprintf("server_name: tg\nupstreams:\n  - url: %s\nlocations:\n  - path: /\n", up.URL))
 	cfg := runConfigYAML(fmt.Sprintf("127.0.0.1:%d ssl", port), filepath.Join(dir, "cache"), false)
 	cfg += fmt.Sprintf("tls_cert_file: %s\ntls_key_file: %s\n", cert, key)
 	writeFile(t, cfgPath, cfg)
@@ -990,7 +983,7 @@ func TestRunServeH2C(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFile(t, filepath.Join(targetsDir, "t.yaml"),
-		fmt.Sprintf("name: tg\nupstreams:\n  - url: %s\nlocations:\n  - path: /\n", up.URL))
+		fmt.Sprintf("server_name: tg\nupstreams:\n  - url: %s\nlocations:\n  - path: /\n", up.URL))
 	writeFile(t, cfgPath, runConfigYAML(fmt.Sprintf("127.0.0.1:%d", port), filepath.Join(dir, "cache"), false))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1045,7 +1038,7 @@ func TestBuildPluginConfigs(t *testing.T) {
 	}
 	targets := []config.TargetConfig{
 		{
-			Name: "lean",
+			ServerName: "lean",
 			Locations: []config.LocationConfig{
 				{
 					Path:        "/l",
@@ -1059,7 +1052,7 @@ func TestBuildPluginConfigs(t *testing.T) {
 			},
 		},
 		{
-			Name: "full",
+			ServerName: "full",
 			Locations: []config.LocationConfig{
 				{
 					Path:        "/f",
@@ -1130,7 +1123,7 @@ func TestBuildPluginConfigs(t *testing.T) {
 
 func TestBuildPluginConfigsDisabledPrometheus(t *testing.T) {
 	proxyCfg := &config.ProxyConfig{}
-	targets := []config.TargetConfig{{Name: "x", Locations: []config.LocationConfig{{Path: "/"}}}}
+	targets := []config.TargetConfig{{ServerName: "x", Locations: []config.LocationConfig{{Path: "/"}}}}
 	configs := buildPluginConfigs(proxyCfg, targets)
 	if v, ok := configs["prometheus_exporter"]; !ok || v["enabled"] != false {
 		t.Fatalf("prometheus disabled config = %v", configs["prometheus_exporter"])
@@ -1166,7 +1159,7 @@ func TestBuildPluginConfigsWAF(t *testing.T) {
 	}
 	targets := []config.TargetConfig{
 		{
-			Name: "full",
+			ServerName: "full",
 			Locations: []config.LocationConfig{
 				{
 					Path: "/f",
@@ -1189,7 +1182,7 @@ func TestBuildPluginConfigsWAF(t *testing.T) {
 			},
 		},
 		{
-			Name: "lean",
+			ServerName: "lean",
 			Locations: []config.LocationConfig{
 				{Path: "/l", WAF: &config.WAFLocationConfig{Enabled: false}},
 			},
@@ -1260,7 +1253,7 @@ func TestBuildPluginConfigsWAFNoGlobal(t *testing.T) {
 	// Global waf block absent but a location declares a policy: the plugin is
 	// considered enabled with an empty geolite directory.
 	targets := []config.TargetConfig{{
-		Name: "x",
+		ServerName: "x",
 		Locations: []config.LocationConfig{
 			{Path: "/", WAF: &config.WAFLocationConfig{Enabled: true, Rules: []config.WAFRule{}}},
 		},
@@ -1279,7 +1272,7 @@ func TestBuildPluginConfigsWAFNoGlobal(t *testing.T) {
 }
 
 func TestBuildPluginConfigsWAFNone(t *testing.T) {
-	targets := []config.TargetConfig{{Name: "x", Locations: []config.LocationConfig{{Path: "/"}}}}
+	targets := []config.TargetConfig{{ServerName: "x", Locations: []config.LocationConfig{{Path: "/"}}}}
 	configs := buildPluginConfigs(&config.ProxyConfig{}, targets)
 	v, ok := configs["waf"]
 	if !ok {
@@ -1486,9 +1479,9 @@ func TestStartListenersEndToEnd(t *testing.T) {
 	sslLn.Close()
 	dir := t.TempDir()
 	targets := []config.TargetConfig{{
-		Name:      "tg",
-		Upstreams: []config.UpstreamConfig{{URL: up.URL}},
-		Locations: []config.LocationConfig{{Path: "/", Cache: false}},
+		ServerName: "tg",
+		Upstreams:  []config.UpstreamConfig{{URL: up.URL}},
+		Locations:  []config.LocationConfig{{Path: "/", Cache: false}},
 	}}
 	ps := newProxyServer(&config.ProxyConfig{
 		Listeners: []string{
@@ -1664,9 +1657,9 @@ func TestPullTargetsFromControlPlane(t *testing.T) {
 			"targets": map[string]interface{}{
 				"svc.snap": map[string]interface{}{
 					"target": map[string]interface{}{
-						"name":      "svc.snap",
-						"upstreams": []interface{}{map[string]interface{}{"url": url}},
-						"locations": []interface{}{map[string]interface{}{"path": "/"}},
+						"server_name": "svc.snap",
+						"upstreams":   []interface{}{map[string]interface{}{"url": url}},
+						"locations":   []interface{}{map[string]interface{}{"path": "/"}},
 					},
 					"version": "abc",
 				},
@@ -1708,10 +1701,9 @@ func TestEnsureLazyStoreSeedsFromLocalTargets(t *testing.T) {
 	ps := &proxyServer{
 		targetStore: store,
 		targets: []config.TargetConfig{{
-			Name:      "t1",
-			Listen:    "t1", // listen field becomes hostname key
-			Upstreams: []config.UpstreamConfig{{URL: "http://x:1"}},
-			Locations: []config.LocationConfig{{Path: "/"}},
+			ServerName: "t1",
+			Upstreams:  []config.UpstreamConfig{{URL: "http://x:1"}},
+			Locations:  []config.LocationConfig{{Path: "/"}},
 		}},
 	}
 	if err := ps.ensureLazyStore(); err != nil {
@@ -1754,8 +1746,8 @@ func TestLazyControlPlaneUpdateAndDelete(t *testing.T) {
 		TargetName: "svc.upd",
 		Version:    "v2",
 		Config: map[string]interface{}{
-			"name":      "svc.upd",
-			"listen":    "svc.upd", // listen field for hostname
+			"server_name": "svc.upd",
+			// listen field for hostname
 			"upstreams": []interface{}{map[string]interface{}{"url": url}},
 			"locations": []interface{}{map[string]interface{}{"path": "/"}},
 		},

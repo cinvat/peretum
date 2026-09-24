@@ -41,12 +41,12 @@ func checkConfig(cfgPath, targetsDir string) error {
 	for _, t := range targets {
 		if len(t.Upstreams) > 0 {
 			if _, err := t.ParseUpstreams(); err != nil {
-				return fmt.Errorf("target %s: %w", t.Name, err)
+				return fmt.Errorf("target %s: %w", t.ServerName, err)
 			}
 		}
 		for _, loc := range t.Locations {
 			if _, err := loc.ParseCacheTTL(); err != nil {
-				return fmt.Errorf("target %s location %s cache_ttl: %w", t.Name, loc.Path, err)
+				return fmt.Errorf("target %s location %s cache_ttl: %w", t.ServerName, loc.Path, err)
 			}
 		}
 	}

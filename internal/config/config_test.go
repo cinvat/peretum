@@ -257,16 +257,16 @@ func TestLoadProxy(t *testing.T) {
 }
 
 func TestLoadTarget(t *testing.T) {
-	path := writeTemp(t, "target.yaml", "name: svc-a\nlisten: :8081\nhost: upstream.example.com\nupstreams:\n  - url: http://a:80\n")
+	path := writeTemp(t, "target.yaml", "server_name: svc-a\nhost_header: upstream.example.com\nupstreams:\n  - url: http://a:80\n")
 	tgt, err := LoadTarget(path)
 	if err != nil {
 		t.Fatalf("LoadTarget error: %v", err)
 	}
-	if tgt.Name != "svc-a" || len(tgt.Upstreams) != 1 {
+	if tgt.ServerName != "svc-a" || len(tgt.Upstreams) != 1 {
 		t.Fatalf("LoadTarget parsed: %+v", tgt)
 	}
-	if tgt.Host != "upstream.example.com" {
-		t.Fatalf("Host = %q, want upstream.example.com", tgt.Host)
+	if tgt.HostHeader != "upstream.example.com" {
+		t.Fatalf("HostHeader = %q, want upstream.example.com", tgt.HostHeader)
 	}
 
 	if _, err := LoadTarget("/nonexistent/target.yaml"); err == nil {
@@ -281,11 +281,11 @@ func TestLoadTarget(t *testing.T) {
 
 func TestLoadTargets(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "a.yaml"), []byte("name: a\n"), 0o644)
-	os.WriteFile(filepath.Join(dir, "b.yml"), []byte("name: b\n"), 0o644)
-	os.WriteFile(filepath.Join(dir, "c.txt"), []byte("name: c\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "a.yaml"), []byte("server_name: a\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "b.yml"), []byte("server_name: b\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "c.txt"), []byte("server_name: c\n"), 0o644)
 	os.Mkdir(filepath.Join(dir, "subdir"), 0o755)
-	os.WriteFile(filepath.Join(dir, "subdir", "d.yaml"), []byte("name: d\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "subdir", "d.yaml"), []byte("server_name: d\n"), 0o644)
 
 	targets, err := LoadTargets(dir)
 	if err != nil {
@@ -293,7 +293,7 @@ func TestLoadTargets(t *testing.T) {
 	}
 	names := map[string]bool{}
 	for _, tg := range targets {
-		names[tg.Name] = true
+		names[tg.ServerName] = true
 	}
 	if !names["a"] || !names["b"] {
 		t.Fatalf("expected targets a and b, got %v", names)
@@ -307,7 +307,7 @@ func TestLoadTargets(t *testing.T) {
 	}
 
 	emptyDir := t.TempDir()
-	os.WriteFile(filepath.Join(emptyDir, "c.txt"), []byte("name: c\n"), 0o644)
+	os.WriteFile(filepath.Join(emptyDir, "c.txt"), []byte("server_name: c\n"), 0o644)
 	os.Mkdir(filepath.Join(emptyDir, "sub"), 0o755)
 	if _, err := LoadTargets(emptyDir); err != ErrNoTargetFiles {
 		t.Fatalf("expected ErrNoTargetFiles, got %v", err)

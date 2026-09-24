@@ -186,7 +186,7 @@ func (cph *ControlPlaneHTTP) SyncTarget(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var req struct {
-		Name string `json:"name"`
+		ServerName string `json:"server_name"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -194,12 +194,12 @@ func (cph *ControlPlaneHTTP) SyncTarget(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if req.Name == "" {
-		http.Error(w, "missing target name", http.StatusBadRequest)
+	if req.ServerName == "" {
+		http.Error(w, "missing target server_name", http.StatusBadRequest)
 		return
 	}
 
-	target, ok := cph.configStore.GetTarget(req.Name)
+	target, ok := cph.configStore.GetTarget(req.ServerName)
 	if !ok {
 		http.Error(w, "target not found", http.StatusNotFound)
 		return
