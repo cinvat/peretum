@@ -70,7 +70,7 @@ For CDN-scale deployments with 10M+ targets:
 ```yaml
 cluster:
   enabled: true
-  control_plane: "nats://nats.example.com:4222"
+  nats_uri: "nats://nats.example.com:4222"
   lazy: true
   data_dir: "/var/lib/peretum/targetstore"
   lru_size: 1000

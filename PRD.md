@@ -63,7 +63,7 @@
 ```yaml
 cluster:
   enabled: true              # master switch
-  control_plane: "nats://nats.example.com:4222"   # NATS JetStream URL
+  nats_uri: "nats://nats.example.com:4222"   # NATS JetStream URL
   lazy: true                 # enable on-disk + LRU
   data_dir: "/var/lib/peretum/targetstore"  # Pebble dir
   lru_size: 1000             # compiled-handler LRU capacity
