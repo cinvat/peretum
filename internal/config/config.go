@@ -64,17 +64,14 @@ type WAFConfig struct {
 type ClusterConfig struct {
 	Enabled       bool   `yaml:"enabled"`
 	ReplicaFactor int    `yaml:"replica_factor"` // replication factor for control plane
-	ControlPlane  string `yaml:"control_plane"`  // gRPC control plane address for config streaming
+	NATSURI       string `yaml:"nats_uri"`       // NATS JetStream URL(s) for config sync
 
 	// Lazy enables on-disk target storage backed by Pebble: cold configs stay
 	// off-RAM and a target's compiled handlers are materialized on first
 	// request into a bounded LRU. Required for CDN-scale (10M+ target) edges.
-	Lazy bool `yaml:"lazy"`
-	// DataDir is where the Pebble target store lives (default:
-	// <cache_dir>/targetstore).
+	Lazy    bool   `yaml:"lazy"`
 	DataDir string `yaml:"data_dir"`
-	// LRUSize is the compiled-handler LRU capacity (default: 1000).
-	LRUSize int `yaml:"lru_size"`
+	LRUSize int    `yaml:"lru_size"`
 }
 
 type ErrorPageConfig struct {

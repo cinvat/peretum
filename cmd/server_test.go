@@ -1671,7 +1671,7 @@ func TestPullTargetsFromControlPlane(t *testing.T) {
 	store := lazyTestStore(t)
 	ps := &proxyServer{
 		targetStore: store,
-		proxyCfg:    &config.ProxyConfig{Cluster: &config.ClusterConfig{ControlPlane: snap.URL}},
+		proxyCfg:    &config.ProxyConfig{Cluster: &config.ClusterConfig{NATSURI: snap.URL}},
 	}
 
 	if err := ps.ensureLazyStore(); err != nil {

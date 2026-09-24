@@ -407,7 +407,7 @@ cluster:
   lazy: true
   data_dir: "/var/peretum/store"
   lru_size: 5000
-  control_plane: "cp:9001"
+  nats_uri: "cp:9001"
 `)
 	cfg, err := LoadProxy(path)
 	if err != nil {
@@ -422,7 +422,7 @@ cluster:
 	if cfg.Cluster.LRUSize != 5000 {
 		t.Fatalf("lru_size = %d", cfg.Cluster.LRUSize)
 	}
-	if cfg.Cluster.ControlPlane != "cp:9001" {
-		t.Fatalf("control_plane = %q", cfg.Cluster.ControlPlane)
+	if cfg.Cluster.NATSURI != "cp:9001" {
+		t.Fatalf("nats_uri = %q", cfg.Cluster.NATSURI)
 	}
 }

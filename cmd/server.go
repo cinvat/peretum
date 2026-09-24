@@ -145,9 +145,9 @@ func newProxyServer(proxyCfg *config.ProxyConfig, targets []config.TargetConfig,
 	}
 
 	// Initialize NATS config sync if control plane is configured
-	if proxyCfg != nil && proxyCfg.Cluster != nil && proxyCfg.Cluster.ControlPlane != "" {
+	if proxyCfg != nil && proxyCfg.Cluster != nil && proxyCfg.Cluster.NATSURI != "" {
 		streamCfg := cluster.DefaultStreamConfig()
-		natsSync, err := cluster.NewNATSConfigSync(context.Background(), proxyCfg.Cluster.ControlPlane, streamCfg)
+		natsSync, err := cluster.NewNATSConfigSync(context.Background(), proxyCfg.Cluster.NATSURI, streamCfg)
 		if err != nil {
 			klog.Errorf("failed to create NATS sync: %v", err)
 		} else {
@@ -427,7 +427,7 @@ func (ps *proxyServer) ensureLazyStore() error {
 
 	// First launch: if control_plane is configured, pull from it (required).
 	// Otherwise, seed from local config.d.
-	if ps.proxyCfg != nil && ps.proxyCfg.Cluster != nil && ps.proxyCfg.Cluster.ControlPlane != "" {
+	if ps.proxyCfg != nil && ps.proxyCfg.Cluster != nil && ps.proxyCfg.Cluster.NATSURI != "" {
 		if err := ps.pullTargetsFromControlPlane(ctx); err != nil {
 			return fmt.Errorf("control plane pull failed: %w", err)
 		}
@@ -484,7 +484,7 @@ func parseServerNames(serverName string) []string {
 // pullTargetsFromControlPlane fetches the full config snapshot from the leader
 // (/sync) and persists it to the local store.
 func (ps *proxyServer) pullTargetsFromControlPlane(ctx context.Context) error {
-	addr := ps.proxyCfg.Cluster.ControlPlane
+	addr := ps.proxyCfg.Cluster.NATSURI
 	base := addr
 	if !strings.HasPrefix(base, "http") {
 		base = "http://" + base
@@ -1216,7 +1216,7 @@ func run(ctx context.Context, cfgPath, targetsDir string) error {
 	// For lazy edges with control_plane, skip loading local targets;
 	// they will pull from the control plane on first launch.
 	var targets []config.TargetConfig
-	skipLocalTargets := proxyCfg != nil && proxyCfg.Cluster != nil && proxyCfg.Cluster.Lazy && proxyCfg.Cluster.ControlPlane != ""
+	skipLocalTargets := proxyCfg != nil && proxyCfg.Cluster != nil && proxyCfg.Cluster.Lazy && proxyCfg.Cluster.NATSURI != ""
 	if !skipLocalTargets {
 		targets, err = config.LoadTargets(targetsDir)
 		if err != nil {
