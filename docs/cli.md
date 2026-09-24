@@ -12,7 +12,7 @@ order: 800
 peretum                  # run the proxy (defaults below)
 peretum -t               # check configuration syntax and exit ('config OK')
 peretum -r               # reload the running proxy (SIGHUP to the pid file)
-peretum controlplane     # run the CDN control plane (config distribution)
+peretum controlplane     # run the CDN control plane (NATS JetStream config distribution)
 ```
 
 The default command runs the proxy with a graceful shutdown: `SIGINT` /
@@ -32,13 +32,14 @@ The default command runs the proxy with a graceful shutdown: `SIGINT` /
 
 | Command | Description |
 | --- | --- |
-| `controlplane` | Run the CDN control plane (HTTP config snapshot server) |
+| `controlplane` | Run the CDN control plane (NATS JetStream config distribution) |
 
 ### `controlplane`
 
-Starts the HTTP control plane that serves config snapshots to edge nodes. Edges
-pull the full config from `/sync` on first launch (lazy mode) and the control
-plane keeps its snapshot store in sync with the config directory.
+Starts the NATS JetStream control plane that serves config snapshots and streams
+updates to edge nodes. Edges pull the full config from `config.snapshot` NATS
+subject on first launch (lazy mode) and the control plane keeps its snapshot
+store in sync with the config directory.
 
 ```bash
 peretum controlplane [flags]
@@ -46,13 +47,16 @@ peretum controlplane [flags]
 
 | Flag | Description | Default |
 | --- | --- | --- |
-| `--listen` | HTTP listen address | `:9001` |
+| `--listen` | NATS listen address | `:4222` |
 | `--config-dir` | Directory of target config files to watch | `config.d` |
 | `--data-dir` | Directory for persistent data (snapshots, state) | `./controlplane-data` |
+| `--cluster` | NATS cluster URLs for HA (comma-separated) | `""` |
 
 Example:
 ```bash
-peretum controlplane --listen :9001 --config-dir config.d --data-dir ./controlplane-data
+peretum controlplane --listen :4222 --config-dir config.d --data-dir ./controlplane-data
+# HA mode
+peretum controlplane --listen :4222 --cluster nats://cp1:4222,nats://cp2:4222,nats://cp3:4222
 ```
 
 ## `--test` (config check)
@@ -77,7 +81,7 @@ Sending `SIGHUP` (via `peretum -r` or `kill -HUP <pid>`) to a running proxy:
   directory is not used);
 - **delta reload**: only targets that changed are rebuilt (when Cluster mode is enabled);
 - rebuilds the host/location router (targets, upstreams, locations, and the
-  target `host` header override) and re-applies TLS certificates
+  target `host_header` override) and re-applies TLS certificates
   (`GetConfigForClient` for dynamic per-target certs);
 - rotates log outputs on plugins that implement `Reopen()` (the JSON-log
   plugin), which supports `logrotate`-style setups.

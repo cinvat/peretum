@@ -53,18 +53,17 @@
 - [x] **Bounded LRU**: Compiled handlers cached up to `cluster.lru_size` (default 1000); eviction returns to cold storage
 - [x] **Single-Flight Coalescing**: Concurrent first requests for same host compile exactly once
 - [x] **Pebble Store**: Atomic batch writes (config + version), `NoSync` for throughput, fast restart via `v/` prefix scan
-- [x] **Control-Plane Pull**: New edge pulls full snapshot via `/sync` on first launch; falls back to local `config.d`
-- [x] **Incremental Updates**: `applyTargetUpdate`/`applyTargetDelete` persist to store, evict LRU, upsert router stub
-- [x] **Control-Plane HTTP Server**: `/sync`, `/sync/target`, `/health`, `/health/leader`, `/stats` on `:9001`
-- [x] **Leader Election**: Active-standby HA via `/leadership/claim|resign`; single-node auto-leader
+- [x] **Control-Plane Pull**: New edge pulls full snapshot via NATS `config.snapshot` on first launch; falls back to local `config.d`
+- [x] **Incremental Updates**: `applyTargetUpdate`/`applyTargetDelete` persist to store, evict LRU, upsert router stub via NATS JetStream
+- [x] **NATS JetStream Sync**: `config.target.updated.*`, `config.target.deleted.*`, `config.snapshot`, `config.hot-targets`
+- [x] **JetStream Stream**: `LimitsPolicy`, `MaxMsgsPerSubject: 1`, `DiscardOld`, `FileStorage`, 24h max age
 - [x] **Delta Reloads**: SIGHUP triggers config diff; only changed targets rebuild (SHA-256 based)
 
 ### 4.3 Configuration (Complete)
 ```yaml
 cluster:
   enabled: true              # master switch
-  replica_factor: 3          # control-plane HA replication
-  control_plane: "cp:9001"   # HTTP control plane address
+  control_plane: "nats://nats.example.com:4222"   # NATS JetStream URL
   lazy: true                 # enable on-disk + LRU
   data_dir: "/var/lib/peretum/targetstore"  # Pebble dir
   lru_size: 1000             # compiled-handler LRU capacity
@@ -74,7 +73,7 @@ cluster:
 - [x] Prometheus metrics at `metrics_addr`:
   - Reload: `peretum_reload_total{type="delta|full"}`, `peretum_reload_duration_ns`, `peretum_reload_errors_total`
   - Targets: `peretum_targets_loaded_total`, `peretum_targets_changed_total`, `peretum_targets_deleted_total`
-  - Streaming: `peretum_stream_connects_total`, `peretum_stream_disconnects_total`, `peretum_stream_updates_total`, `peretum_stream_errors_total`
+  - NATS sync: `peretum_nats_updates_received_total`, `peretum_nats_deletes_received_total`, `peretum_nats_snapshot_requests_total`
   - Request latency histogram: `peretum_request_latency_bucket`
 - [x] Structured JSON access/error logs
 - [x] Health endpoints: `/health`, `/health/leader`
@@ -109,22 +108,23 @@ cluster:
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Control Plane                            │
-│  (peretum controlplane --listen :9001 --config-dir config.d)   │
+│  (peretum controlplane --listen :4222 --config-dir config.d)   │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
-│  │ fsnotify    │  │ Config      │  │ HTTP :9001              │  │
-│  │ Watcher     │──│VersionStore │──│ /sync, /sync/target,    │  │
-│  └─────────────┘  └─────────────┘  │ /health, /stats         │  │
+│  │ fsnotify    │  │ Config      │  │ NATS JetStream :4222    │  │
+│  │ Watcher     │──│VersionStore │──│ config.target.updated.* │  │
+│  └─────────────┘  └─────────────┘  │ config.snapshot         │  │
+│                                    │ config.hot-targets      │  │
 │                                    └─────────────────────────┘  │
 └──────────────────────────────┬──────────────────────────────────┘
-                               │ /sync snapshot + streaming
-┌──────────────────────────────┼──────────────────────────────────┐
+                               │ config.target.updated.* + config.snapshot
+ ┌─────────────────────────────┼──────────────────────────────────┐
                                ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                          Edge Node                              │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
 │  │ Pebble Store │  │ Lazy LRU     │  │ HostRouter           │  │
-│  │ (t/<name>,   │◄─┤ (1000 cap)   │◄─┤ (LazyHandler stubs)  │  │
-│  │  v/<name>)   │  └──────────────┘  └──────────┬───────────┘  │
+│  │ (h/<host>,   │◄─┤ (1000 cap)   │◄─┤ (LazyHandler stubs)  │  │
+│  │  v/<host>)   │  └──────────────┘  └──────────┬───────────┘  │
 │  └──────┬───────┘                                │            │
 │         │ materialize                             ▼            │
 │         │                            ┌──────────────────────┐  │

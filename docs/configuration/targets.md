@@ -8,9 +8,8 @@ order: 200
 One YAML file per target:
 
 ```yaml
-name: "api"                        # host key, or use `listen:` with a host
-listen: "api.example.com"          # host key (a bare ":port" binds nothing)
-host: "api.example.com"            # upstream Host header override (all locations)
+server_name: "api"                        # hostname key (router match key)
+host_header: "api.example.com"            # upstream Host header override (all locations)
 lb_algorithm: "maglev"
 upstreams:
   - url: "https://api1.example.com"
@@ -43,15 +42,14 @@ locations:
 
 | Key | Type | Description |
 | --- | --- | --- |
-| `name` | string | Target name; also the router host key unless `listen` overrides it. |
-| `listen` | string | Host key for this target. A host-only value (e.g. `api.example.com`) becomes the router key; `":port"`-only values do not create a host key. |
-| `host` | string | Optional upstream `Host` header override sent on every request proxied by this target's locations. Takes precedence over `proxy.pass_host_header`; empty keeps the default behavior. |
+| `server_name` | string | **Required**. Target hostname; used as the router host key and Pebble key. |
+| `host_header` | string | Optional upstream `Host` header override sent on every request proxied by this target's locations. Takes precedence over `proxy.pass_host_header`; empty keeps the default behavior. |
 | `upstreams` | []object | `url` (required), `weight` (`<= 0` treated as `1`), `health_check` (see [Health tracking](#health-tracking)). |
 | `lb_algorithm` | string | See [load balancing](#load-balancing-algorithms). |
 | `locations` | []object | Ordered location list; first match wins (see priorities below). |
 | `tls` | object | `cert_file`, `key_file` — per-target certificate presented via SNI. |
 
-Targets with no host key act as the **default/fallback** handler; the router
+Targets with no `server_name` act as the **default/fallback** handler; the router
 also falls back to a target whose first matching location is `path: "/"`.
 
 ## Locations

@@ -43,8 +43,7 @@ waf:
 
 cluster:
   enabled: true
-  replica_factor: 3                   # replication factor for control plane HA
-  control_plane: "control-plane.example.com:9001"  # control plane address (HTTP :9001)
+  control_plane: "nats://nats.example.com:4222"  # NATS JetStream URL for config sync
   lazy: true                          # keep target configs on disk, compile on first request
   lru_size: 1000                      # compiled-handler LRU capacity
 ```
