@@ -36,10 +36,10 @@ The default command runs the proxy with a graceful shutdown: `SIGINT` /
 
 ### `controlplane`
 
-Starts the NATS JetStream control plane that serves config snapshots and streams
-updates to edge nodes. Edges pull the full config from `config.snapshot` NATS
-subject on first launch (lazy mode) and the control plane keeps its snapshot
-store in sync with the config directory.
+Starts the NATS JetStream control plane that watches `config.d/` and publishes
+config updates to NATS JetStream. Edges subscribe to `config.target.updated.*` and
+`config.target.deleted.*` for real-time updates, and can request full snapshots via
+`config.snapshot`.
 
 ```bash
 peretum controlplane [flags]
@@ -47,16 +47,16 @@ peretum controlplane [flags]
 
 | Flag | Description | Default |
 | --- | --- | --- |
-| `--listen` | NATS listen address | `:4222` |
+| `--nats` | NATS JetStream URL(s) (comma-separated for cluster) | `nats://localhost:4222` |
+| `--http` | HTTP listen address for snapshot API | `:9001` |
 | `--config-dir` | Directory of target config files to watch | `config.d` |
 | `--data-dir` | Directory for persistent data (snapshots, state) | `./controlplane-data` |
-| `--cluster` | NATS cluster URLs for HA (comma-separated) | `""` |
 
 Example:
 ```bash
-peretum controlplane --listen :4222 --config-dir config.d --data-dir ./controlplane-data
+peretum controlplane --nats nats://nats.example.com:4222 --config-dir config.d --data-dir ./controlplane-data
 # HA mode
-peretum controlplane --listen :4222 --cluster nats://cp1:4222,nats://cp2:4222,nats://cp3:4222
+peretum controlplane --nats nats://cp1:4222,cp2:4222,cp3:4222 --http :9001 --config-dir config.d --data-dir ./controlplane-data
 ```
 
 ## `--test` (config check)

@@ -17,7 +17,7 @@
 - **Transparent disk cache** — `X-Cache: HIT/MISS`, LRU eviction, background sweep, atomic writes, request coalescing
 - **Routing** — prefix/exact/regex `location` matching, per-host targets with default fallback
 - **Load balancing** — round-robin, weighted, Maglev consistent hashing, least-connections; passive health tracking
-- **Active health checks** — per-upstream HTTP probes with configurable interval/timeout
+- **Active health checks** — per-upstream HTTP probes with configurable interval/timeout/path
 - **Cache excludes** — bypass cache for live streaming (`.m3u8`, `.ts`, `/live/`) with `Cache-Control: no-store`
 - **nginx-style `listeners`** — multiple frontends with `ssl`, `h2c`, `h3`/`quic` flags
 - **TLS** — global/per-target certs, automatic self-signed fallback
@@ -53,6 +53,44 @@ Full docs at **[cinvat.github.io/peretum](https://cinvat.github.io/peretum/)**:
 - [Targets & Locations →](https://cinvat.github.io/peretum/configuration/targets.html) — cache, health checks, cache_excludes
 - [Plugins →](https://cinvat.github.io/peretum/plugins/index.html) — compression, CORS, headers, WAF, etc.
 - [HTTP/3 →](https://cinvat.github.io/peretum/http3.html) | [gRPC →](https://cinvat.github.io/peretum/grpc.html) | [Cache →](https://cinvat.github.io/peretum/cache.html)
+
+---
+
+## CDN-Scale Cluster Mode
+
+For CDN-scale deployments with 10M+ targets:
+
+- **Lazy target loading** — target configs stay on disk (Pebble); compiled handlers materialize on first request
+- **Bounded LRU** — compiled handlers cached up to `cluster.lru_size` (default 1000)
+- **Single-Flight Coalescing** — concurrent first requests for same host compile exactly once
+- **Pebble Store** — atomic batch writes, `NoSync` for throughput, fast restart via prefix scan
+- **NATS JetStream Sync** — full snapshot on startup via `config.snapshot`; incremental updates via `config.target.updated.*`/`config.target.deleted.*`
+- **Delta Reloads** — SIGHUP triggers config diff; only changed targets rebuild (SHA-256 based)
+
+```yaml
+cluster:
+  enabled: true
+  control_plane: "nats://nats.example.com:4222"
+  lazy: true
+  data_dir: "/var/lib/peretum/targetstore"
+  lru_size: 1000
+```
+
+---
+
+## Quick Start
+
+```bash
+# Build
+go build .
+
+# Run proxy
+./peretum -t                    # validate config
+./peretum                       # run proxy
+
+# Control plane
+peretum controlplane --nats nats://nats.example.com:4222 --config-dir config.d
+```
 
 ---
 

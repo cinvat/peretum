@@ -11,9 +11,28 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats-server/v2/server"
 )
 
 func TestRunControlPlaneServesSnapshots(t *testing.T) {
+	// Start embedded NATS server with JetStream
+	ns, natsErr := server.NewServer(&server.Options{
+		Port:      -1, // random port
+		JetStream: true,
+	})
+	if natsErr != nil {
+		t.Fatal(natsErr)
+	}
+	ns.Start()
+	defer ns.Shutdown()
+
+	if !ns.ReadyForConnections(5 * time.Second) {
+		t.Fatal("NATS server not ready")
+	}
+
+	natsURL := ns.ClientURL()
+
 	dir := t.TempDir()
 	cfgDir := filepath.Join(dir, "config.d")
 	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
@@ -26,13 +45,11 @@ locations:
   - path: /
 `)
 
-	port := freePort(t)
-	listen := fmt.Sprintf("127.0.0.1:%d", port)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
+	httpAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
 	go func() {
-		done <- runControlPlane(ctx, listen, cfgDir, filepath.Join(dir, "data"))
+		done <- runControlPlane(ctx, natsURL, httpAddr, cfgDir, filepath.Join(dir, "data"))
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -43,12 +60,14 @@ locations:
 		}
 	})
 
-	base := "http://" + listen
-	resp := waitForServer(t, base+"/health")
+	base := "http://" + httpAddr
+	var resp *http.Response
+	resp = waitForServer(t, base+"/health")
 	resp.Body.Close()
 
 	// Full snapshot
-	resp, err := http.Get(base + "/sync")
+	var err error
+	resp, err = http.Get(base + "/sync")
 	if err != nil {
 		t.Fatalf("GET /sync: %v", err)
 	}
