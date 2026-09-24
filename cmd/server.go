@@ -34,6 +34,7 @@ import (
 	"github.com/cinvat/peretum/internal/router"
 	"github.com/cinvat/peretum/plugins/base"
 	"github.com/cinvat/peretum/plugins/registry"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/samber/lo"
 	"gopkg.in/yaml.v3"
@@ -54,23 +55,21 @@ type proxyServer struct {
 	pluginMgr   *manager.PluginManager
 
 	// CDN Scale features
-	configStore  *cluster.ConfigVersionStore
-	configStream *cluster.ConfigStreamClient
-	metrics      *cluster.MetricsCollector
-
-	// Cluster control plane
-	clusterHTTP    *cluster.ControlPlaneHTTP
-	leaderElection *cluster.LeaderElection
+	configStore *cluster.ConfigVersionStore
+	metrics     *cluster.MetricsCollector
 
 	// Health checkers for each target (keyed by target name).
 	healthCheckers map[string]*loadbalancer.HealthChecker
 
 	// Lazy mode (cluster.lazy): the Pebble target store holds cold configs
 	// off-RAM; lazyLRU caches compiled handlers for hot hosts; lazyRouter is
-	// the live router updated incrementally from control plane updates.
+	// the live router updated incrementally from NATS updates.
 	targetStore *cluster.TargetStore
 	lazyLRU     *cluster.LRUCache[string, *router.TargetConfigHandler]
 	lazyRouter  *router.HostRouter
+
+	// NATS config sync for control plane updates
+	natsSync *cluster.NATSConfigSync
 
 	// cfgPath/targetsDir are the config file and target directory the proxy
 	// was started with, so SIGHUP reloads re-read the same sources no matter
@@ -113,48 +112,10 @@ func newProxyServer(proxyCfg *config.ProxyConfig, targets []config.TargetConfig,
 		metrics:        &cluster.MetricsCollector{},
 	}
 
-	// Initialize cluster features (config versioning, streaming, metrics)
+	// Initialize cluster features (config versioning, metrics)
 	if proxyCfg != nil && proxyCfg.Cluster != nil {
 		ps.configStore = cluster.NewConfigVersionStore(10000)
 		ps.metrics = &cluster.MetricsCollector{}
-
-		// Initialize control plane HTTP server for leader election and config sync
-		if proxyCfg.Cluster.ControlPlane != "" {
-			peerURLs := strings.Split(proxyCfg.Cluster.ControlPlane, ",")
-			ps.clusterHTTP = cluster.NewControlPlaneHTTP(
-				"", // nodeID not needed without sharding
-				ps.cfgPath,
-				ps.configStore,
-				peerURLs,
-			)
-
-			// Initialize leader election (only if multiple control plane URLs)
-			if len(peerURLs) > 1 {
-				ps.leaderElection = cluster.NewLeaderElection(
-					"", // nodeID not needed without sharding
-					peerURLs,
-					2*time.Second,
-				)
-				ps.leaderElection.Start(context.Background(),
-					func() {
-						ps.clusterHTTP.SetLeader(true)
-						klog.Infof("Became cluster leader")
-						ps.startConfigStream()
-					},
-					func() {
-						ps.clusterHTTP.SetLeader(false)
-						klog.Infof("Lost cluster leadership")
-						ps.stopConfigStream()
-					},
-				)
-			} else if proxyCfg.Cluster.ControlPlane != "" {
-				// Single control plane - just start streaming. A single
-				// control plane is by definition the leader, which also makes
-				// its /sync snapshot endpoint available for lazy edges.
-				ps.clusterHTTP.SetLeader(true)
-				ps.startConfigStream()
-			}
-		}
 
 		// Lazy mode: open the on-disk target store (Pebble) so configs can
 		// stay off-RAM. The store is seeded/pulled from the control plane or
@@ -180,6 +141,68 @@ func newProxyServer(proxyCfg *config.ProxyConfig, targets []config.TargetConfig,
 				ps.lazyLRU = cluster.NewLRUCache[string, *router.TargetConfigHandler](lruSize)
 				klog.Infof("lazy target loading enabled: store=%s lru_capacity=%d", storeDir, ps.lazyLRU.Capacity())
 			}
+		}
+	}
+
+	// Initialize NATS config sync if control plane is configured
+	if proxyCfg != nil && proxyCfg.Cluster != nil && proxyCfg.Cluster.ControlPlane != "" {
+		streamCfg := cluster.DefaultStreamConfig()
+		natsSync, err := cluster.NewNATSConfigSync(context.Background(), proxyCfg.Cluster.ControlPlane, streamCfg)
+		if err != nil {
+			klog.Errorf("failed to create NATS sync: %v", err)
+		} else {
+			ps.natsSync = natsSync
+
+			// Register handlers for target updates and deletes
+			natsSync.RegisterHandler(cluster.SubjectTargetUpdated, func(ctx context.Context, msg jetstream.Msg) error {
+				var event cluster.TargetUpdateEvent
+				if err := json.Unmarshal(msg.Data(), &event); err != nil {
+					klog.Errorf("unmarshal target update: %v", err)
+					return err
+				}
+				// Apply update
+				ps.applyTargetUpdate(&cluster.TargetConfigUpdate{
+					TargetName: event.ServerName,
+					Version:    event.Version,
+					Config:     map[string]interface{}{},
+				})
+				// Unmarshal the actual config
+				var targetConfig config.TargetConfig
+				if err := json.Unmarshal(event.Config, &targetConfig); err != nil {
+					return err
+				}
+				data, err := yaml.Marshal(targetConfig)
+				if err != nil {
+					return err
+				}
+				if err := ps.targetStore.PutTargetByHost(context.Background(), event.ServerName, event.Version, data); err != nil {
+					return err
+				}
+				ps.lazyLRU.Delete(event.ServerName)
+				if ps.lazyRouter != nil {
+					ps.lazyRouter.Upsert(event.ServerName, router.NewLazyHandler(event.ServerName, ps.lazyLRU, func(ctx context.Context) (*router.TargetConfigHandler, error) {
+						return ps.materializeTarget(ctx, event.ServerName)
+					}))
+				}
+				return nil
+			})
+
+			natsSync.RegisterHandler(cluster.SubjectTargetDeleted, func(ctx context.Context, msg jetstream.Msg) error {
+				var event cluster.TargetDeleteEvent
+				if err := json.Unmarshal(msg.Data(), &event); err != nil {
+					klog.Errorf("unmarshal target delete: %v", err)
+					return err
+				}
+				ps.applyTargetDelete(event.ServerName)
+				return nil
+			})
+
+			// Start consuming NATS messages
+			go func() {
+				if err := ps.natsSync.StartConsuming(context.Background()); err != nil {
+					klog.Errorf("NATS consumer error: %v", err)
+				}
+			}()
 		}
 	}
 
@@ -1012,21 +1035,6 @@ func (ps *proxyServer) start() error {
 		ps.h3Conn = ps.h3Conns[0]
 	}
 
-	// Start cluster control plane HTTP server (for leader election and config sync)
-	if ps.clusterHTTP != nil {
-		go ps.runClusterHTTPServer()
-	}
-
-	// Start leader election
-	if ps.leaderElection != nil {
-		go func() {
-			ps.leaderElection.Start(context.Background(),
-				func() { ps.clusterHTTP.SetLeader(true) },
-				func() { ps.clusterHTTP.SetLeader(false) },
-			)
-		}()
-	}
-
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGHUP)
 
@@ -1124,10 +1132,12 @@ var h3Serve = func(srv *http3.Server, conn net.PacketConn) error { return srv.Se
 var serverShutdown = func(ctx context.Context, srv *http.Server) error { return srv.Shutdown(ctx) }
 
 func (ps *proxyServer) shutdown(ctx context.Context) error {
-	// Stop config streaming and leader election
-	ps.stopConfigStream()
-	if ps.leaderElection != nil {
-		ps.leaderElection.Stop()
+	// Stop NATS config sync
+	if ps.natsSync != nil {
+		if err := ps.natsSync.Close(); err != nil {
+			klog.Errorf("NATS sync close error: %v", err)
+		}
+		ps.natsSync = nil
 	}
 
 	// Close the lazy target store (flushes pending config writes to Pebble).
@@ -1178,66 +1188,6 @@ func (ps *proxyServer) shutdown(ctx context.Context) error {
 }
 
 var h3Shutdown = func(ctx context.Context, srv *http3.Server) error { return srv.Shutdown(ctx) }
-
-// runClusterHTTPServer runs the control plane HTTP server for leader election and config sync.
-func (ps *proxyServer) runClusterHTTPServer() {
-	mux := http.NewServeMux()
-
-	// Register cluster HTTP handlers
-	mux.HandleFunc("/health", ps.clusterHTTP.Health)
-	mux.HandleFunc("/health/leader", ps.clusterHTTP.HealthLeader)
-	mux.HandleFunc("/leadership/claim", ps.clusterHTTP.ClaimLeadership)
-	mux.HandleFunc("/leadership/resign", ps.clusterHTTP.ResignLeadership)
-	mux.HandleFunc("/sync", ps.clusterHTTP.SyncConfig)
-	mux.HandleFunc("/sync/target", ps.clusterHTTP.SyncTarget)
-	mux.HandleFunc("/config/reload", ps.clusterHTTP.ReloadConfig)
-	mux.HandleFunc("/stats", ps.clusterHTTP.Stats)
-	mux.HandleFunc("/peer/notify", ps.clusterHTTP.NotifyPeer)
-
-	server := &http.Server{
-		Addr:         ":9001",
-		Handler:      mux,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  60 * time.Second,
-	}
-
-	klog.Info("starting cluster control plane HTTP server on :9001")
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		klog.Errorf("cluster HTTP server error: %v", err)
-	}
-}
-
-// startConfigStream starts the config streaming from control plane (when leader).
-func (ps *proxyServer) startConfigStream() {
-	if ps.configStream == nil || ps.proxyCfg == nil || ps.proxyCfg.Cluster == nil || ps.proxyCfg.Cluster.ControlPlane == "" {
-		return
-	}
-
-	ps.configStream.SetCallbacks(
-		func(update *cluster.GlobalConfigUpdate) {
-			klog.Infof("Received global config update from control plane: %s", update.Version)
-		},
-		func(update *cluster.TargetConfigUpdate) {
-			ps.applyTargetUpdate(update)
-		},
-		func(targetName string) {
-			ps.applyTargetDelete(targetName)
-		},
-	)
-
-	if err := ps.configStream.Connect(); err != nil {
-		klog.Errorf("Failed to connect to control plane: %v", err)
-	}
-}
-
-// stopConfigStream stops the config streaming.
-func (ps *proxyServer) stopConfigStream() {
-	if ps.configStream != nil {
-		ps.configStream.Close()
-		ps.configStream = nil
-	}
-}
 
 // buildWriteSem returns the write-semaphore channel that gates concurrent
 // cache writes. A worker count below zero means unlimited (nil channel,
