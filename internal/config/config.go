@@ -74,7 +74,20 @@ type ClusterConfig struct {
 	Lazy    bool   `yaml:"lazy"`
 	DataDir string `yaml:"data_dir"`
 	LRUSize int    `yaml:"lru_size"`
+
+	// ReplayTimeout bounds how long startup waits for the retained config
+	// events to be applied before giving up. The edge does not accept traffic
+	// until replay finishes, because a store that is still filling in would
+	// answer 404 for every target it has not reached yet. Zero means
+	// DefaultReplayTimeout. Set it generously for a large stream: replay time
+	// grows with the number of retained events.
+	ReplayTimeout time.Duration `yaml:"replay_timeout"`
 }
+
+// DefaultReplayTimeout is how long startup waits for the retained config events
+// when cluster.replay_timeout is unset. It is a startup gate, not a per-request
+// timeout, so it is generous.
+const DefaultReplayTimeout = 2 * time.Minute
 
 type ErrorPageConfig struct {
 	Enabled bool `yaml:"enabled"`

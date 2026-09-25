@@ -630,3 +630,21 @@ func TestHostRouterSetResolverNilRestoresTableOnly(t *testing.T) {
 		t.Fatalf("status with nil resolver = %d, want %d", rec.Code, http.StatusNotFound)
 	}
 }
+
+// A nil table must fall back to a private one rather than panicking, so a
+// single-host caller does not have to construct a table.
+func TestNewSharedLazyHandlerNilTableFallsBack(t *testing.T) {
+	lru := cluster.NewLRUCache[string, *TargetConfigHandler](4)
+	lh := NewSharedLazyHandler("svc-nil", lru, func(ctx context.Context) (*TargetConfigHandler, error) {
+		return lazyEchoHandler(t, "nil-table-body"), nil
+	}, nil)
+	if lh.flights == nil {
+		t.Fatal("nil table left the handler without a flight table")
+	}
+
+	rec := httptest.NewRecorder()
+	lh.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-nil/", nil))
+	if rec.Body.String() != "nil-table-body" {
+		t.Fatalf("body = %q, want %q", rec.Body.String(), "nil-table-body")
+	}
+}

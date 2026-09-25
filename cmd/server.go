@@ -69,6 +69,18 @@ type proxyServer struct {
 	// NATS config sync for control plane updates
 	natsSync *cluster.NATSConfigSync
 
+	// configReady is closed once the retained config events have been applied
+	// to the target store and the live consumer is attached. Startup waits for
+	// it, because a store-backed router resolves hostnames by looking them up:
+	// a target that has not been replayed yet is a missing route, so serving
+	// mid-replay turns into 404s that look like a broken origin. Nil when
+	// there is no event stream to replay.
+	configReady <-chan struct{}
+
+	// configErr is why the event stream could not be started, reported by
+	// start() so the process fails loudly instead of serving an empty store.
+	configErr error
+
 	// cfgPath/targetsDir are the config file and target directory the proxy
 	// was started with, so SIGHUP reloads re-read the same sources no matter
 	// which working directory the process runs from. Empty keeps the legacy
@@ -146,11 +158,14 @@ func newProxyServer(proxyCfg *config.ProxyConfig, targets []config.TargetConfig,
 		} else {
 			ps.natsSync = natsSync
 
-			// Consume the config event store. Starting from the beginning of
-			// the stream gives this edge the current state of every target,
-			// then live updates keep it current.
-			if err := natsSync.Consume(context.Background(), ps.applyTargetEvent); err != nil {
-				klog.Errorf("failed to start NATS config consumer: %v", err)
+			// Consume the config event store. Start replays the retained state
+			// of every target into the store and then follows live updates,
+			// signalling configReady when the edge is caught up. start() holds
+			// off binding listeners until then, because until the replay lands
+			// a target has no route to serve.
+			ps.configReady, ps.configErr = natsSync.Start(context.Background(), ps.applyTargetEvent)
+			if ps.configErr != nil {
+				klog.Errorf("failed to start NATS config consumer: %v", ps.configErr)
 			}
 		}
 	}
@@ -880,6 +895,41 @@ func (ps *proxyServer) listenerSpecs() ([]config.ListenersSpec, error) {
 	return []config.ListenersSpec{{Addr: ":8081"}}, nil
 }
 
+// waitForConfigReplay blocks until the retained config events have been applied
+// to the target store and the live consumer is attached.
+//
+// It is a startup gate, not a nicety. The router resolves hostnames by looking
+// them up in the store, so a target whose event has not been replayed yet has no
+// route: the edge would answer 404 for exactly the targets it is supposed to
+// serve, and a fresh edge replaying a large stream is the normal case. Failing
+// to wait turns startup into an outage window; failing loudly here lets the
+// orchestrator restart the edge instead.
+func (ps *proxyServer) waitForConfigReplay() error {
+	if ps.configErr != nil {
+		return fmt.Errorf("config event store unavailable: %w", ps.configErr)
+	}
+	if ps.configReady == nil {
+		return nil
+	}
+
+	timeout := config.DefaultReplayTimeout
+	if ps.proxyCfg != nil && ps.proxyCfg.Cluster != nil && ps.proxyCfg.Cluster.ReplayTimeout > 0 {
+		timeout = ps.proxyCfg.Cluster.ReplayTimeout
+	}
+
+	begin := time.Now()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-ps.configReady:
+		klog.Infof("config replay complete in %s; target store is current", time.Since(begin).Round(time.Millisecond))
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("config replay did not complete within %s; refusing to serve an incomplete target store (raise cluster.replay_timeout for a large stream)", timeout)
+	}
+}
+
 func (ps *proxyServer) start() error {
 	klog.Infof("start() called")
 
@@ -887,6 +937,11 @@ func (ps *proxyServer) start() error {
 	// router is built from it.
 	if err := ps.ensureLazyStore(); err != nil {
 		klog.Errorf("lazy target store init failed: %v", err)
+	}
+
+	// Do not build or serve routes until the retained config has been applied.
+	if err := ps.waitForConfigReplay(); err != nil {
+		return err
 	}
 
 	ps.router = ps.buildHostRouter()

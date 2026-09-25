@@ -26,6 +26,7 @@ cluster:
   lazy: true                 # materialize target handlers on first request
   data_dir: "/var/lib/peretum/targetstore"   # Pebble store dir (default: <cache_dir>/targetstore)
   lru_size: 1000             # compiled-handler LRU capacity (default: 1000)
+  replay_timeout: 2m         # how long startup waits for the replay (default: 2m)
 ```
 
 | Key | Type | Required | Description |
@@ -35,6 +36,7 @@ cluster:
 | `lazy` | bool | no | Keep target configs off-RAM; compile on first request |
 | `data_dir` | string | no | Pebble target store directory (default: `<cache_dir>/targetstore` or `.peretum/targetstore`) |
 | `lru_size` | int | no | Compiled-handler LRU capacity for lazy mode (default: 1000) |
+| `replay_timeout` | duration | no | How long startup waits for the retained events to be applied before giving up (default: 2m) |
 
 When `nats_uri` is set the edge **ignores its local `config.d`** entirely and takes
 its state from JetStream. When it is unset the edge seeds itself from `config.d`
@@ -141,19 +143,32 @@ every compiled target handler in memory. With `cluster.lazy: true`:
 
 - **Target configs live in a Pebble key-value store on disk** (`data_dir`), so cold
   configs use **zero RAM**.
+- The **store is the routing table**. The in-memory routing map stays empty, and a
+  request costs one point lookup on `h/<hostname>` in Pebble to decide whether the
+  host exists. Memory is therefore the bounded LRU plus a constant, independent of
+  how many targets the store holds.
 - On **first request** for a host, the config is read from the store and compiled into
   a target handler. Concurrent first requests are coalesced (single-flight) so the
-  config is compiled exactly once.
+  config is compiled exactly once. The single-flight table is shared across all hosts
+  and only holds entries for loads that are actually running, so it stays bounded by
+  concurrent cold requests rather than by target count.
 - Compiled handlers are kept in an **LRU** (`lru_size`); evicted handlers are
   re-materialized from disk on the next request.
-- Incoming events are applied immediately: the target is persisted, evicted from the
-  LRU, and re-routed on the next request.
+- Incoming events are applied immediately: the target is persisted and evicted from
+  the LRU. There is no router entry to add or remove, so applying an event is O(1) in
+  memory.
 
 ### Lazy mode notes
 
 - In lazy mode the router host key is the target **`server_name`**. The incoming Host
   header is normalized (lowercased, port and trailing dot stripped, IPv6 brackets
   handled) and matched directly against Pebble keys.
+- **Startup waits for the replay.** A fresh edge applies the retained events to its
+  store before it accepts traffic (`replay_timeout`, default 2m). Because the router
+  resolves hostnames by looking them up, a target whose event has not been replayed
+  yet has no route, and serving anyway would answer 404 for exactly the targets the
+  edge is meant to serve. If the replay does not finish in time, or the event store is
+  unreachable, startup fails rather than serving an incomplete store.
 - Active health checks are only attached to **currently materialized** targets;
   evicted (cold) targets fall back to passive upstream health detection.
 - A load that panics is converted into a 502 rather than crashing the server, and a

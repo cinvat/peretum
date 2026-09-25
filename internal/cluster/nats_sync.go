@@ -210,16 +210,32 @@ func sanitizeConsumerName(s string) string {
 	return name
 }
 
-// Consume delivers every target event to handle, starting from the beginning
-// of the stream so that a newly started edge builds the same state as every
-// other edge, then following live updates.
+// EventHandler applies one target event to the edge. Returning an error causes
+// the event to be NAKed for redelivery.
+type EventHandler func(context.Context, *TargetEvent) error
+
+// Start applies the retained config events to handle and then follows live
+// updates on the same durable consumer. The returned channel is closed once the
+// retained backlog has been fully applied and the live consumer is attached,
+// so a caller can hold off serving until the edge is actually caught up.
 //
-// Messages are acknowledged only after handle returns nil, so an edge that
-// crashes mid-apply replays the affected events on restart. Because events are
-// idempotent writes keyed by hostname, replay is safe.
-func (s *NATSConfigSync) Consume(ctx context.Context, handle func(context.Context, *TargetEvent) error) error {
+// Catch-up is synchronous and bounded for two reasons. The stream doubles as
+// the initial snapshot, so an edge that starts serving before the backlog is
+// applied answers 404 for every target it has not replayed yet, which looks
+// exactly like a misconfigured origin. And because a store-backed router
+// resolves hostnames by looking them up, there is no longer a prebuilt table
+// that would have made a partially replayed store merely incomplete; missing
+// rows now mean missing routes.
+//
+// The live consumer is attached *before* ready is signalled, and it reuses the
+// same durable as the catch-up fetch. An event published in the window between
+// the last empty batch and the consumer attaching stays pending on that durable
+// and is delivered to it, so the handoff neither loses nor double-applies an
+// event. Applying an event twice is harmless in any case: they are idempotent
+// writes keyed by hostname.
+func (s *NATSConfigSync) Start(ctx context.Context, handle EventHandler) (<-chan struct{}, error) {
 	if handle == nil {
-		return fmt.Errorf("consume: nil handler")
+		return nil, fmt.Errorf("start: nil handler")
 	}
 
 	durable := ConsumerName()
@@ -234,30 +250,159 @@ func (s *NATSConfigSync) Consume(ctx context.Context, handle func(context.Contex
 		BackOff:       []time.Duration{time.Second, 5 * time.Second, 30 * time.Second},
 	})
 	if err != nil {
-		return fmt.Errorf("create consumer %q: %w", durable, err)
+		return nil, fmt.Errorf("create consumer %q: %w", durable, err)
+	}
+
+	ready := make(chan struct{})
+	if err := s.catchUp(ctx, cons, handle); err != nil {
+		return nil, err
 	}
 
 	if _, err := cons.Consume(func(msg jetstream.Msg) {
-		var event TargetEvent
-		if err := json.Unmarshal(msg.Data(), &event); err != nil {
-			// A malformed event will never succeed; drop it rather than
-			// blocking the consumer on a poison message.
-			klog.Errorf("config sync: dropping malformed event: %v", err)
-			_ = msg.Term()
-			return
-		}
-		if err := handle(ctx, &event); err != nil {
-			klog.Errorf("config sync: apply %s: %v", event.ServerName, err)
-			_ = msg.Nak()
-			return
-		}
-		_ = msg.Ack()
+		applyMessage(ctx, handle, msg)
 	}); err != nil {
-		return fmt.Errorf("consume %q: %w", durable, err)
+		return nil, fmt.Errorf("consume %q: %w", durable, err)
+	}
+	close(ready)
+
+	return ready, nil
+}
+
+// CatchUp is Start without the live consumer: it applies the retained backlog
+// and returns when the consumer has caught up. It is the same durable Start
+// uses, so a caller can catch up and later attach live updates on the same
+// consumer without replaying anything twice.
+func (s *NATSConfigSync) CatchUp(ctx context.Context, handle EventHandler) error {
+	if handle == nil {
+		return fmt.Errorf("catch up: nil handler")
+	}
+	cons, err := s.ensureConsumer(ctx)
+	if err != nil {
+		return err
+	}
+	return s.catchUp(ctx, cons, handle)
+}
+
+// Consume delivers live target events to handle on the edge's durable consumer,
+// starting from the beginning of the stream so that a newly started edge builds
+// the same state as every other edge, then following updates.
+//
+// Unlike Start it returns as soon as the consumer is attached, so the caller
+// cannot tell when the retained state has been applied. Prefer Start: only an
+// asynchronous consumer is correct where serving before the replay completes is
+// harmless.
+func (s *NATSConfigSync) Consume(ctx context.Context, handle EventHandler) error {
+	if handle == nil {
+		return fmt.Errorf("consume: nil handler")
+	}
+
+	cons, err := s.ensureConsumer(ctx)
+	if err != nil {
+		return err
+	}
+
+	if _, err := cons.Consume(func(msg jetstream.Msg) {
+		applyMessage(ctx, handle, msg)
+	}); err != nil {
+		return fmt.Errorf("consume %q: %w", cons.CachedInfo().Name, err)
 	}
 
 	return nil
 }
+
+// ensureConsumer creates or reopens the edge's durable consumer over the full
+// retained stream.
+func (s *NATSConfigSync) ensureConsumer(ctx context.Context) (jetstream.Consumer, error) {
+	durable := ConsumerName()
+	cons, err := s.js.CreateOrUpdateConsumer(ctx, s.stream, jetstream.ConsumerConfig{
+		Durable:   durable,
+		AckPolicy: jetstream.AckExplicitPolicy,
+		// Replay the full retained state, then follow live updates. This is
+		// what makes the stream double as the initial snapshot.
+		DeliverPolicy: jetstream.DeliverAllPolicy,
+		AckWait:       30 * time.Second,
+		MaxDeliver:    5,
+		BackOff:       []time.Duration{time.Second, 5 * time.Second, 30 * time.Second},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create consumer %q: %w", durable, err)
+	}
+	return cons, nil
+}
+
+// catchUp applies every retained event to handle and returns once a fetch comes
+// back empty, which means the consumer has delivered everything that was in the
+// stream when the drain began.
+func (s *NATSConfigSync) catchUp(ctx context.Context, cons jetstream.Consumer, handle EventHandler) error {
+	for {
+		applied, err := s.fetchBatch(ctx, cons, handle)
+		if err != nil {
+			return err
+		}
+		if applied == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+	}
+}
+
+// fetchBatch applies one batch and reports how many events it applied. A fetch
+// that times out with nothing available yields an empty batch and no error,
+// which is how the drain knows it has reached the end of the retained state.
+func (s *NATSConfigSync) fetchBatch(ctx context.Context, cons jetstream.Consumer, handle EventHandler) (int, error) {
+	batch, err := cons.Fetch(catchUpBatchSize, jetstream.FetchMaxWait(catchUpMaxWait))
+	if err != nil {
+		return 0, fmt.Errorf("fetch %q: %w", cons.CachedInfo().Name, err)
+	}
+
+	applied := 0
+	for msg := range batch.Messages() {
+		applyMessage(ctx, handle, msg)
+		applied++
+	}
+	if err := batch.Error(); err != nil {
+		return applied, fmt.Errorf("fetch %q: %w", cons.CachedInfo().Name, err)
+	}
+	return applied, nil
+}
+
+// applyMessage applies one event and settles the message.
+//
+// Messages are acknowledged only after handle returns nil, so an edge that
+// crashes mid-apply replays the affected events on restart. A malformed event
+// can never succeed, so it is terminated rather than left to block the consumer
+// with a poison message.
+func applyMessage(ctx context.Context, handle EventHandler, msg jetstream.Msg) {
+	var event TargetEvent
+	if err := json.Unmarshal(msg.Data(), &event); err != nil {
+		klog.Errorf("config sync: dropping malformed event: %v", err)
+		_ = msg.Term()
+		return
+	}
+	if err := handle(ctx, &event); err != nil {
+		klog.Errorf("config sync: apply %s: %v", event.ServerName, err)
+		_ = msg.Nak()
+		return
+	}
+	_ = msg.Ack()
+}
+
+const (
+	// catchUpBatchSize is how many events one fetch request asks for. Large
+	// enough to keep the replay round trips low, small enough that a failed
+	// batch is cheaply redelivered.
+	catchUpBatchSize = 256
+
+	// catchUpMaxWait is how long a fetch waits for the batch to fill before
+	// returning what it has. It bounds the empty fetch that ends the drain, so
+	// it is also the floor on how long catching up takes when there is nothing
+	// to replay.
+	catchUpMaxWait = 250 * time.Millisecond
+)
 
 // Close drains and closes the NATS connection.
 func (s *NATSConfigSync) Close() error {

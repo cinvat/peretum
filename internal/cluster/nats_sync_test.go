@@ -478,3 +478,380 @@ func TestNATSConfigSyncRespectsCustomStreamNameAndReplicas(t *testing.T) {
 		t.Fatalf("Discard = %v, want DiscardOld", info.Config.Discard)
 	}
 }
+
+// readyGate is a handler that can be held open mid-apply, so a test can prove
+// readiness is only signalled once every retained event has actually been
+// applied.
+type readyGate struct {
+	mu      sync.Mutex
+	started int
+	applied []string
+	blocked chan struct{}
+}
+
+func newReadyGate(blocked bool) *readyGate {
+	g := &readyGate{blocked: make(chan struct{})}
+	if !blocked {
+		close(g.blocked)
+	}
+	return g
+}
+
+func (g *readyGate) handle(_ context.Context, ev *TargetEvent) error {
+	g.mu.Lock()
+	g.started++
+	g.mu.Unlock()
+	// Hold the apply open so readiness provably cannot be reached while an
+	// event is still being applied.
+	<-g.blocked
+	g.mu.Lock()
+	g.applied = append(g.applied, ev.ServerName)
+	g.mu.Unlock()
+	return nil
+}
+
+func (g *readyGate) unblock() {
+	select {
+	case <-g.blocked:
+	default:
+		close(g.blocked)
+	}
+}
+
+func (g *readyGate) startedCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.started
+}
+
+func (g *readyGate) appliedNames() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.applied...)
+}
+
+func (g *readyGate) count() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.applied)
+}
+
+// The regression this fixes: a fresh edge must not report ready until the
+// retained state has been applied, because a store-backed router has no route
+// for a target whose event it has not replayed yet.
+func TestStartDoesNotSignalReadyUntilBacklogApplied(t *testing.T) {
+	url := startJetStream(t)
+	ctx := context.Background()
+	t.Setenv("PERETUM_EDGE_ID", "edge-replay")
+
+	// A second sync publishes the retained state before this edge joins.
+	writer := newTestSync(t, url)
+	for _, name := range []string{"a", "b", "c"} {
+		if err := writer.PublishTarget(ctx, TargetEvent{
+			ServerName: name,
+			Config:     json.RawMessage(`{"server_name":"` + name + `"}`),
+		}); err != nil {
+			t.Fatalf("PublishTarget(%s): %v", name, err)
+		}
+	}
+
+	s := newTestSync(t, url)
+	g := newReadyGate(true) // every apply blocks until told to proceed
+
+	// Start is synchronous, so run it in the background to be able to observe
+	// that readiness is still pending while events are mid-apply.
+	type outcome struct {
+		ready <-chan struct{}
+		err   error
+	}
+	res := make(chan outcome, 1)
+	go func() {
+		ready, err := s.Start(ctx, g.handle)
+		res <- outcome{ready, err}
+	}()
+
+	waitUntil(t, "an event to start applying", func() bool { return g.startedCount() >= 1 })
+	if got := g.appliedNames(); len(got) != 0 {
+		t.Fatalf("applied %v while every apply is blocked, want none", got)
+	}
+	select {
+	case out := <-res:
+		t.Fatalf("Start returned while the backlog was still being applied (ready=%v err=%v)", out.ready != nil, out.err)
+	default:
+	}
+
+	g.unblock()
+	out := <-res
+	if out.err != nil {
+		t.Fatalf("Start: %v", out.err)
+	}
+	select {
+	case <-out.ready:
+	case <-time.After(15 * time.Second):
+		t.Fatal("ready was never signalled")
+	}
+
+	applied := g.appliedNames()
+	want := []string{"a", "b", "c"}
+	if len(applied) != len(want) {
+		t.Fatalf("applied %v, want %v", applied, want)
+	}
+	for i := range want {
+		if applied[i] != want[i] {
+			t.Fatalf("applied %v, want %v (order matters: last write per target wins)", applied, want)
+		}
+	}
+}
+
+// After Start, live events must still arrive on the same durable, and an event
+// published in the handoff window must not be lost.
+func TestStartFollowsLiveUpdatesAfterCatchUp(t *testing.T) {
+	url := startJetStream(t)
+	ctx := context.Background()
+	t.Setenv("PERETUM_EDGE_ID", "edge-live")
+
+	writer := newTestSync(t, url)
+	if err := writer.PublishTarget(ctx, TargetEvent{
+		ServerName: "retained",
+		Config:     json.RawMessage(`{"server_name":"retained"}`),
+	}); err != nil {
+		t.Fatalf("PublishTarget: %v", err)
+	}
+
+	s := newTestSync(t, url)
+	c := newCollector()
+	ready, err := s.Start(ctx, c.handle)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-ready:
+	case <-time.After(15 * time.Second):
+		t.Fatal("ready was never signalled")
+	}
+
+	// The retained event came through the catch-up drain.
+	waitUntil(t, "retained event to be caught up", func() bool {
+		_, ok := c.get("retained")
+		return ok
+	})
+
+	// And the live consumer keeps working afterwards.
+	if err := s.PublishTarget(ctx, TargetEvent{
+		ServerName: "live",
+		Config:     json.RawMessage(`{"server_name":"live"}`),
+	}); err != nil {
+		t.Fatalf("PublishTarget(live): %v", err)
+	}
+	waitUntil(t, "live event", func() bool {
+		_, ok := c.get("live")
+		return ok
+	})
+}
+
+// The catch-up drain and the live consumer must not double-apply: a retained
+// event has to be applied exactly once even though it passes the same durable
+// on the way from the fetch to the consumer.
+func TestStartAppliesEachRetainedEventOnce(t *testing.T) {
+	url := startJetStream(t)
+	ctx := context.Background()
+	t.Setenv("PERETUM_EDGE_ID", "edge-once")
+
+	writer := newTestSync(t, url)
+	const targets = 40
+	for i := 0; i < targets; i++ {
+		name := fmt.Sprintf("svc-%02d", i)
+		if err := writer.PublishTarget(ctx, TargetEvent{
+			ServerName: name,
+			Config:     json.RawMessage(`{"server_name":"` + name + `"}`),
+		}); err != nil {
+			t.Fatalf("PublishTarget(%s): %v", name, err)
+		}
+	}
+
+	s := newTestSync(t, url)
+	c := newCollector()
+	ready, err := s.Start(ctx, c.handle)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-ready:
+	case <-time.After(15 * time.Second):
+		t.Fatal("ready was never signalled")
+	}
+
+	c.mu.Lock()
+	order := append([]string(nil), c.order...)
+	c.mu.Unlock()
+
+	if len(order) != targets {
+		t.Fatalf("applied %d events, want %d: %v", len(order), targets, order)
+	}
+	seen := make(map[string]int, targets)
+	for _, name := range order {
+		seen[name]++
+	}
+	for name, n := range seen {
+		if n != 1 {
+			t.Fatalf("event %s applied %d times, want 1", name, n)
+		}
+	}
+}
+
+// An event published while the drain is finishing must still be delivered: the
+// live consumer is attached to the same durable the drain used, so it picks up
+// anything that was not acked.
+func TestStartDoesNotLoseEventPublishedDuringCatchUp(t *testing.T) {
+	url := startJetStream(t)
+	ctx := context.Background()
+	t.Setenv("PERETUM_EDGE_ID", "edge-race")
+
+	writer := newTestSync(t, url)
+	if err := writer.PublishTarget(ctx, TargetEvent{
+		ServerName: "early",
+		Config:     json.RawMessage(`{"server_name":"early"}`),
+	}); err != nil {
+		t.Fatalf("PublishTarget(early): %v", err)
+	}
+
+	s := newTestSync(t, url)
+	c := newCollector()
+
+	// Publish concurrently with the drain so the event lands around the moment
+	// the drain reports itself empty.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = writer.PublishTarget(ctx, TargetEvent{
+			ServerName: "racing",
+			Config:     json.RawMessage(`{"server_name":"racing"}`),
+		})
+	}()
+
+	ready, err := s.Start(ctx, c.handle)
+	wg.Wait()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-ready:
+	case <-time.After(15 * time.Second):
+		t.Fatal("ready was never signalled")
+	}
+
+	// Whether the event was drained or delivered live, it must arrive exactly
+	// once; losing it is the failure mode this guards.
+	waitUntil(t, "both events", func() bool {
+		_, a := c.get("early")
+		_, b := c.get("racing")
+		return a && b
+	})
+	c.mu.Lock()
+	order := append([]string(nil), c.order...)
+	c.mu.Unlock()
+	if len(order) != 2 {
+		t.Fatalf("applied %v, want exactly one event per target", order)
+	}
+}
+
+// CatchUp alone must leave the durable positioned so a later Start does not
+// replay everything again.
+func TestCatchUpThenStartDoesNotReplayTwice(t *testing.T) {
+	url := startJetStream(t)
+	ctx := context.Background()
+	t.Setenv("PERETUM_EDGE_ID", "edge-catchup")
+
+	writer := newTestSync(t, url)
+	for _, name := range []string{"x", "y"} {
+		if err := writer.PublishTarget(ctx, TargetEvent{
+			ServerName: name,
+			Config:     json.RawMessage(`{"server_name":"` + name + `"}`),
+		}); err != nil {
+			t.Fatalf("PublishTarget(%s): %v", name, err)
+		}
+	}
+
+	s := newTestSync(t, url)
+	c := newCollector()
+	if err := s.CatchUp(ctx, c.handle); err != nil {
+		t.Fatalf("CatchUp: %v", err)
+	}
+	if c.count() != 2 {
+		t.Fatalf("CatchUp applied %d events, want 2", c.count())
+	}
+
+	ready, err := s.Start(ctx, c.handle)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-ready:
+	case <-time.After(15 * time.Second):
+		t.Fatal("ready was never signalled")
+	}
+
+	if got := c.count(); got != 2 {
+		t.Fatalf("applied %d events overall, want 2; Start re-replayed the backlog", got)
+	}
+}
+
+// A canceled catch-up must surface the cancellation rather than reporting ready.
+func TestStartCanceledDuringCatchUp(t *testing.T) {
+	url := startJetStream(t)
+	t.Setenv("PERETUM_EDGE_ID", "edge-cancel")
+
+	writer := newTestSync(t, url)
+	for i := 0; i < 20; i++ {
+		name := fmt.Sprintf("svc-%02d", i)
+		if err := writer.PublishTarget(context.Background(), TargetEvent{
+			ServerName: name,
+			Config:     json.RawMessage(`{"server_name":"` + name + `"}`),
+		}); err != nil {
+			t.Fatalf("PublishTarget(%s): %v", name, err)
+		}
+	}
+
+	s := newTestSync(t, url)
+	ctx, cancel := context.WithCancel(context.Background())
+	g := newReadyGate(false)
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Start(ctx, g.handle)
+		done <- err
+	}()
+
+	// Cancel while the drain is running.
+	waitUntil(t, "drain to start", func() bool { return g.count() > 0 })
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Start succeeded on a canceled context")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("Start did not return after its context was canceled")
+	}
+}
+
+func TestStartAndCatchUpRejectNilHandler(t *testing.T) {
+	url := startJetStream(t)
+	s := newTestSync(t, url)
+	ctx := context.Background()
+
+	if _, err := s.Start(ctx, nil); err == nil {
+		t.Fatal("Start accepted a nil handler")
+	}
+	if err := s.CatchUp(ctx, nil); err == nil {
+		t.Fatal("CatchUp accepted a nil handler")
+	}
+}
+
+// count reports how many events the collector has applied.
+func (c *collector) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.order)
+}

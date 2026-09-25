@@ -426,3 +426,43 @@ cluster:
 		t.Fatalf("nats_uri = %q", cfg.Cluster.NATSURI)
 	}
 }
+
+func TestParseClusterReplayTimeout(t *testing.T) {
+	path := writeTemp(t, "cfg.yaml", `
+listeners:
+  - ":8080"
+cluster:
+  enabled: true
+  lazy: true
+  replay_timeout: 45s
+`)
+	cfg, err := LoadProxy(path)
+	if err != nil {
+		t.Fatalf("LoadProxy: %v", err)
+	}
+	if cfg.Cluster == nil {
+		t.Fatal("cluster is nil")
+	}
+	if cfg.Cluster.ReplayTimeout != 45*time.Second {
+		t.Fatalf("replay_timeout = %v, want 45s", cfg.Cluster.ReplayTimeout)
+	}
+}
+
+// Unset must stay zero so the server can apply its own default, rather than
+// baking one into the config package.
+func TestParseClusterReplayTimeoutDefaultsToZero(t *testing.T) {
+	path := writeTemp(t, "cfg.yaml", `
+listeners:
+  - ":8080"
+cluster:
+  enabled: true
+  lazy: true
+`)
+	cfg, err := LoadProxy(path)
+	if err != nil {
+		t.Fatalf("LoadProxy: %v", err)
+	}
+	if cfg.Cluster.ReplayTimeout != 0 {
+		t.Fatalf("replay_timeout = %v, want 0 (server applies the default)", cfg.Cluster.ReplayTimeout)
+	}
+}

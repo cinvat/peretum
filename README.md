@@ -61,10 +61,12 @@ Full docs at **[cinvat.github.io/peretum](https://cinvat.github.io/peretum/)**:
 For CDN-scale deployments with 10M+ targets:
 
 - **Lazy target loading** — target configs stay on disk (Pebble); compiled handlers materialize on first request
+- **Store-backed routing** — no per-target map; a request costs one Pebble point lookup, so memory is O(1) plus the LRU regardless of target count
 - **Bounded LRU** — compiled handlers cached up to `cluster.lru_size` (default 1000)
-- **Single-Flight Coalescing** — concurrent first requests for same host compile exactly once
+- **Single-Flight Coalescing** — concurrent first requests for same host compile exactly once, via a shared table that holds only in-flight loads
 - **Pebble Store** — atomic batch writes, `NoSync` for throughput, fast restart via prefix scan
 - **NATS JetStream State Store** — current state of every target on `config.target.{server_name}`; a new edge replays the stream to build its store
+- **Replay-Gated Startup** — the edge finishes applying retained events before it accepts traffic (`cluster.replay_timeout`, default 2m), so it never serves 404s for targets it has not caught up with
 - **Delta Reloads** — SIGHUP triggers a config diff; only changed targets rebuild
 
 ```yaml
@@ -74,6 +76,7 @@ cluster:
   lazy: true
   data_dir: "/var/lib/peretum/targetstore"
   lru_size: 1000
+  replay_timeout: 2m
 ```
 
 ---

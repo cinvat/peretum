@@ -46,6 +46,7 @@ cluster:
   nats_uri: "nats://nats.example.com:4222"  # NATS JetStream URL for config sync
   lazy: true                          # keep target configs on disk, compile on first request
   lru_size: 1000                      # compiled-handler LRU capacity
+  replay_timeout: 2m                  # how long startup waits for the event replay
 ```
 
 ## Reference
@@ -65,7 +66,7 @@ cluster:
 | `json_log` | object | See [JSON logs](../plugins/jsonlog.md). |
 | `error_page` | object | See [Error pages](../plugins/errorpage.md). |
 | `waf` | object | Global WAF settings: `enabled`, `geolite_dir`, `max_body_size` (see [WAF](../plugins/waf.md)). |
-| `cluster` | object | Cluster settings: `enabled`, `nats_uri`, `lazy`, `data_dir`, `lru_size` (see [Cluster Mode](../configuration/cluster.md)). |
+| `cluster` | object | Cluster settings: `enabled`, `nats_uri`, `lazy`, `data_dir`, `lru_size`, `replay_timeout` (see [Cluster Mode](../configuration/cluster.md)). |
 
 ## Size strings
 
