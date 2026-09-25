@@ -10,6 +10,10 @@ import (
 	"k8s.io/klog/v2"
 )
 
+// DefaultHostname is the reserved router key used as the fallback target when
+// an incoming Host matches no configured target.
+const DefaultHostname = "_default"
+
 type HostRouter struct {
 	targets        map[string]http.Handler
 	defaultHandler http.Handler
@@ -28,33 +32,59 @@ func NewHostRouter() *HostRouter {
 	}
 }
 
-func (hr *HostRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	host := req.Host
-	if idx := strings.Index(host, ":"); idx != -1 {
-		host = host[:idx]
+// NormalizeHost strips the port from an HTTP Host header and lowercases the
+// result so that it can be used as a target-store key. It handles bracketed
+// IPv6 literals such as "[::1]:8443", which a naive split on ":" would mangle.
+func NormalizeHost(host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return ""
 	}
+
+	// Bracketed IPv6 literal: "[::1]" or "[::1]:8080".
+	if strings.HasPrefix(host, "[") {
+		if end := strings.Index(host, "]"); end != -1 {
+			return host[:end+1]
+		}
+		return host
+	}
+
+	// Bare IPv6 literal has multiple colons and no port, so only strip after
+	// the last colon when exactly one is present.
+	if strings.Count(host, ":") == 1 {
+		if idx := strings.Index(host, ":"); idx != -1 {
+			host = host[:idx]
+		}
+	}
+
+	// A trailing dot is a valid absolute form of the same name.
+	return strings.TrimSuffix(host, ".")
+}
+
+func (hr *HostRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	host := NormalizeHost(req.Host)
 
 	hr.mu.RLock()
 	tch, ok := hr.targets[host]
 	if !ok {
-		tch, ok = hr.targets["_default"]
+		tch, ok = hr.targets[DefaultHostname]
 	}
 	def := hr.defaultHandler
 	hr.mu.RUnlock()
 
 	if !ok && def != nil {
-		klog.Infof("Using default handler for host: %s", host)
+		klog.V(4).Infof("Using default handler for host: %s", host)
 		def.ServeHTTP(w, req)
 		return
 	}
 
 	if tch != nil {
-		klog.Infof("Found target handler for host: %s", host)
+		klog.V(4).Infof("Found target handler for host: %s", host)
 		tch.ServeHTTP(w, req)
 		return
 	}
 
-	klog.Infof("No matching target for host: %s", host)
+	klog.V(4).Infof("No matching target for host: %s", host)
 	http.Error(w, "No matching target for host", http.StatusNotFound)
 }
 
