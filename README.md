@@ -64,8 +64,8 @@ For CDN-scale deployments with 10M+ targets:
 - **Bounded LRU** — compiled handlers cached up to `cluster.lru_size` (default 1000)
 - **Single-Flight Coalescing** — concurrent first requests for same host compile exactly once
 - **Pebble Store** — atomic batch writes, `NoSync` for throughput, fast restart via prefix scan
-- **NATS JetStream Sync** — full snapshot on startup via `config.snapshot`; incremental updates via `config.target.updated.*`/`config.target.deleted.*`
-- **Delta Reloads** — SIGHUP triggers config diff; only changed targets rebuild (SHA-256 based)
+- **NATS JetStream State Store** — current state of every target on `config.target.{server_name}`; a new edge replays the stream to build its store
+- **Delta Reloads** — SIGHUP triggers a config diff; only changed targets rebuild
 
 ```yaml
 cluster:

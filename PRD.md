@@ -52,12 +52,13 @@
 - [x] **Lazy Target Loading**: Target configs stay on disk (Pebble); compiled handlers materialize on first request
 - [x] **Bounded LRU**: Compiled handlers cached up to `cluster.lru_size` (default 1000); eviction returns to cold storage
 - [x] **Single-Flight Coalescing**: Concurrent first requests for same host compile exactly once
-- [x] **Pebble Store**: Atomic batch writes (config + version), `NoSync` for throughput, fast restart via `v/` prefix scan
-- [x] **Control-Plane Pull**: New edge pulls full snapshot via NATS `config.snapshot` on first launch; falls back to local `config.d`
-- [x] **Incremental Updates**: `applyTargetUpdate`/`applyTargetDelete` persist to store, evict LRU, upsert router stub via NATS JetStream
-- [x] **NATS JetStream Sync**: `config.target.updated.*`, `config.target.deleted.*`, `config.snapshot`, `config.hot-targets`
-- [x] **JetStream Stream**: `LimitsPolicy`, `MaxMsgsPerSubject: 1`, `DiscardOld`, `FileStorage`, 24h max age
-- [x] **Delta Reloads**: SIGHUP triggers config diff; only changed targets rebuild (SHA-256 based)
+- [x] **Pebble Store**: Atomic batch writes, `NoSync` for throughput, hostname-keyed lookups
+- [x] **Stream Replay as Snapshot**: A new edge replays `config.target.>` from the beginning and builds its own state; no snapshot API
+- [x] **Incremental Updates**: `applyTargetEvent` → `applyTargetUpdate`/`applyTargetDelete` persist to store, evict LRU, upsert router stub
+- [x] **NATS JetStream Sync**: One subject per target, `config.target.{server_name}`, upsert and delete share the subject
+- [x] **JetStream Stream**: `LimitsPolicy`, `MaxMsgsPerSubject: 1`, `DiscardOld`, `FileStorage`, no expiry
+- [x] **Delta Reloads**: SIGHUP triggers a config diff; only changed targets rebuild
+- [x] **Per-Edge Durable Consumers**: `DeliverAll` replay, explicit ack, nack on apply failure, terminate on malformed events
 
 ### 4.3 Configuration (Complete)
 ```yaml
@@ -76,7 +77,7 @@ cluster:
   - NATS sync: `peretum_nats_updates_received_total`, `peretum_nats_deletes_received_total`, `peretum_nats_snapshot_requests_total`
   - Request latency histogram: `peretum_request_latency_bucket`
 - [x] Structured JSON access/error logs
-- [x] Health endpoints: `/health`, `/health/leader`
+- [x] Health endpoints: `/health` (edge and control plane), `/readyz` (control plane)
 
 ---
 
@@ -108,15 +109,14 @@ cluster:
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Control Plane                            │
-│  (peretum controlplane --listen :4222 --config-dir config.d)   │
+│ (peretum controlplane --nats nats://nats:4222 --config-dir ...) │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
-│  │ fsnotify    │  │ Config      │  │ NATS JetStream :4222    │  │
-│  │ Watcher     │──│VersionStore │──│ config.target.updated.* │  │
-│  └─────────────┘  └─────────────┘  │ config.snapshot         │  │
-│                                    │ config.hot-targets      │  │
+│  │ fsnotify    │  │ config diff │  │ NATS JetStream :4222    │  │
+│  │ Watcher     │──│ (no hashes) │──│ config.target.>         │  │
+│  └─────────────┘  └─────────────┘  │ MaxMsgsPerSubject: 1    │  │
 │                                    └─────────────────────────┘  │
 └──────────────────────────────┬──────────────────────────────────┘
-                               │ config.target.updated.* + config.snapshot
+                               │ config.target.{server_name}
  ┌─────────────────────────────┼──────────────────────────────────┐
                                ▼
 ┌─────────────────────────────────────────────────────────────────┐
@@ -149,10 +149,10 @@ cluster:
 
 1. **Startup (Lazy Edge)**
    - Open Pebble store at `data_dir`
-   - `ListTargets()` → fast `v/` prefix scan → name→version map
-   - Build `HostRouter` with `LazyHandler` stubs per name
-   - If store empty: `GET /sync` from control plane → `PutTarget` each
-   - If control plane unreachable: seed from local `config.d` (sha256 version)
+   - If `cluster.nats_uri` is set: connect, ensure the stream, start a durable
+     consumer with `DeliverAll`, and let the replay populate the store
+   - Otherwise: seed the store from local `config.d`
+   - Build `HostRouter` with `LazyHandler` stubs keyed by hostname
 
 2. **First Request (Cold Host)**
    - `LazyHandler.ServeHTTP` → LRU miss
@@ -164,13 +164,15 @@ cluster:
    - LRU hit → direct `TargetConfigHandler.ServeHTTP`
 
 4. **Control-Plane Update**
-   - `POST /sync/target` or streaming push → `applyTargetUpdate`
-   - `PutTarget` (atomic) → `lazyLRU.Delete(key)` → `lazyRouter.Upsert(key, new LazyHandler)`
-   - Next request materializes fresh config
+   - JetStream delivers `TargetEvent` → `applyTargetEvent`
+   - Upsert: `PutTargetByHost` (atomic) → `lazyLRU.Delete(host)` → `lazyRouter.Upsert(host, new LazyHandler)`
+   - Delete: `DeleteTargetByHost` → evict LRU → remove route
+   - Ack only after a successful apply; nak to retry, terminate if malformed
+   - Next request materializes the fresh config
 
 5. **SIGHUP Reload**
    - Reload `config.yaml` + `config.d`
-   - `ConfigVersionStore.LoadTargets` → delta diff (SHA-256)
+   - Diff the parsed target set; rebuild only the targets that changed
    - `buildHostRouter` (eager or lazy) → `router.Reload` (atomic)
 
 ---
@@ -180,12 +182,13 @@ cluster:
 | Decision | Rationale | Trade-off |
 |----------|-----------|-----------|
 | **Pebble over BoltDB/RocksDB** | Pure Go, no CGO, ACID batches, prefix scan | Slightly higher write latency than RocksDB |
-| **NoSync writes** | Configs re-fetchable; throughput critical | Potential loss of last N writes on crash (mitigated by `/sync` re-pull) |
+| **NoSync writes** | Configs re-derivable from the stream; throughput critical | Potential loss of last N writes on crash, restored on reconnect |
 | **LRU on compiled handlers, not raw config** | Compilation is expensive (regex, template, plugin chain); raw YAML is small | Memory per entry higher (~50KB vs ~1KB) |
-| **Host key = target name (lazy mode)** | Simpler; `listen` override ignored for stubs | Less flexible than full host routing |
+| **Host key = `server_name` (lazy mode)** | Incoming `Host` header is matched directly against Pebble keys | Hostnames must be unique across targets |
 | **No active health checks for lazy targets** | Lifecycle complexity on eviction; passive detection sufficient | Slightly slower failover for cold targets |
 | **fsnotify over polling** | Instant config reload, lower CPU | Platform-dependent; falls back to 5s polling |
-| **SHA-256 for versioning** | Content-addressable; deterministic | 32-byte overhead per version key |
+| **Stream as state, not a log** (`MaxMsgsPerSubject: 1`) | Retention bounded by target count; replay *is* the snapshot | No history or audit trail in the stream |
+| **No config versioning or hashing** | Events are idempotent writes keyed by hostname, so replay is safe | Change history lives in git, not in the event store |
 
 ---
 
@@ -198,7 +201,6 @@ cluster:
 - [x] Example cluster demo runs (`docker compose up`)
 
 ### Should-Have (Post-Launch)
-- [ ] gRPC config streaming implementation (`ConfigStreamClient` wiring)
 - [ ] Maglev table lazy rebuild (dirty flag)
 - [ ] Per-target metrics (latency, error rate)
 - [ ] Config validation CLI (`peretum -t` for cluster config)
@@ -229,11 +231,13 @@ cluster:
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|------------|--------|------------|
-| Pebble corruption on crash | Low | High | `NoSync` + re-pull from control plane; backup strategy |
-| LRU eviction storm under load | Medium | Medium | Configurable `lru_size`; monitor `peretum_evictions_total` |
-| Control plane single point of failure | Medium | High | 3-node HA with leader election; edge falls back to local config.d |
+| Pebble corruption on crash | Low | High | `NoSync`; state is re-derivable from the stream on reconnect |
+| LRU eviction storm under load | Medium | Medium | Configurable `lru_size`; monitor cache eviction metrics |
+| NATS single point of failure | Medium | High | Run NATS as a replicated cluster; edges reconnect and resume from their durable consumer |
 | Memory leak in plugin chain | Low | High | Plugin sandbox; `StopAllPlugins` on shutdown |
-| SHA-256 collision | Negligible | Critical | 256-bit space; accept risk |
+| Two edges share a durable consumer | Low | High | `PERETUM_EDGE_ID` pins the identity; the name is sanitized to `[A-Za-z0-9_-]` |
+| Durable name rejected by NATS server | Medium | High | Dots are stripped: the server rejects them even though the client allows them |
+| Slow replay on first start | Low | Medium | `MaxMsgsPerSubject: 1` bounds the stream to one message per target |
 
 ---
 
@@ -244,14 +248,15 @@ cluster:
 | `internal/cluster/targetstore.go` | Pebble-backed config store |
 | `internal/router/lazy.go` | Single-flight materialization |
 | `cmd/server.go` | Proxy lifecycle, lazy wiring |
-| `cmd/controlplane.go` | HTTP control plane server |
-| `internal/cluster/version.go` | Delta reload, tiered storage |
+| `cmd/controlplane.go` | fsnotify reconciler + JetStream publisher (health-only HTTP) |
+| `internal/cluster/nats_sync.go` | Stream config, target events, durable consumers |
+| `internal/cluster/lru.go` | Bounded compiled-handler LRU |
 | `internal/loadbalancer/loadbalancer.go` | LB algorithms + health checks |
 | `docs/configuration/cluster.md` | User-facing cluster config guide |
 | `examples/cluster/` | Docker Compose demo |
 
 ---
 
-*Document Version: 1.0*  
-*Last Updated: 2026-09-22*  
+*Document Version: 1.1*  
+*Last Updated: 2026-09-25*  
 *Authors: Peretum Engineering*

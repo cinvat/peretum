@@ -9,9 +9,11 @@ order: 400
 Peretum includes **cluster mode** features for high-volume deployments across multiple edge nodes:
 
 - **Lazy target loading** — target configs stay on disk (Pebble) and are compiled **on first request**
-- **Delta reloads** — only changed targets are rebuilt on reload
-- **Control plane sync** — NATS JetStream control plane with full config snapshots and incremental updates
-- **Control plane HA** — multiple control plane nodes via NATS clustering
+- **NATS JetStream event store** — the control plane publishes the current state of every target; edges consume it
+- **Replicated state** — a new edge replays the stream to build its store, so no snapshot endpoint is needed
+
+There is no gRPC control channel and no HTTP snapshot API. NATS JetStream is the only
+transport, and it doubles as both the update feed and the state snapshot.
 
 ---
 
@@ -20,19 +22,115 @@ Peretum includes **cluster mode** features for high-volume deployments across mu
 ```yaml
 cluster:
   enabled: true              # master switch for cluster features
-  control_plane: "nats://nats.example.com:4222"   # NATS JetStream URL(s)
+  nats_uri: "nats://nats.example.com:4222"   # NATS JetStream URL(s)
   lazy: true                 # materialize target handlers on first request
-  data_dir: "/var/lib/peretum/targetstore"        # Pebble store dir (default: <cache_dir>/targetstore)
+  data_dir: "/var/lib/peretum/targetstore"   # Pebble store dir (default: <cache_dir>/targetstore)
   lru_size: 1000             # compiled-handler LRU capacity (default: 1000)
 ```
 
 | Key | Type | Required | Description |
 | --- | --- | --- | --- |
 | `enabled` | bool | yes | Master switch for cluster features |
-| `control_plane` | string | no | NATS JetStream URL(s) for config sync |
+| `nats_uri` | string | no | NATS JetStream URL(s) for config sync |
 | `lazy` | bool | no | Keep target configs off-RAM; compile on first request |
 | `data_dir` | string | no | Pebble target store directory (default: `<cache_dir>/targetstore` or `.peretum/targetstore`) |
 | `lru_size` | int | no | Compiled-handler LRU capacity for lazy mode (default: 1000) |
+
+When `nats_uri` is set the edge **ignores its local `config.d`** entirely and takes
+its state from JetStream. When it is unset the edge seeds itself from `config.d`
+and does not run a consumer.
+
+---
+
+## Target Events
+
+The control plane publishes one message per target to a single subject per hostname:
+
+| Subject | Payload |
+| --- | --- |
+| `config.target.{server_name}` | `{"server_name": "...", "deleted": false, "config": {...}}` |
+| `config.target.{server_name}` | `{"server_name": "...", "deleted": true, "config": null}` |
+
+Upserts and deletes share the same subject, distinguished by the `deleted` field.
+The event carries no version or hash: the retained message on the subject *is* the
+current state, so an edge never has to reconcile an ordering counter.
+
+```go
+type TargetEvent struct {
+    ServerName string          `json:"server_name"`
+    Deleted    bool            `json:"deleted"`
+    Config     json.RawMessage `json:"config,omitempty"`
+    Timestamp  time.Time       `json:"timestamp"`
+}
+```
+
+### Stream configuration
+
+Created by both the control plane and each edge via `CreateOrUpdateStream`, so the
+first process to connect establishes it:
+
+```go
+jetstream.StreamConfig{
+    Name:              "config-sync",
+    Subjects:          []string{"config.target.>"},
+    Retention:         jetstream.LimitsPolicy,
+    MaxMsgs:           -1,
+    MaxAge:            0,   // never expire current state
+    MaxBytes:          -1,
+    MaxMsgsPerSubject: 1,   // keep only the newest event per target
+    Discard:           jetstream.DiscardOld,
+    Storage:           jetstream.FileStorage,
+    Replicas:          1,   // raise for HA
+}
+```
+
+**Why `MaxMsgsPerSubject: 1` is the whole design:**
+
+- The stream is a **key-value state store**, not a log. History has no value to an
+  edge that only wants the latest config.
+- A **new edge replays from the beginning** (`DeliverAllPolicy`) and ends up with the
+  current state of every target after a single pass. This replaces the old
+  `config.snapshot` subject and the `/sync` HTTP pull.
+- Growth is bounded by the number of targets, not by the number of changes, so the
+  stream does not grow without limit.
+- `MaxAge: 0` matters: a state store must not lose a target just because it has been
+  quiet for a day. A delete is represented by a retained tombstone, not by expiry.
+
+---
+
+## Edge Consumers
+
+Each edge creates one **durable** consumer and processes every target event:
+
+```go
+DeliverPolicy: jetstream.DeliverAllPolicy,
+AckPolicy:     jetstream.AckExplicitPolicy,
+Durable:       ConsumerName(),
+```
+
+- `DeliverAllPolicy` is what makes a fresh edge self-sufficient: it replays the
+  retained state, writes it to Pebble, and starts serving without asking anyone.
+- Messages are acked only after the config is persisted, so a crash mid-replay
+  resumes rather than silently losing targets.
+- Malformed messages are **terminated** (poison-message protection) instead of being
+  left to loop forever.
+
+### Consumer identity
+
+Durable consumer names must be unique per edge, and stable across restarts, or two
+edges will share one consumer and half the traffic.
+
+`ConsumerName()` resolves in this order:
+
+1. `PERETUM_EDGE_ID` environment variable
+2. `os.Hostname()`
+
+Set `PERETUM_EDGE_ID` explicitly whenever hostnames can collide — Kubernetes pods,
+containers, or multiple edges per machine:
+
+```bash
+PERETUM_EDGE_ID=edge-us-east-1 peretum
+```
 
 ---
 
@@ -48,23 +146,21 @@ every compiled target handler in memory. With `cluster.lazy: true`:
   config is compiled exactly once.
 - Compiled handlers are kept in an **LRU** (`lru_size`); evicted handlers are
   re-materialized from disk on the next request.
-- Router stubs are built at startup from a fast disk scan (hostname → version),
-  keeping startup time at seconds even with millions of targets.
-- A new edge node with an empty store pulls the **full config snapshot** from the
-  control plane's `config.snapshot` NATS subject on first launch. If no control plane
-  is configured, the edge seeds its store from the local `config.d` directory.
-- **Config streaming** updates from the control plane are applied immediately:
-  updated targets are persisted, evicted from the LRU, and re-routed.
+- Incoming events are applied immediately: the target is persisted, evicted from the
+  LRU, and re-routed on the next request.
 
 ### Lazy mode notes
 
-- In lazy mode the router host key is the target **`server_name`** (the Host header
-  is matched directly against Pebble keys).
+- In lazy mode the router host key is the target **`server_name`**. The incoming Host
+  header is normalized (lowercased, port and trailing dot stripped, IPv6 brackets
+  handled) and matched directly against Pebble keys.
 - Active health checks are only attached to **currently materialized** targets;
   evicted (cold) targets fall back to passive upstream health detection.
+- A load that panics is converted into a 502 rather than crashing the server, and a
+  request that is canceled while waiting for an in-flight load returns 408.
 - Write durability: store writes use `pebble.NoSync` for throughput — configs are
-  re-fetchable from the control plane, so a crash loses at most the last updates
-  that a re-sync will restore.
+  re-derivable from the stream, so a crash loses at most the last writes, which the
+  next reconnect restores.
 
 ---
 
@@ -73,61 +169,46 @@ every compiled target handler in memory. With `cluster.lazy: true`:
 ```yaml
 cluster:
   enabled: true
-  control_plane: "nats://nats.example.com:4222"
+  nats_uri: "nats://nats.example.com:4222"
   lazy: true
 ```
 
 **What this gives you:**
-- Full config replication at every edge node
+- Full state replication at every edge node
 - Target configs kept on disk, compiled on first request (bounded LRU)
-- Fast startup even at 10M+ targets
-- Full snapshot pull on new edge nodes, then delta streaming updates via NATS
+- A new edge becomes useful on its own by replaying the stream
+- Steady-state updates delivered over a single subject per target
 
 ---
 
 ## Control Plane
 
-The control plane is a peretum node that watches `config.d/` and publishes config
-snapshots and updates to NATS JetStream.
+The control plane is a peretum node that watches `config.d/`, computes the diff, and
+publishes the resulting target events to JetStream.
 
 ```bash
 peretum controlplane \
-  --listen :4222 \
+  --nats nats://nats.example.com:4222 \
   --config-dir config.d \
-  --data-dir ./controlplane-data
+  --http :9001
 ```
 
-NATS JetStream subjects:
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--nats` | `nats://localhost:4222` | NATS JetStream URL(s), comma-separated for a cluster |
+| `--config-dir` | `config.d` | Directory of target config files to watch |
+| `--http` | `:9001` | HTTP listen address for health checks |
 
-| Subject | Description |
+The control plane serves **health only** — there is no config-serving HTTP API:
+
+| Endpoint | Description |
 | --- | --- |
-| `config.target.updated.{server_name}` | Single target update |
-| `config.target.deleted.{server_name}` | Single target delete |
-| `config.snapshot` | Full config snapshot request/response |
-| `config.hot-targets` | Hot targets list request/response |
+| `GET /health` | Liveness |
+| `GET /readyz` | Readiness |
 
-JetStream stream configuration (pre-configured by controlplane command):
-
-```yaml
-Name:              "config-sync"
-Subjects:          ["config.target.>", "config.snapshot", "config.hot-targets"]
-Retention:         LimitsPolicy
-MaxMsgsPerSubject: 1            # Keep only latest per hostname
-MaxAge:            24h
-Discard:           DiscardOld
-Storage:           FileStorage
-Replicas:          1
-```
-
-For HA, run multiple control plane nodes with NATS clustering:
-
-```bash
-# Control plane 1
-peretum controlplane --listen :4222 --cluster nats://cp1:4222,nats://cp2:4222,nats://cp3:4222
-
-# Control plane 2
-peretum controlplane --listen :4222 --cluster nats://cp1:4222,nats://cp2:4222,nats://cp3:4222
-```
+Multiple control plane nodes may run concurrently against the same JetStream cluster.
+They are not leader-elected; they are expected to be configured with the same
+`--config-dir`, and each publishes the events it observes.
 
 ---
 
@@ -136,87 +217,63 @@ peretum controlplane --listen :4222 --cluster nats://cp1:4222,nats://cp2:4222,na
 ### Public CDN (Full Replication / Lazy)
 
 ```
-                    ┌─────────────────┐
-                    │  Control Plane  │
-                    │  (NATS JetStream)│
-                    └────────┬────────┘
-                             │ config.target.updated.* + config.snapshot
-           ┌─────────────────┼─────────────────┐
-           ▼                 ▼                 ▼
-      ┌─────────┐      ┌─────────┐      ┌─────────┐
-      │ Edge 1  │      │ Edge 2  │      │ Edge 3  │
-      │ Pebble  │      │ Pebble  │      │ Pebble  │
-      │ + LRU   │      │ + LRU   │      │ + LRU   │
-      └────┬────┘      └────┬────┘      └────┬────┘
-           │                │                │
-           └────────────────┴────────────────┘
-                             │
-                    ┌────────▼────────┐
-                    │   Upstream APIs │
-                    └─────────────────┘
+              ┌──────────────────────┐
+              │     config.d/        │
+              └───────────┬──────────┘
+                          │ fsnotify diff
+              ┌───────────▼──────────┐
+              │    Control Plane    │
+              └───────────┬──────────┘
+                          │ publish config.target.{server_name}
+              ┌───────────┴──────────┐
+              │    NATS JetStream    │  MaxMsgsPerSubject: 1
+              │  (current state)     │
+              └───────────┬──────────┘
+        ┌─────────────────┼─────────────────┐
+        ▼                 ▼                 ▼
+   ┌─────────┐      ┌─────────┐      ┌─────────┐
+   │ Edge 1  │      │ Edge 2  │      │ Edge 3  │
+   │ durable │      │ durable │      │ durable │
+   │ consumer│      │ consumer│      │ consumer│
+   │ Pebble  │      │ Pebble  │      │ Pebble  │
+   │ + LRU   │      │ + LRU   │      │ + LRU   │
+   └────┬────┘      └────┬────┘      └────┬────┘
+        └─────────────────┴─────────────────┘
+                          │
+                 ┌────────▼────────┐
+                 │   Upstream APIs │
+                 └─────────────────┘
 ```
 
-All edges keep full config snapshots on disk and serve cold configs off-RAM.
-
----
-
-## NATS JetStream Stream Configuration
-
-The control plane creates a JetStream stream with this precise configuration:
-
-```go
-StreamConfig{
-    Name:              "config-sync",
-    Subjects:          []string{"config.target.>", "config.snapshot", "config.hot-targets"},
-    Retention:         jetstream.LimitsPolicy,
-    MaxMsgs:           -1,
-    MaxAge:            24 * time.Hour,
-    MaxBytes:          -1,
-    MaxMsgsPerSubject: 1,                 // Keep only latest per hostname
-    Discard:           jetstream.DiscardOld,
-    Storage:           jetstream.FileStorage,
-    Replicas:          1,                 // Increase for HA
-}
-```
-
-**Key settings rationale:**
-- `MaxMsgsPerSubject: 1` — Only the latest target config per hostname is kept
-- `DiscardOld` — When a new update arrives, the old one is discarded automatically
-- `LimitsPolicy` — Enforces the per-subject limit strictly
-- `FileStorage` — Persistent storage, survives restarts
+Every edge holds the full state on disk and serves cold configs off-RAM.
 
 ---
 
 ## Metrics
 
-Prometheus-compatible metrics exposed at `metrics_addr`:
+Cluster mode adds no metrics of its own. Request and cache metrics come from the
+Prometheus plugin at `metrics_addr`:
 
 ```
-# Reload metrics
-peretum_reload_total{type="delta|full"}
-peretum_reload_duration_ns
-peretum_reload_errors_total
-
-# Target metrics
-peretum_targets_loaded_total
-peretum_targets_changed_total
-peretum_targets_deleted_total
-
-# NATS sync metrics
-peretum_nats_updates_received_total
-peretum_nats_deletes_received_total
-peretum_nats_snapshot_requests_total
-
-# Request latency
-peretum_request_latency_bucket{le="1ms|5ms|10ms|50ms|100ms|500ms|1s|5s|10s|+Inf"}
+peretum_target_requests_total{server_name}
+peretum_target_cached_requests_total{server_name}
+peretum_location_requests_total{server_name}
+peretum_proxy_requests_total{server_name}
+peretum_proxy_active_requests
+peretum_proxy_request_duration_seconds
+peretum_cache_size_bytes
+peretum_cache_hits_total
+peretum_cache_misses_total
+peretum_cache_evictions_total
 ```
 
 ---
 
 ## Best Practices Summary
 
-| Scenario | `cluster.enabled` | `lazy` | `control_plane` |
-|----------|-------------------|--------|-----------------|
+| Scenario | `cluster.enabled` | `lazy` | `nats_uri` |
+|----------|-------------------|--------|-------------|
 | Public CDN | `true` | ✅ | ✅ Required |
 | Multi-tenant SaaS | `true` | ✅ | ✅ Required |
 | Data residency (GDPR) | `true` | optional | ✅ Required |
+| Single node | `false` | optional | — |

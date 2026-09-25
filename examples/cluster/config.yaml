@@ -34,8 +34,7 @@ waf:
 # Cluster Configuration
 cluster:
   enabled: true            # enable cluster features
-  replica_factor: 2        # replication factor for control plane HA
-  control_plane: "control-plane:9001"
+  nats_uri: "nats://nats:4222"  # external NATS JetStream holding target state
   lazy: true               # materialize target handlers on first request (CDN mode)
   data_dir: "/cache/targetstore"  # Pebble store directory
   lru_size: 1000           # compiled-handler LRU capacity

@@ -1,18 +1,43 @@
 services:
+  # NATS JetStream holds the target state events. It is the only thing edges
+  # read configuration from, so it must be healthy before the control plane
+  # publishes and long before the edges start consuming.
+  nats:
+    image: nats:2.10-alpine
+    container_name: peretum-nats
+    command: ["-js", "-m", "8222", "-sd", "/data"]
+    ports:
+      - "4222:4222"   # client (control plane + edges)
+      - "8222:8222"   # monitoring
+    volumes:
+      - ./data/nats:/data
+    healthcheck:
+      test: ["CMD", "nats-server", "-sl", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
   control-plane:
     image: peretum:0.0.0-alpha0
     container_name: peretum-control-plane
-    ports:
-      - "9001:9001"   # control plane HTTP
-    volumes:
-      - ./config.d:/config.d:ro
-      - ./data/controlplane:/data
     command:
       - controlplane
+      - --nats
+      - nats://nats:4222
+      - --config-dir
+      - /config.d
+      - --http
+      - :9001
+    volumes:
+      - ./config.d:/config.d:ro
     environment:
       - GOMAXPROCS=2
     networks:
       - cluster-network
+    depends_on:
+      nats:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:9001/health"]
       interval: 10s
@@ -33,10 +58,15 @@ services:
       - ./config.yaml:/config.yaml:ro
     environment:
       - GOMAXPROCS=2
-      - CLUSTER_DATA_DIR=/cache/targetstore
+      # Pins this edge's durable JetStream consumer so every edge gets its own
+      # copy of the target state. Without it the consumer name falls back to
+      # the container hostname.
+      - PERETUM_EDGE_ID=us-east-1
     networks:
       - cluster-network
     depends_on:
+      nats:
+        condition: service_healthy
       control-plane:
         condition: service_healthy
     healthcheck:
@@ -59,10 +89,15 @@ services:
       - ./config.yaml:/config.yaml:ro
     environment:
       - GOMAXPROCS=2
-      - CLUSTER_DATA_DIR=/cache/targetstore
+      # Pins this edge's durable JetStream consumer so every edge gets its own
+      # copy of the target state. Without it the consumer name falls back to
+      # the container hostname.
+      - PERETUM_EDGE_ID=us-west-1
     networks:
       - cluster-network
     depends_on:
+      nats:
+        condition: service_healthy
       control-plane:
         condition: service_healthy
     healthcheck:
@@ -85,10 +120,15 @@ services:
       - ./config.yaml:/config.yaml:ro
     environment:
       - GOMAXPROCS=2
-      - CLUSTER_DATA_DIR=/cache/targetstore
+      # Pins this edge's durable JetStream consumer so every edge gets its own
+      # copy of the target state. Without it the consumer name falls back to
+      # the container hostname.
+      - PERETUM_EDGE_ID=eu-central-1
     networks:
       - cluster-network
     depends_on:
+      nats:
+        condition: service_healthy
       control-plane:
         condition: service_healthy
     healthcheck:
