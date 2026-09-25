@@ -22,6 +22,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -32,6 +33,7 @@ import (
 	"github.com/cinvat/peretum/internal/router"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
+	"gopkg.in/yaml.v3"
 )
 
 func genCertFiles(t *testing.T, dir string) (string, string) {
@@ -1710,8 +1712,9 @@ func TestLazyControlPlaneUpdateAndDelete(t *testing.T) {
 	if !strings.Contains(string(data), "svc.upd") {
 		t.Fatalf("stored config = %q, want it to mention svc.upd", data)
 	}
-	if ps.lazyRouter.GetTargets()["svc.upd"] == nil {
-		t.Fatal("router missing target after update")
+	// The store is the routing table, so an update must not add a per-host entry.
+	if got := len(ps.lazyRouter.GetTargets()); got != 0 {
+		t.Fatalf("routing table holds %d entries after update, want 0 (store-backed)", got)
 	}
 
 	rec := httptest.NewRecorder()
@@ -1724,8 +1727,12 @@ func TestLazyControlPlaneUpdateAndDelete(t *testing.T) {
 	if _, ok, _ := store.GetTargetByHost(ctx, "svc.upd"); ok {
 		t.Fatal("target still in store after delete")
 	}
-	if ps.lazyRouter.GetTargets()["svc.upd"] != nil {
-		t.Fatal("target still routed after delete")
+	// Deleting the row is enough to stop routing it; nothing removes an entry
+	// because nothing added one.
+	rec = httptest.NewRecorder()
+	ps.router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc.upd/", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status after delete = %d, want %d", rec.Code, http.StatusNotFound)
 	}
 }
 
@@ -1926,4 +1933,178 @@ func TestBuildHealthCheckConfig(t *testing.T) {
 			t.Fatalf("Interval/Timeout = %v/%v, want the defaults", hc.Interval, hc.Timeout)
 		}
 	})
+}
+
+// The whole point of the store-backed router: a store holding many thousands of
+// targets must produce a routing table that stays empty, and serving them must
+// stay within the bounded LRU.
+func TestLazyRouterScalesWithoutRoutingTable(t *testing.T) {
+	ctx := context.Background()
+	store := lazyTestStore(t)
+	url := lazyEchoUpstream(t, "scaled-body")
+
+	// More targets than the LRU can hold, so a bounded cache is the only way to
+	// serve them all.
+	const targets = 2000
+	const lruCapacity = 32
+	for i := 0; i < targets; i++ {
+		host := fmt.Sprintf("h%04d.example.com", i)
+		data, err := yaml.Marshal(&config.TargetConfig{
+			ServerName: host,
+			Upstreams:  []config.UpstreamConfig{{URL: url}},
+			Locations:  []config.LocationConfig{{Path: "/"}},
+		})
+		if err != nil {
+			t.Fatalf("marshal target %s: %v", host, err)
+		}
+		if err := store.PutTargetByHost(ctx, host, data); err != nil {
+			t.Fatalf("PutTargetByHost(%s): %v", host, err)
+		}
+	}
+
+	ps := &proxyServer{targetStore: store}
+	ps.lazyLRU = cluster.NewLRUCache[string, *router.TargetConfigHandler](lruCapacity)
+	ps.router = ps.buildHostRouter()
+
+	if got := len(ps.lazyRouter.GetTargets()); got != 0 {
+		t.Fatalf("routing table holds %d entries for %d targets, want 0", got, targets)
+	}
+
+	// Serve a spread of hosts: the ones that stayed resident and the ones that
+	// were evicted after their first request.
+	for _, i := range []int{0, 1, targets / 2, targets - 1, 0, targets / 2} {
+		host := fmt.Sprintf("h%04d.example.com", i)
+		rec := httptest.NewRecorder()
+		ps.router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+host+"/", nil))
+		if rec.Body.String() != "scaled-body" {
+			t.Fatalf("host %s body = %q, want %q", host, rec.Body.String(), "scaled-body")
+		}
+	}
+
+	if got := ps.lazyLRU.Len(); got > lruCapacity {
+		t.Fatalf("LRU holds %d handlers, want at most %d", got, lruCapacity)
+	}
+
+	// An unknown host must 404 without being materialized.
+	rec := httptest.NewRecorder()
+	ps.router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://nope.example.com/", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown host status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+// Guards the invariant that makes per-request handlers safe: the router must
+// build its handlers on one shared flight table, so concurrent first requests
+// for a cold host compile it once.
+func TestLazyRouterCoalescesColdRequests(t *testing.T) {
+	ctx := context.Background()
+	store := lazyTestStore(t)
+	url := lazyEchoUpstream(t, "coalesced-body")
+
+	data, err := yaml.Marshal(&config.TargetConfig{
+		ServerName: "svc-cold",
+		Upstreams:  []config.UpstreamConfig{{URL: url}},
+		Locations:  []config.LocationConfig{{Path: "/"}},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := store.PutTargetByHost(ctx, "svc-cold", data); err != nil {
+		t.Fatalf("PutTargetByHost: %v", err)
+	}
+
+	ps := &proxyServer{targetStore: store}
+	ps.lazyLRU = cluster.NewLRUCache[string, *router.TargetConfigHandler](16)
+
+	var loads int
+	var mu sync.Mutex
+	release := make(chan struct{})
+	ps.lazyLoad = func(ctx context.Context, hostname string) (*router.TargetConfigHandler, error) {
+		mu.Lock()
+		loads++
+		mu.Unlock()
+		<-release
+		return ps.materializeTarget(ctx, hostname)
+	}
+	ps.router = ps.buildHostRouter()
+
+	const callers = 16
+	var wg sync.WaitGroup
+	bodies := make([]string, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			ps.router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-cold/", nil))
+			bodies[i] = rec.Body.String()
+		}(i)
+	}
+
+	// Wait for the leader to enter the load, then give the followers time to
+	// arrive and join the same flight.
+	for {
+		mu.Lock()
+		started := loads
+		mu.Unlock()
+		if started == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	mu.Lock()
+	got := loads
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("materialized %d times for %d concurrent cold requests, want 1", got, callers)
+	}
+	for i, body := range bodies {
+		if body != "coalesced-body" {
+			t.Fatalf("caller %d body = %q, want %q", i, body, "coalesced-body")
+		}
+	}
+}
+
+// An update to a target that is already resident must be picked up: the
+// resolver rebuilds the handler, so the LRU invalidation has to be enough.
+func TestLazyRouterServesUpdatedTarget(t *testing.T) {
+	store := lazyTestStore(t)
+	first := lazyEchoUpstream(t, "v1")
+	second := lazyEchoUpstream(t, "v2")
+
+	ps := &proxyServer{targetStore: store}
+	ps.lazyLRU = cluster.NewLRUCache[string, *router.TargetConfigHandler](16)
+	ps.router = ps.buildHostRouter()
+
+	if err := ps.applyTargetUpdate("svc-rot", &config.TargetConfig{
+		ServerName: "svc-rot",
+		Upstreams:  []config.UpstreamConfig{{URL: first}},
+		Locations:  []config.LocationConfig{{Path: "/"}},
+	}); err != nil {
+		t.Fatalf("applyTargetUpdate: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	ps.router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-rot/", nil))
+	if rec.Body.String() != "v1" {
+		t.Fatalf("body before update = %q, want %q", rec.Body.String(), "v1")
+	}
+
+	if err := ps.applyTargetUpdate("svc-rot", &config.TargetConfig{
+		ServerName: "svc-rot",
+		Upstreams:  []config.UpstreamConfig{{URL: second}},
+		Locations:  []config.LocationConfig{{Path: "/"}},
+	}); err != nil {
+		t.Fatalf("applyTargetUpdate (update): %v", err)
+	}
+
+	rec = httptest.NewRecorder()
+	ps.router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-rot/", nil))
+	if rec.Body.String() != "v2" {
+		t.Fatalf("body after update = %q, want %q", rec.Body.String(), "v2")
+	}
 }

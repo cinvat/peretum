@@ -75,6 +75,40 @@ func (ts *TargetStore) GetTargetByHost(ctx context.Context, hostname string) (da
 	return ts.get(hostKeyPrefix + hostname)
 }
 
+// HasTargetByHost reports whether a target exists for a hostname without
+// copying the config body out of the store. Existence checks are on the request
+// path for a store-backed router, so copying every config just to test a
+// prefix would be wasteful at CDN scale.
+func (ts *TargetStore) HasTargetByHost(ctx context.Context, hostname string) (bool, error) {
+	_ = ctx
+	_, closer, err := ts.db.Get([]byte(hostKeyPrefix + hostname))
+	if err == pebble.ErrNotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	closer.Close()
+	return true, nil
+}
+
+// HasAnyTarget reports whether the store holds at least one target, without
+// enumerating the keyspace. Startup uses this to tell a fresh store from a
+// provisioned one; ListHosts would allocate one string per target to answer a
+// yes/no question.
+func (ts *TargetStore) HasAnyTarget(ctx context.Context) (bool, error) {
+	_ = ctx
+	iter, err := ts.db.NewIter(nil)
+	if err != nil {
+		return false, err
+	}
+	defer iter.Close()
+
+	prefix := []byte(hostKeyPrefix)
+	valid := iter.SeekGE(prefix)
+	return valid && bytes.HasPrefix(iter.Key(), prefix), nil
+}
+
 // DeleteTargetByHost removes a target by hostname.
 func (ts *TargetStore) DeleteTargetByHost(ctx context.Context, hostname string) error {
 	_ = ctx
@@ -103,12 +137,26 @@ func (ts *TargetStore) ListHosts(ctx context.Context) ([]string, error) {
 }
 
 // HostCount returns the number of stored hostnames.
+//
+// It walks the keyspace but allocates nothing per key, so counting 10M targets
+// costs a scan rather than 10M strings.
 func (ts *TargetStore) HostCount(ctx context.Context) (int, error) {
-	hosts, err := ts.ListHosts(ctx)
+	_ = ctx
+	iter, err := ts.db.NewIter(nil)
 	if err != nil {
 		return 0, err
 	}
-	return len(hosts), nil
+	defer iter.Close()
+
+	count := 0
+	prefix := []byte(hostKeyPrefix)
+	for valid := iter.SeekGE(prefix); valid; valid = iter.Next() {
+		if !bytes.HasPrefix(iter.Key(), prefix) {
+			break
+		}
+		count++
+	}
+	return count, nil
 }
 
 // get retrieves a value by key. The returned slice is a copy safe to use after

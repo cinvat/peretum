@@ -195,3 +195,100 @@ func TestTargetStoreConcurrent(t *testing.T) {
 		t.Fatalf("ListHosts = %d names, want %d", len(hosts), n)
 	}
 }
+
+func TestTargetStoreHasAnyTarget(t *testing.T) {
+	ctx := context.Background()
+	ts, err := OpenTargetStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenTargetStore: %v", err)
+	}
+	defer ts.Close()
+
+	// Startup calls this to tell a fresh store from a provisioned one, so the
+	// empty case has to be distinguishable from "has targets" without relying
+	// on a count.
+	has, err := ts.HasAnyTarget(ctx)
+	if err != nil || has {
+		t.Fatalf("HasAnyTarget on empty store = %v, err %v; want false", has, err)
+	}
+
+	if err := ts.PutTargetByHost(ctx, "a.example.com", []byte("{}")); err != nil {
+		t.Fatalf("PutTargetByHost: %v", err)
+	}
+	if has, err = ts.HasAnyTarget(ctx); err != nil || !has {
+		t.Fatalf("HasAnyTarget after put = %v, err %v; want true", has, err)
+	}
+
+	if err := ts.DeleteTargetByHost(ctx, "a.example.com"); err != nil {
+		t.Fatalf("DeleteTargetByHost: %v", err)
+	}
+	if has, err = ts.HasAnyTarget(ctx); err != nil || has {
+		t.Fatalf("HasAnyTarget after delete = %v, err %v; want false", has, err)
+	}
+
+	// A store that holds only the non-host global key must not count as
+	// provisioned: HasAnyTarget scans the h/ prefix specifically.
+	if err := ts.PutGlobal(ctx, []byte("{}")); err != nil {
+		t.Fatalf("PutGlobal: %v", err)
+	}
+	if has, err = ts.HasAnyTarget(ctx); err != nil || has {
+		t.Fatalf("HasAnyTarget with only the global key = %v, err %v; want false", has, err)
+	}
+}
+
+func TestTargetStoreHasTargetByHost(t *testing.T) {
+	ctx := context.Background()
+	ts, err := OpenTargetStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenTargetStore: %v", err)
+	}
+	defer ts.Close()
+
+	has, err := ts.HasTargetByHost(ctx, "a.example.com")
+	if err != nil || has {
+		t.Fatalf("HasTargetByHost on missing = %v, err %v; want false", has, err)
+	}
+
+	if err := ts.PutTargetByHost(ctx, "a.example.com", []byte("server_name: a")); err != nil {
+		t.Fatalf("PutTargetByHost: %v", err)
+	}
+	has, err = ts.HasTargetByHost(ctx, "a.example.com")
+	if err != nil || !has {
+		t.Fatalf("HasTargetByHost after put = %v, err %v; want true", has, err)
+	}
+
+	// The existence check must agree with the read it stands in for: a router
+	// resolves via HasTargetByHost and then materializes via GetTargetByHost,
+	// so a disagreement would surface as a 502 on a valid target.
+	data, ok, err := ts.GetTargetByHost(ctx, "a.example.com")
+	if err != nil || !ok || string(data) != "server_name: a" {
+		t.Fatalf("GetTargetByHost = %q ok %v err %v", data, ok, err)
+	}
+}
+
+func TestTargetStoreHostCountMatchesListHosts(t *testing.T) {
+	ctx := context.Background()
+	ts, err := OpenTargetStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenTargetStore: %v", err)
+	}
+	defer ts.Close()
+
+	if err := ts.PutGlobal(ctx, []byte("{}")); err != nil {
+		t.Fatalf("PutGlobal: %v", err)
+	}
+	const n = 25
+	for i := 0; i < n; i++ {
+		if err := ts.PutTargetByHost(ctx, fmt.Sprintf("host%d.example.com", i), []byte("{}")); err != nil {
+			t.Fatalf("PutTargetByHost(%d): %v", i, err)
+		}
+	}
+
+	count, err := ts.HostCount(ctx)
+	if err != nil {
+		t.Fatalf("HostCount: %v", err)
+	}
+	if count != n {
+		t.Fatalf("HostCount = %d, want %d (global key must not be counted)", count, n)
+	}
+}

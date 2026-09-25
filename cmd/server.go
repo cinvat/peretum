@@ -61,6 +61,11 @@ type proxyServer struct {
 	lazyLRU     *cluster.LRUCache[string, *router.TargetConfigHandler]
 	lazyRouter  *router.HostRouter
 
+	// lazyLoad materializes a target by hostname. It exists so tests can observe
+	// how many times a cold target is compiled; production always uses
+	// materializeTarget. buildLazyHostRouter resolves through it.
+	lazyLoad func(ctx context.Context, hostname string) (*router.TargetConfigHandler, error)
+
 	// NATS config sync for control plane updates
 	natsSync *cluster.NATSConfigSync
 
@@ -295,32 +300,51 @@ func targetHostKey(target *config.TargetConfig) string {
 	return target.ServerName
 }
 
-// buildLazyHostRouter builds the routing table from the set of hostnames stored
-// on disk. Each host is served by a LazyHandler that materializes the target's
-// compiled handlers on first request and keeps them in a bounded LRU.
-// The router key is the hostname directly (O(1) lookup by Host header).
+// buildLazyHostRouter builds a router that resolves hosts from the target store
+// instead of holding them in memory.
+//
+// The routing table is left empty on purpose. A CDN edge may hold 10M+ targets,
+// and one map entry per hostname would put every cold target back in RAM, which
+// is exactly what lazy loading exists to avoid. Instead the store is the routing
+// table: a request costs one point lookup on h/<hostname> to decide whether the
+// host exists, and the config itself is only read and compiled if it does.
+//
+// That lookup runs on every request, but it is a Pebble point read against a
+// key the block cache already has, and it replaces an unbounded map. Memory is
+// therefore O(1) plus the bounded handler LRU, independent of target count.
+//
+// One consequence worth noting: a target becomes routable the moment its event
+// is applied to the store, so incremental updates no longer need to touch the
+// router at all. applyTargetUpdate only has to invalidate the LRU entry.
 func (ps *proxyServer) buildLazyHostRouter() *router.HostRouter {
 	hr := router.NewHostRouter()
-	targets := make(map[string]http.Handler)
-	var def http.Handler
+	hr.Reload(nil, nil)
 
-	hosts, err := ps.targetStore.ListHosts(context.Background())
-	if err != nil {
-		klog.Errorf("lazy router: list hosts from store: %v", err)
-	} else {
-		for _, hostname := range hosts {
-			// In lazy mode, the router key is the hostname itself.
-			// The LazyHandler will use this same hostname to fetch from store.
-			host := hostname
-			targets[host] = router.NewLazyHandler(host, ps.lazyLRU, func(ctx context.Context) (*router.TargetConfigHandler, error) {
-				return ps.materializeTarget(ctx, host)
-			})
-			if host == router.DefaultHostname {
-				def = targets[host]
-			}
-		}
+	// The flight table is shared by every host so that the per-request
+	// LazyHandler built below still coalesces concurrent first requests.
+	flights := router.NewFlightTable(ps.lazyLRU)
+	load := ps.lazyLoad
+	if load == nil {
+		load = ps.materializeTarget
 	}
-	hr.Reload(targets, def)
+
+	hr.SetResolver(func(host string) (http.Handler, bool) {
+		if host == "" {
+			return nil, false
+		}
+		exists, err := ps.targetStore.HasTargetByHost(context.Background(), host)
+		if err != nil {
+			klog.Errorf("lazy router: lookup %s: %v", host, err)
+			return nil, false
+		}
+		if !exists {
+			return nil, false
+		}
+		return router.NewSharedLazyHandler(host, ps.lazyLRU, func(ctx context.Context) (*router.TargetConfigHandler, error) {
+			return load(ctx, host)
+		}, flights), true
+	})
+
 	ps.lazyRouter = hr
 	return hr
 }
@@ -364,12 +388,14 @@ func (ps *proxyServer) ensureLazyStore() error {
 	}
 
 	ctx := context.Background()
-	hosts, err := ps.targetStore.ListHosts(ctx)
+	provisioned, err := ps.targetStore.HasAnyTarget(ctx)
 	if err != nil {
 		return fmt.Errorf("target store: %w", err)
 	}
-	if len(hosts) > 0 {
-		klog.Infof("target store already provisioned with %d targets", len(hosts))
+	if provisioned {
+		// Deliberately not counting the rows: at CDN scale that is a full
+		// keyspace scan just to produce a log line.
+		klog.Infof("target store already provisioned; using as-is")
 		return nil
 	}
 
@@ -473,13 +499,11 @@ func (ps *proxyServer) applyTargetUpdate(serverName string, targetConfig *config
 			return fmt.Errorf("store target %s for hostname %s: %w", serverName, hostname, err)
 		}
 
-		// Invalidate any compiled handler and re-point the router at a fresh stub.
+		// The store is the routing table, so an update only has to drop the
+		// compiled handler: the next request re-reads the config we just wrote.
+		// There is no per-host router entry to add or replace, which is what
+		// keeps updates O(1) in memory.
 		ps.lazyLRU.Delete(hostname)
-		if ps.lazyRouter != nil {
-			ps.lazyRouter.Upsert(hostname, router.NewLazyHandler(hostname, ps.lazyLRU, func(ctx context.Context) (*router.TargetConfigHandler, error) {
-				return ps.materializeTarget(ctx, hostname)
-			}))
-		}
 	}
 	return nil
 }
@@ -496,10 +520,9 @@ func (ps *proxyServer) applyTargetDelete(name string) {
 	if err := ps.targetStore.DeleteTargetByHost(context.Background(), name); err != nil {
 		klog.Errorf("delete stored target %s: %v", name, err)
 	}
+	// Drop the compiled handler; the router resolves through the store, so once
+	// the row is gone the hostname stops resolving on its own.
 	ps.lazyLRU.Delete(name)
-	if ps.lazyRouter != nil {
-		ps.lazyRouter.RemoveHost(name)
-	}
 }
 
 // buildFrontendHandler wraps the router with every plugin implementing

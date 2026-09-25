@@ -390,3 +390,243 @@ func TestLazyHandlerLoadSurvivesLeaderDisconnect(t *testing.T) {
 		t.Fatalf("follower body = %q, want detached", followerRec.Body.String())
 	}
 }
+
+// A store-backed router cannot keep one LazyHandler per target in memory, so it
+// builds a throwaway handler per request instead. This test pins the invariant
+// that makes that safe: coalescing lives in the shared table, not the handler.
+func TestSharedFlightTableCoalescesAcrossHandlers(t *testing.T) {
+	lru := cluster.NewLRUCache[string, *TargetConfigHandler](4)
+	flights := NewFlightTable(lru)
+
+	var mu sync.Mutex
+	loads := 0
+	release := make(chan struct{})
+	load := func(ctx context.Context) (*TargetConfigHandler, error) {
+		mu.Lock()
+		loads++
+		mu.Unlock()
+		// Hold the load open so every goroutine below is guaranteed to arrive
+		// while it is in flight, rather than after it finished.
+		<-release
+		return lazyEchoHandler(t, "shared-body"), nil
+	}
+
+	const callers = 8
+	var wg sync.WaitGroup
+	bodies := make([]string, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// A distinct handler per goroutine, exactly as the resolver builds
+			// them: no shared *LazyHandler, so the only thing that can coalesce
+			// these is the table.
+			lh := NewSharedLazyHandler("svc-b", lru, load, flights)
+			rec := httptest.NewRecorder()
+			lh.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-b/", nil))
+			bodies[i] = rec.Body.String()
+		}(i)
+	}
+
+	// Wait until the leader is inside load, then let the followers pile up.
+	for {
+		mu.Lock()
+		started := loads
+		mu.Unlock()
+		if started == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	mu.Lock()
+	got := loads
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("load called %d times across %d distinct handlers, want 1", got, callers)
+	}
+	for i, body := range bodies {
+		if body != "shared-body" {
+			t.Fatalf("caller %d body = %q, want %q", i, body, "shared-body")
+		}
+	}
+}
+
+// The table must not leak: entries exist only while a load runs, so a store
+// with 10M targets still costs nothing here.
+func TestSharedFlightTableReleasesEntriesAfterLoad(t *testing.T) {
+	lru := cluster.NewLRUCache[string, *TargetConfigHandler](4)
+	flights := NewFlightTable(lru)
+
+	load := func(ctx context.Context) (*TargetConfigHandler, error) {
+		return lazyEchoHandler(t, "b"), nil
+	}
+
+	for _, host := range []string{"a", "b", "c", "d", "e", "f"} {
+		lh := NewSharedLazyHandler(host, lru, load, flights)
+		rec := httptest.NewRecorder()
+		lh.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+host+"/", nil))
+		if rec.Body.String() != "b" {
+			t.Fatalf("host %s body = %q", host, rec.Body.String())
+		}
+	}
+
+	flights.mu.Lock()
+	inflight := len(flights.calls)
+	flights.mu.Unlock()
+	if inflight != 0 {
+		t.Fatalf("flight table holds %d entries after all loads finished, want 0", inflight)
+	}
+}
+
+// A failed load must also clear the flight, otherwise the key would be
+// permanently pinned and every later request would wait on a call that already
+// returned.
+func TestSharedFlightTableReleasesEntriesAfterFailure(t *testing.T) {
+	lru := cluster.NewLRUCache[string, *TargetConfigHandler](4)
+	flights := NewFlightTable(lru)
+
+	var attempts int
+	var mu sync.Mutex
+	load := func(ctx context.Context) (*TargetConfigHandler, error) {
+		mu.Lock()
+		attempts++
+		failed := attempts == 1
+		mu.Unlock()
+		if failed {
+			return nil, errMaterializeFailed
+		}
+		return lazyEchoHandler(t, "b"), nil
+	}
+
+	lh := NewSharedLazyHandler("svc-f", lru, load, flights)
+	rec := httptest.NewRecorder()
+	lh.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-f/", nil))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status after failed load = %d, want %d", rec.Code, http.StatusBadGateway)
+	}
+
+	flights.mu.Lock()
+	inflight := len(flights.calls)
+	flights.mu.Unlock()
+	if inflight != 0 {
+		t.Fatalf("flight table holds %d entries after a failed load, want 0", inflight)
+	}
+
+	// The next request must be able to retry rather than joining a dead flight.
+	rec = httptest.NewRecorder()
+	lh.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-f/", nil))
+	if rec.Body.String() != "b" {
+		t.Fatalf("retry body = %q, want %q", rec.Body.String(), "b")
+	}
+}
+
+func TestHostRouterResolverServesUnlistedHosts(t *testing.T) {
+	hr := NewHostRouter()
+	hr.Reload(nil, nil) // table deliberately empty, as in lazy mode
+
+	known := map[string]string{"svc-r": "resolved-body"}
+	hr.SetResolver(func(host string) (http.Handler, bool) {
+		body, ok := known[host]
+		if !ok {
+			return nil, false
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, body)
+		}), true
+	})
+
+	rec := httptest.NewRecorder()
+	hr.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-r/", nil))
+	if rec.Body.String() != "resolved-body" {
+		t.Fatalf("resolved body = %q, want %q", rec.Body.String(), "resolved-body")
+	}
+
+	// An unknown host must still 404 rather than falling through to a handler.
+	rec = httptest.NewRecorder()
+	hr.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-missing/", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown host status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+// The default target has to resolve through the resolver too, otherwise a
+// store-backed deployment would have no _default route.
+func TestHostRouterResolverServesDefaultHost(t *testing.T) {
+	hr := NewHostRouter()
+	hr.Reload(nil, nil)
+
+	known := map[string]string{DefaultHostname: "default-body"}
+	hr.SetResolver(func(host string) (http.Handler, bool) {
+		body, ok := known[host]
+		if !ok {
+			return nil, false
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, body)
+		}), true
+	})
+
+	rec := httptest.NewRecorder()
+	hr.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://anything.example.com/", nil))
+	if rec.Body.String() != "default-body" {
+		t.Fatalf("default fallback body = %q, want %q", rec.Body.String(), "default-body")
+	}
+}
+
+// A table entry wins over the resolver: table entries are explicit, and a
+// stale resolver must not override them.
+func TestHostRouterResolverDoesNotOverrideTable(t *testing.T) {
+	hr := NewHostRouter()
+	hr.Upsert("svc-t", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "table-body")
+	}))
+	hr.SetResolver(func(host string) (http.Handler, bool) {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, "resolver-body")
+		}), true
+	})
+
+	rec := httptest.NewRecorder()
+	hr.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-t/", nil))
+	if rec.Body.String() != "table-body" {
+		t.Fatalf("body = %q, want %q (table must win)", rec.Body.String(), "table-body")
+	}
+}
+
+// Reload must not drop the resolver, or a reload would silently turn a
+// store-backed router into one that 404s every target it does not hold in RAM.
+func TestHostRouterReloadKeepsResolver(t *testing.T) {
+	hr := NewHostRouter()
+	called := false
+	hr.SetResolver(func(host string) (http.Handler, bool) {
+		called = true
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), true
+	})
+	hr.Reload(map[string]http.Handler{}, nil)
+
+	rec := httptest.NewRecorder()
+	hr.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-q/", nil))
+	if !called {
+		t.Fatal("resolver was dropped by Reload")
+	}
+}
+
+func TestHostRouterSetResolverNilRestoresTableOnly(t *testing.T) {
+	hr := NewHostRouter()
+	hr.SetResolver(func(host string) (http.Handler, bool) {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, "resolver-body")
+		}), true
+	})
+	hr.SetResolver(nil)
+
+	rec := httptest.NewRecorder()
+	hr.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-n/", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status with nil resolver = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}

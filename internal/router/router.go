@@ -14,9 +14,20 @@ import (
 // an incoming Host matches no configured target.
 const DefaultHostname = "_default"
 
+// Resolver produces a handler for a hostname that is not present in the routing
+// table, and reports whether the hostname is known at all.
+//
+// This is what lets a router serve an unbounded number of targets without
+// holding them in memory. A store-backed implementation answers from the
+// target store (a point lookup on the hostname key), so the routing table can
+// stay empty and the cost of a request becomes one disk read instead of one map
+// entry per target.
+type Resolver func(host string) (http.Handler, bool)
+
 type HostRouter struct {
 	targets        map[string]http.Handler
 	defaultHandler http.Handler
+	resolver       Resolver
 	mu             sync.RWMutex
 }
 
@@ -64,13 +75,32 @@ func NormalizeHost(host string) string {
 func (hr *HostRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	host := NormalizeHost(req.Host)
 
+	// Both table lookups happen under a single read lock; reading the default
+	// after unlocking would race with Reload.
 	hr.mu.RLock()
 	tch, ok := hr.targets[host]
-	if !ok {
-		tch, ok = hr.targets[DefaultHostname]
-	}
+	fallback, hasFallback := hr.targets[DefaultHostname]
+	resolver := hr.resolver
 	def := hr.defaultHandler
 	hr.mu.RUnlock()
+
+	if !ok && resolver != nil {
+		// The hostname is not in the table, but it may still be a known target
+		// that the table deliberately does not hold. Ask the resolver.
+		if resolved, found := resolver(host); found {
+			tch, ok = resolved, true
+		}
+	}
+	if !ok {
+		tch, ok = fallback, hasFallback
+	}
+	if !ok && resolver != nil {
+		// Resolve the default target too, so a store-backed default does not
+		// need to be pinned in the table either.
+		if resolved, found := resolver(DefaultHostname); found {
+			tch, ok = resolved, true
+		}
+	}
 
 	if !ok && def != nil {
 		klog.V(4).Infof("Using default handler for host: %s", host)
@@ -129,11 +159,24 @@ func (tch *TargetConfigHandler) ServeHTTP(w http.ResponseWriter, req *http.Reque
 }
 
 // Reload atomically replaces the entire routing table.
+//
+// The resolver is left in place: it is not part of the table's contents, and
+// dropping it would silently turn a store-backed router into one that 404s
+// every hostname it does not hold in memory.
 func (hr *HostRouter) Reload(targets map[string]http.Handler, defaultHandler http.Handler) {
 	hr.mu.Lock()
 	defer hr.mu.Unlock()
 	hr.targets = targets
 	hr.defaultHandler = defaultHandler
+}
+
+// SetResolver installs the resolver consulted for hostnames that are not in the
+// routing table. Passing nil disables resolution and restores table-only
+// behavior.
+func (hr *HostRouter) SetResolver(r Resolver) {
+	hr.mu.Lock()
+	defer hr.mu.Unlock()
+	hr.resolver = r
 }
 
 // Upsert installs (or replaces) a single host handler without rebuilding the
