@@ -81,3 +81,27 @@ func TestGetStringSlice(t *testing.T) {
 		t.Fatalf("GetStringSlice non-slice = %v", got)
 	}
 }
+
+func TestGetInt64(t *testing.T) {
+	m := map[string]any{
+		"int64":          int64(42),
+		"float":          43.9,
+		"int":            44,
+		"numeric_string": "45",
+	}
+	if got := GetInt64(m, "int64"); got != 42 {
+		t.Fatalf("GetInt64 int64 = %d, want 42", got)
+	}
+	if got := GetInt64(m, "float"); got != 43 {
+		t.Fatalf("GetInt64 float64 = %d, want 43 (truncated)", got)
+	}
+	if got := GetInt64(m, "int"); got != 44 {
+		t.Fatalf("GetInt64 int = %d, want 44", got)
+	}
+	if got := GetInt64(m, "missing"); got != 0 {
+		t.Fatalf("GetInt64 missing = %d, want 0", got)
+	}
+	if got := GetInt64(m, "numeric_string"); got != 0 {
+		t.Fatalf("GetInt64 string = %d, want 0", got)
+	}
+}
