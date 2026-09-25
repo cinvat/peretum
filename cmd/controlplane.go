@@ -8,52 +8,55 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/cinvat/peretum/internal/cluster"
+	"github.com/cinvat/peretum/internal/config"
 	"github.com/fsnotify/fsnotify"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/spf13/cobra"
+	"k8s.io/klog/v2"
 )
 
 func newControlPlaneCommand() *cobra.Command {
 	var natsURLs string
 	var httpAddr string
 	var configDir string
-	var dataDir string
 
 	cmd := &cobra.Command{
 		Use:   "controlplane",
 		Short: "Run the CDN control plane for config distribution via NATS JetStream",
-		Long: `Start the NATS JetStream control plane that watches config.d/ and publishes
-config updates to NATS JetStream. Edges subscribe to config.target.updated.* and
-config.target.deleted.* for real-time updates, and can request full snapshots via
-config.snapshot.`,
+		Long: `Start the NATS JetStream control plane.
+
+The control plane is the single source of truth for target configuration. It
+watches a directory of target YAML files and publishes the current state of
+each target to a NATS JetStream event store.
+
+The stream is configured as an event store: it keeps exactly one message per
+target subject, so the newest event for a target is always its current state.
+Edge nodes replay the stream from the beginning to obtain the full
+configuration, then follow live updates. There is no separate snapshot API and
+no configuration versioning.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runControlPlane(cmd.Context(), natsURLs, httpAddr, configDir, dataDir)
+			return runControlPlane(cmd.Context(), natsURLs, httpAddr, configDir)
 		},
 	}
 
 	cmd.Flags().StringVar(&natsURLs, "nats", "nats://localhost:4222", "NATS JetStream URL(s) (comma-separated for cluster)")
-	cmd.Flags().StringVar(&httpAddr, "http", ":9001", "HTTP listen address for snapshot API")
+	cmd.Flags().StringVar(&httpAddr, "http", ":9001", "HTTP listen address for health checks")
 	cmd.Flags().StringVar(&configDir, "config-dir", "config.d", "directory of target config files to watch")
-	cmd.Flags().StringVar(&dataDir, "data-dir", "./controlplane-data", "directory for persistent data (snapshots, state)")
 
 	return cmd
 }
 
-func runControlPlane(ctx context.Context, natsURLs, httpAddr, configDir, dataDir string) error {
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		return fmt.Errorf("failed to create data dir %s: %w", dataDir, err)
-	}
-
+func runControlPlane(ctx context.Context, natsURLs, httpAddr, configDir string) error {
 	if err := os.MkdirAll(configDir, 0o755); err != nil {
-		return fmt.Errorf("failed to create config dir %s: %w", configDir, err)
+		return fmt.Errorf("create config dir %s: %w", configDir, err)
 	}
 
-	// Connect to NATS
 	nc, err := nats.Connect(natsURLs,
 		nats.ReconnectWait(5*time.Second),
 		nats.MaxReconnects(-1),
@@ -68,194 +71,201 @@ func runControlPlane(ctx context.Context, natsURLs, httpAddr, configDir, dataDir
 		return fmt.Errorf("create jetstream context: %w", err)
 	}
 
-	// Create or update the stream
 	streamCfg := cluster.DefaultStreamConfig()
-	_, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:              streamCfg.Name,
-		Subjects:          streamCfg.Subjects,
-		Retention:         jetstream.LimitsPolicy,
-		MaxMsgs:           -1,
-		MaxAge:            streamCfg.MaxAge,
-		MaxBytes:          streamCfg.MaxBytes,
-		MaxMsgsPerSubject: int64(streamCfg.MaxMsgsPerSubject),
-		Discard:           streamCfg.DiscardPolicy,
-		Storage:           streamCfg.StorageType,
-		Replicas:          streamCfg.Replicas,
-	})
-	if err != nil {
-		return fmt.Errorf("create stream: %w", err)
+	if err := cluster.EnsureStream(ctx, js, streamCfg); err != nil {
+		return fmt.Errorf("create config stream: %w", err)
 	}
 
-	// Load initial snapshot into JetStream
-	configStore := cluster.NewConfigVersionStore(10000)
-	if _, _, err := configStore.LoadTargets(configDir); err != nil {
-		fmt.Fprintf(os.Stderr, "warn: no target configs loaded yet: %v\n", err)
-	} else {
-		// Publish initial targets to JetStream
-		allTargets := configStore.GetAllTargets()
-		for name, target := range allTargets {
-			data, _ := json.Marshal(target.Target)
-			js.Publish(ctx, "config.target.updated."+name, data)
-		}
-		fmt.Fprintf(os.Stderr, "published %d initial targets to JetStream\n", len(allTargets))
+	// Publish the initial state, then keep it in sync with the directory.
+	pub := &configPublisher{
+		js:     js,
+		dir:    configDir,
+		byName: make(map[string][]byte),
 	}
+	if err := pub.syncAll(ctx); err != nil {
+		return fmt.Errorf("initial config publish: %w", err)
+	}
+	klog.Infof("published %d targets from %s", len(pub.byName), configDir)
 
-	// Watch config directory for changes
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warn: failed to create fsnotify watcher: %v; falling back to polling\n", err)
-		go pollConfigChanges(ctx, js, configDir)
-	} else {
-		go watchConfigChanges(ctx, watcher, configDir, js)
+		return fmt.Errorf("create fsnotify watcher: %w", err)
 	}
+	defer watcher.Close()
 
-	// Start HTTP server for snapshot requests and health checks
+	go watchConfigDir(ctx, watcher, configDir, pub)
+
+	// Health endpoint for liveness/readiness probes.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
-	mux.HandleFunc("/sync", func(w http.ResponseWriter, r *http.Request) {
-		// Full snapshot request
-		allTargets := configStore.GetAllTargets()
-		resp := map[string]interface{}{
-			"version": time.Now().Unix(),
-			"targets": make(map[string]interface{}),
-		}
-		targetsMap := resp["targets"].(map[string]interface{})
-		for name, target := range allTargets {
-			targetsMap[name] = map[string]interface{}{
-				"target":    target.Target,
-				"version":   target.Version,
-				"loaded_at": target.LoadedAt.Unix(),
-			}
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
-	})
-	mux.HandleFunc("/hot-targets", func(w http.ResponseWriter, r *http.Request) {
-		// Return list of hot targets (those with high access count)
-		stats := configStore.GetStats()
-		hotTargets := stats["hot_targets"].([]string)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"server_names": hotTargets,
-			"version":      time.Now().Unix(),
-		})
-	})
-	mux.HandleFunc("/sync/target", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if !nc.IsConnected() {
+			http.Error(w, "nats disconnected", http.StatusServiceUnavailable)
 			return
 		}
-		var req struct {
-			ServerName string `json:"server_name"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "invalid request", http.StatusBadRequest)
-			return
-		}
-		if req.ServerName == "" {
-			http.Error(w, "missing server_name", http.StatusBadRequest)
-			return
-		}
-
-		target, ok := configStore.GetTarget(req.ServerName)
-		if !ok {
-			http.Error(w, "target not found", http.StatusNotFound)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"target":    target.Target,
-			"version":   target.Version,
-			"loaded_at": target.LoadedAt.Unix(),
-		})
+		w.WriteHeader(http.StatusOK)
 	})
 
 	server := &http.Server{
-		Addr:         httpAddr,
-		Handler:      mux,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              httpAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
-
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			fmt.Fprintf(os.Stderr, "control plane HTTP server error: %v\n", err)
+			klog.Errorf("control plane HTTP server: %v", err)
 		}
 	}()
 
-	fmt.Fprintf(os.Stderr, "Control plane listening on NATS: %s\n", natsURLs)
-	fmt.Fprintf(os.Stderr, "Control plane HTTP on %s\n", httpAddr)
-	fmt.Fprintf(os.Stderr, "Watching config directory: %s\n", configDir)
+	klog.Infof("control plane ready: nats=%s http=%s config-dir=%s", natsURLs, httpAddr, configDir)
 
-	// Wait for shutdown signal
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-
 	select {
 	case <-ctx.Done():
 	case s := <-sigCh:
-		fmt.Fprintf(os.Stderr, "Received signal %v, shutting down...\n", s)
+		klog.Infof("received signal %v, shutting down", s)
 	}
 
-	// Graceful shutdown
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	return server.Shutdown(shutdownCtx)
+}
 
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		return err
+// configPublisher tracks the last state published for each target so it can
+// publish only what changed and emit deletions for targets that disappeared.
+type configPublisher struct {
+	mu     sync.Mutex
+	js     jetstream.JetStream
+	dir    string
+	byName map[string][]byte // server name -> published YAML
+}
+
+// syncAll loads the directory and reconciles it with the published state.
+func (p *configPublisher) syncAll(ctx context.Context) error {
+	targets, err := config.LoadTargets(p.dir)
+	if err != nil {
+		if len(p.byName) == 0 {
+			return err
+		}
+		// A transient read error should not wipe published state.
+		return fmt.Errorf("load %s: %w", p.dir, err)
 	}
 
+	// The event payload is JSON so it matches the wire format the edges
+	// unmarshal. Edges re-serialize to YAML for their on-disk store.
+	next := make(map[string][]byte, len(targets))
+	for i := range targets {
+		data, err := json.Marshal(&targets[i])
+		if err != nil {
+			return fmt.Errorf("marshal target %s: %w", targets[i].ServerName, err)
+		}
+		for _, name := range parseServerNames(targets[i].ServerName) {
+			next[name] = data
+		}
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for name, data := range next {
+		if prev, ok := p.byName[name]; ok && string(prev) == string(data) {
+			continue // unchanged
+		}
+		if err := p.publish(ctx, cluster.TargetEvent{
+			ServerName: name,
+			Config:     json.RawMessage(data),
+			Timestamp:  time.Now().UTC(),
+		}); err != nil {
+			return err
+		}
+	}
+
+	for name := range p.byName {
+		if _, ok := next[name]; ok {
+			continue
+		}
+		if err := p.publish(ctx, cluster.TargetEvent{
+			ServerName: name,
+			Deleted:    true,
+			Timestamp:  time.Now().UTC(),
+		}); err != nil {
+			return err
+		}
+	}
+
+	p.byName = next
 	return nil
 }
 
-func watchConfigChanges(ctx context.Context, watcher *fsnotify.Watcher, configDir string, js jetstream.JetStream) {
-	if err := watcher.Add(configDir); err != nil {
-		fmt.Fprintf(os.Stderr, "warn: failed to watch config dir: %v\n", err)
+func (p *configPublisher) publish(ctx context.Context, event cluster.TargetEvent) error {
+	data, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("marshal event for %s: %w", event.ServerName, err)
+	}
+	if _, err := p.js.Publish(ctx, cluster.TargetSubject(event.ServerName), data); err != nil {
+		return fmt.Errorf("publish %s: %w", event.ServerName, err)
+	}
+	klog.V(2).Infof("published %s (deleted=%t)", event.ServerName, event.Deleted)
+	return nil
+}
+
+// watchConfigDir debounces filesystem events and reconciles the published
+// state whenever a config file changes.
+func watchConfigDir(ctx context.Context, watcher *fsnotify.Watcher, dir string, pub *configPublisher) {
+	if err := watcher.Add(dir); err != nil {
+		klog.Errorf("watch %s: %v", dir, err)
 		return
 	}
 
-	debounce := time.NewTimer(500 * time.Millisecond)
-	if !debounce.Stop() {
-		<-debounce.C
+	const debounce = 500 * time.Millisecond
+	timer := time.NewTimer(debounce)
+	if !timer.Stop() {
+		<-timer.C
 	}
+	dirty := false
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case event, ok := <-watcher.Events:
+		case ev, ok := <-watcher.Events:
 			if !ok {
 				return
 			}
-			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
-				if filepath.Ext(event.Name) == ".yaml" || filepath.Ext(event.Name) == ".yml" {
-					debounce.Reset(500 * time.Millisecond)
+			switch filepath.Ext(ev.Name) {
+			case ".yaml", ".yml":
+				if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
+					dirty = true
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					timer.Reset(debounce)
 				}
 			}
-		case <-watcher.Errors:
-			// Log error but continue watching
-		case <-debounce.C:
-			// Reload config and publish changes
-			// This is simplified - in production you'd want to diff and only publish changes
-			fmt.Fprintf(os.Stderr, "config changed, publishing updates...\n")
-			// TODO: implement diff and publish individual target updates
-		}
-	}
-}
-
-func pollConfigChanges(ctx context.Context, js jetstream.JetStream, configDir string) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			// TODO: implement periodic polling
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			klog.Errorf("fsnotify: %v", err)
+		case <-timer.C:
+			if !dirty {
+				continue
+			}
+			dirty = false
+			if err := pub.syncAll(ctx); err != nil {
+				klog.Errorf("config sync: %v", err)
+			} else {
+				klog.Infof("config synced from %s (%d targets)", dir, len(pub.byName))
+			}
 		}
 	}
 }

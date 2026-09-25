@@ -62,9 +62,11 @@ type WAFConfig struct {
 
 // ClusterConfig holds cluster feature configuration.
 type ClusterConfig struct {
-	Enabled       bool   `yaml:"enabled"`
-	ReplicaFactor int    `yaml:"replica_factor"` // replication factor for control plane
-	NATSURI       string `yaml:"nats_uri"`       // NATS JetStream URL(s) for config sync
+	Enabled bool `yaml:"enabled"`
+	// NATSURI points at the external NATS JetStream cluster holding target
+	// state. Empty means the edge seeds itself from the local config.d
+	// directory and runs no consumer.
+	NATSURI string `yaml:"nats_uri"`
 
 	// Lazy enables on-disk target storage backed by Pebble: cold configs stay
 	// off-RAM and a target's compiled handlers are materialized on first

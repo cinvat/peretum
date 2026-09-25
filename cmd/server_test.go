@@ -1631,8 +1631,8 @@ func TestLazyModeServesFromStore(t *testing.T) {
 	url := lazyEchoUpstream(t, "lazy-upstream")
 
 	// Target config with listen field that becomes the hostname key
-	targetYAML := fmt.Sprintf("name: svc.lazy\nlisten: svc.lazy\nupstreams:\n  - url: %s\nlocations:\n  - path: /\n", url)
-	if err := store.PutTargetByHost(ctx, "svc.lazy", "v1", []byte(targetYAML)); err != nil {
+	targetYAML := fmt.Sprintf("server_name: svc.lazy\nupstreams:\n  - url: %s\nlocations:\n  - path: /\n", url)
+	if err := store.PutTargetByHost(ctx, "svc.lazy", []byte(targetYAML)); err != nil {
 		t.Fatalf("PutTargetByHost: %v", err)
 	}
 
@@ -1645,53 +1645,6 @@ func TestLazyModeServesFromStore(t *testing.T) {
 	ps.router.ServeHTTP(rec, req)
 	if rec.Body.String() != "lazy-upstream" {
 		t.Fatalf("lazy serve body = %q", rec.Body.String())
-	}
-}
-
-func TestPullTargetsFromControlPlane(t *testing.T) {
-	url := lazyEchoUpstream(t, "snap-upstream")
-
-	snap := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"targets": map[string]interface{}{
-				"svc.snap": map[string]interface{}{
-					"target": map[string]interface{}{
-						"server_name": "svc.snap",
-						"upstreams":   []interface{}{map[string]interface{}{"url": url}},
-						"locations":   []interface{}{map[string]interface{}{"path": "/"}},
-					},
-					"version": "abc",
-				},
-			},
-		})
-	}))
-	defer snap.Close()
-
-	store := lazyTestStore(t)
-	ps := &proxyServer{
-		targetStore: store,
-		proxyCfg:    &config.ProxyConfig{Cluster: &config.ClusterConfig{NATSURI: snap.URL}},
-	}
-
-	if err := ps.ensureLazyStore(); err != nil {
-		t.Fatalf("ensureLazyStore: %v", err)
-	}
-	ctx := context.Background()
-	names, err := store.ListHosts(ctx)
-	if err != nil {
-		t.Fatalf("ListHosts: %v", err)
-	}
-	if len(names) != 1 || names["svc.snap"] != "abc" {
-		t.Fatalf("store after pull = %v", names)
-	}
-
-	ps.lazyLRU = cluster.NewLRUCache[string, *router.TargetConfigHandler](16)
-	ps.router = ps.buildHostRouter()
-	rec := httptest.NewRecorder()
-	ps.router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc.snap/", nil))
-	if rec.Body.String() != "snap-upstream" {
-		t.Fatalf("pulled target body = %q", rec.Body.String())
 	}
 }
 
@@ -1710,8 +1663,8 @@ func TestEnsureLazyStoreSeedsFromLocalTargets(t *testing.T) {
 		t.Fatalf("ensureLazyStore: %v", err)
 	}
 	names, _ := store.ListHosts(ctx)
-	if len(names) != 1 || names["t1"] == "" {
-		t.Fatalf("seeded store = %v", names)
+	if len(names) != 1 || names[0] != "t1" {
+		t.Fatalf("seeded store = %v, want [t1]", names)
 	}
 
 	// Already provisioned: a second run must leave the store alone even when
@@ -1742,20 +1695,20 @@ func TestLazyControlPlaneUpdateAndDelete(t *testing.T) {
 	ps.lazyLRU = cluster.NewLRUCache[string, *router.TargetConfigHandler](16)
 	ps.router = ps.buildHostRouter()
 
-	ps.applyTargetUpdate(&cluster.TargetConfigUpdate{
-		TargetName: "svc.upd",
-		Version:    "v2",
-		Config: map[string]interface{}{
-			"server_name": "svc.upd",
-			// listen field for hostname
-			"upstreams": []interface{}{map[string]interface{}{"url": url}},
-			"locations": []interface{}{map[string]interface{}{"path": "/"}},
-		},
-	})
+	if err := ps.applyTargetUpdate("svc.upd", &config.TargetConfig{
+		ServerName: "svc.upd",
+		Upstreams:  []config.UpstreamConfig{{URL: url}},
+		Locations:  []config.LocationConfig{{Path: "/"}},
+	}); err != nil {
+		t.Fatalf("applyTargetUpdate: %v", err)
+	}
 
-	ver, _, ok, err := store.GetTargetByHost(ctx, "svc.upd")
-	if err != nil || !ok || ver != "v2" {
-		t.Fatalf("store after update = ok %v version %q err %v", ok, ver, err)
+	data, ok, err := store.GetTargetByHost(ctx, "svc.upd")
+	if err != nil || !ok {
+		t.Fatalf("store after update = ok %v err %v", ok, err)
+	}
+	if !strings.Contains(string(data), "svc.upd") {
+		t.Fatalf("stored config = %q, want it to mention svc.upd", data)
 	}
 	if ps.lazyRouter.GetTargets()["svc.upd"] == nil {
 		t.Fatal("router missing target after update")
@@ -1768,10 +1721,209 @@ func TestLazyControlPlaneUpdateAndDelete(t *testing.T) {
 	}
 
 	ps.applyTargetDelete("svc.upd")
-	if _, _, ok, _ := store.GetTargetByHost(ctx, "svc.upd"); ok {
+	if _, ok, _ := store.GetTargetByHost(ctx, "svc.upd"); ok {
 		t.Fatal("target still in store after delete")
 	}
 	if ps.lazyRouter.GetTargets()["svc.upd"] != nil {
 		t.Fatal("target still routed after delete")
 	}
+}
+
+func TestApplyTargetEventUpsert(t *testing.T) {
+	ctx := context.Background()
+	store := lazyTestStore(t)
+	url := lazyEchoUpstream(t, "event-upstream")
+
+	ps := &proxyServer{targetStore: store}
+	ps.lazyLRU = cluster.NewLRUCache[string, *router.TargetConfigHandler](16)
+	ps.router = ps.buildHostRouter()
+
+	tc := config.TargetConfig{
+		ServerName: "svc.event",
+		Upstreams:  []config.UpstreamConfig{{URL: url}},
+		Locations:  []config.LocationConfig{{Path: "/"}},
+	}
+	// Events carry JSON, because that is what the control plane publishes.
+	raw, err := json.Marshal(tc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	// A non-delete event must take the upsert path.
+	if err := ps.applyTargetEvent(ctx, &cluster.TargetEvent{
+		ServerName: "svc.event",
+		Config:     raw,
+	}); err != nil {
+		t.Fatalf("applyTargetEvent upsert: %v", err)
+	}
+
+	if _, ok, _ := store.GetTargetByHost(ctx, "svc.event"); !ok {
+		t.Fatal("target not persisted after upsert event")
+	}
+
+	rec := httptest.NewRecorder()
+	ps.router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc.event/", nil))
+	if rec.Body.String() != "event-upstream" {
+		t.Fatalf("served body = %q", rec.Body.String())
+	}
+}
+
+func TestApplyTargetEventDelete(t *testing.T) {
+	ctx := context.Background()
+	store := lazyTestStore(t)
+
+	ps := &proxyServer{targetStore: store}
+	ps.lazyLRU = cluster.NewLRUCache[string, *router.TargetConfigHandler](16)
+	ps.router = ps.buildHostRouter()
+
+	if err := ps.applyTargetUpdate("svc.evdel", &config.TargetConfig{
+		ServerName: "svc.evdel",
+		Upstreams:  []config.UpstreamConfig{{URL: "http://127.0.0.1:1"}},
+		Locations:  []config.LocationConfig{{Path: "/"}},
+	}); err != nil {
+		t.Fatalf("applyTargetUpdate: %v", err)
+	}
+
+	// A delete event must remove the target even though it carries no config.
+	if err := ps.applyTargetEvent(ctx, &cluster.TargetEvent{
+		ServerName: "svc.evdel",
+		Deleted:    true,
+	}); err != nil {
+		t.Fatalf("applyTargetEvent delete: %v", err)
+	}
+
+	if _, ok, _ := store.GetTargetByHost(ctx, "svc.evdel"); ok {
+		t.Fatal("target still in store after delete event")
+	}
+}
+
+func TestApplyTargetEventErrors(t *testing.T) {
+	store := lazyTestStore(t)
+	ps := &proxyServer{targetStore: store}
+	ps.lazyLRU = cluster.NewLRUCache[string, *router.TargetConfigHandler](16)
+	ps.router = ps.buildHostRouter()
+
+	if err := ps.applyTargetEvent(context.Background(), nil); err == nil {
+		t.Error("nil event should be rejected")
+	}
+
+	if err := ps.applyTargetEvent(context.Background(), &cluster.TargetEvent{
+		ServerName: "bad",
+		Config:     []byte("{not json"),
+	}); err == nil {
+		t.Error("malformed config should be rejected")
+	}
+}
+
+func TestApplyTargetEventFallsBackToEventServerName(t *testing.T) {
+	// A config that omits server_name must still be stored under the name the
+	// event was published with, otherwise the edge would drop the target.
+	store := lazyTestStore(t)
+	ps := &proxyServer{targetStore: store}
+	ps.lazyLRU = cluster.NewLRUCache[string, *router.TargetConfigHandler](16)
+	ps.router = ps.buildHostRouter()
+
+	err := ps.applyTargetEvent(context.Background(), &cluster.TargetEvent{
+		ServerName: "fallback.host",
+		Config:     []byte(`{"upstreams":[{"url":"http://127.0.0.1:1"}],"locations":[{"path":"/"}]}`),
+	})
+	if err != nil {
+		t.Fatalf("applyTargetEvent: %v", err)
+	}
+
+	if _, ok, _ := store.GetTargetByHost(context.Background(), "fallback.host"); !ok {
+		t.Fatal("target was not stored under the event server name")
+	}
+}
+
+func TestApplyTargetUpdateMultipleServerNames(t *testing.T) {
+	// A target claiming several hostnames must be persisted and routed under
+	// every one of them.
+	ctx := context.Background()
+	store := lazyTestStore(t)
+	url := lazyEchoUpstream(t, "multi")
+
+	ps := &proxyServer{targetStore: store}
+	ps.lazyLRU = cluster.NewLRUCache[string, *router.TargetConfigHandler](16)
+	ps.router = ps.buildHostRouter()
+
+	if err := ps.applyTargetUpdate("a.multi", &config.TargetConfig{
+		ServerName: "a.multi,b.multi",
+		Upstreams:  []config.UpstreamConfig{{URL: url}},
+		Locations:  []config.LocationConfig{{Path: "/"}},
+	}); err != nil {
+		t.Fatalf("applyTargetUpdate: %v", err)
+	}
+
+	for _, host := range []string{"a.multi", "b.multi"} {
+		if _, ok, _ := store.GetTargetByHost(ctx, host); !ok {
+			t.Fatalf("host %q missing from store", host)
+		}
+		rec := httptest.NewRecorder()
+		ps.router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+host+"/", nil))
+		if rec.Body.String() != "multi" {
+			t.Fatalf("host %q served %q", host, rec.Body.String())
+		}
+	}
+}
+
+func TestApplyTargetUpdateNoServerName(t *testing.T) {
+	ps := &proxyServer{targetStore: lazyTestStore(t)}
+	ps.lazyLRU = cluster.NewLRUCache[string, *router.TargetConfigHandler](16)
+	ps.router = ps.buildHostRouter()
+
+	// Neither the config nor the event name yields a hostname.
+	if err := ps.applyTargetUpdate("", &config.TargetConfig{}); err == nil {
+		t.Error("target with no server_name should be rejected")
+	}
+}
+
+func TestBuildHealthCheckConfig(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		hc := buildHealthCheckConfig(&config.HealthCheckConfig{Path: "/healthz"})
+		if hc.Path != "/healthz" {
+			t.Fatalf("Path = %q", hc.Path)
+		}
+		if hc.Interval != 10*time.Second {
+			t.Fatalf("Interval = %v, want 10s", hc.Interval)
+		}
+		if hc.Timeout != 3*time.Second {
+			t.Fatalf("Timeout = %v, want 3s", hc.Timeout)
+		}
+		if hc.ExpectedStatus != 200 {
+			t.Fatalf("ExpectedStatus = %d, want the implicit default 200", hc.ExpectedStatus)
+		}
+	})
+
+	t.Run("explicit values", func(t *testing.T) {
+		hc := buildHealthCheckConfig(&config.HealthCheckConfig{
+			Path:           "/ready",
+			Interval:       "1m",
+			Timeout:        "5s",
+			ExpectedStatus: 204,
+			Headers:        map[string]string{"X-Probe": "1"},
+		})
+		if hc.Interval != time.Minute || hc.Timeout != 5*time.Second {
+			t.Fatalf("Interval/Timeout = %v/%v", hc.Interval, hc.Timeout)
+		}
+		if hc.ExpectedStatus != 204 {
+			t.Fatalf("ExpectedStatus = %d, want 204", hc.ExpectedStatus)
+		}
+		if hc.Headers["X-Probe"] != "1" {
+			t.Fatalf("Headers = %v", hc.Headers)
+		}
+	})
+
+	t.Run("invalid durations fall back to defaults", func(t *testing.T) {
+		// A typo in the duration must not produce a zero interval, which would
+		// spin the health-check ticker.
+		hc := buildHealthCheckConfig(&config.HealthCheckConfig{
+			Path:     "/healthz",
+			Interval: "not-a-duration",
+			Timeout:  "also-bad",
+		})
+		if hc.Interval != 10*time.Second || hc.Timeout != 3*time.Second {
+			t.Fatalf("Interval/Timeout = %v/%v, want the defaults", hc.Interval, hc.Timeout)
+		}
+	})
 }

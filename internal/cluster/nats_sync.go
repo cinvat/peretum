@@ -4,49 +4,72 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sync"
+	"os"
 	"time"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"k8s.io/klog/v2"
 )
 
-// NATSConfigSync handles config synchronization via NATS JetStream.
-type NATSConfigSync struct {
-	nc       *nats.Conn
-	js       jetstream.JetStream
-	mu       sync.Mutex
-	handlers map[string]func(ctx context.Context, msg jetstream.Msg) error
+// Subject layout. There is exactly one subject per target, so the stream
+// retains exactly one message per target: the current state.
+const (
+	// SubjectTargetPrefix is followed by the server name. A single message on
+	// this subject is the full current state of that target.
+	SubjectTargetPrefix = "config.target."
+)
+
+// TargetEvent is the single retained message per target.
+//
+// The stream keeps only the newest message per subject, so no version, hash or
+// sequence number is needed: whichever event is retained IS the current state.
+// Replaying the whole stream therefore yields the complete configuration.
+type TargetEvent struct {
+	// ServerName is the target's hostname key. It also forms the subject.
+	ServerName string `json:"server_name"`
+	// Deleted marks the target as removed. The message is retained so that
+	// edges joining later learn about the deletion instead of resurrecting it.
+	Deleted bool `json:"deleted,omitempty"`
+	// Config is the marshalled config.TargetConfig, absent when Deleted.
+	Config json.RawMessage `json:"config,omitempty"`
+	// Timestamp is informational only; ordering comes from the stream.
+	Timestamp time.Time `json:"timestamp"`
 }
 
-// StreamConfig holds NATS JetStream configuration.
+// StreamConfig holds the JetStream configuration for the config event store.
 type StreamConfig struct {
-	Name              string
-	Subjects          []string
-	Replicas          int
-	MaxMsgsPerSubject int
-	MaxAge            time.Duration
-	MaxBytes          int64
-	DiscardPolicy     jetstream.DiscardPolicy
-	StorageType       jetstream.StorageType
+	Name string
+	// Replicas is the number of stream replicas. 1 means single-node, which
+	// the NATS server rejects on a cluster; use 3 for a clustered deployment.
+	Replicas int
 }
 
-// DefaultStreamConfig returns a sensible default for config sync.
+// DefaultStreamConfig returns the config event-store defaults.
+//
+// The stream is an event store, not a log: MaxMsgsPerSubject=1 with
+// DiscardOld and LimitsPolicy keeps only the latest state per target, and the
+// size/age limits are unbounded so state is never silently expired. Edges get
+// their initial configuration by replaying the stream from the beginning.
 func DefaultStreamConfig() StreamConfig {
 	return StreamConfig{
-		Name:              "config-sync",
-		Subjects:          []string{"config.target.>", "config.snapshot", "config.hot-targets"},
-		Replicas:          1,
-		MaxMsgsPerSubject: 1, // Keep only latest per subject
-		MaxAge:            24 * time.Hour,
-		MaxBytes:          -1,
-		DiscardPolicy:     jetstream.DiscardOld,
-		StorageType:       jetstream.FileStorage,
+		Name:     "config-sync",
+		Replicas: 1,
 	}
 }
 
-// NewNATSConfigSync creates a new NATS config sync client.
-func NewNATSConfigSync(ctx context.Context, natsURL string, streamCfg StreamConfig) (*NATSConfigSync, error) {
+// NATSConfigSync consumes and publishes target state over a NATS JetStream
+// event store.
+type NATSConfigSync struct {
+	nc     *nats.Conn
+	js     jetstream.JetStream
+	stream string
+}
+
+// NewNATSConfigSync connects to NATS, ensures the config stream exists, and
+// returns a sync client. The stream is created if missing and reconciled if
+// its configuration has drifted.
+func NewNATSConfigSync(ctx context.Context, natsURL string, cfg StreamConfig) (*NATSConfigSync, error) {
 	nc, err := nats.Connect(natsURL)
 	if err != nil {
 		return nil, fmt.Errorf("connect to NATS: %w", err)
@@ -58,243 +81,191 @@ func NewNATSConfigSync(ctx context.Context, natsURL string, streamCfg StreamConf
 		return nil, fmt.Errorf("create jetstream context: %w", err)
 	}
 
-	// Create or update stream
-	_, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:              streamCfg.Name,
-		Subjects:          streamCfg.Subjects,
+	if _, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:              cfg.Name,
+		Subjects:          []string{SubjectTargetPrefix + ">"},
 		Retention:         jetstream.LimitsPolicy,
+		Storage:           jetstream.FileStorage,
 		MaxMsgs:           -1,
-		MaxAge:            streamCfg.MaxAge,
-		MaxBytes:          streamCfg.MaxBytes,
-		MaxMsgsPerSubject: int64(streamCfg.MaxMsgsPerSubject),
-		Discard:           streamCfg.DiscardPolicy,
-		Storage:           streamCfg.StorageType,
-		Replicas:          streamCfg.Replicas,
-	})
-	if err != nil {
+		MaxAge:            0, // never expire current state
+		MaxBytes:          -1,
+		MaxMsgsPerSubject: 1, // keep only the newest event per target
+		Discard:           jetstream.DiscardOld,
+		Replicas:          cfg.Replicas,
+	}); err != nil {
 		nc.Close()
-		return nil, fmt.Errorf("create stream: %w", err)
+		return nil, fmt.Errorf("create config stream %q: %w", cfg.Name, err)
 	}
 
-	return &NATSConfigSync{
-		nc:       nc,
-		js:       js,
-		handlers: make(map[string]func(ctx context.Context, msg jetstream.Msg) error),
-	}, nil
+	return &NATSConfigSync{nc: nc, js: js, stream: cfg.Name}, nil
 }
 
-// Subject constants
-const (
-	SubjectTargetUpdated = "config.target.updated."
-	SubjectTargetDeleted = "config.target.deleted."
-	SubjectSnapshot      = "config.snapshot"
-	SubjectHotTargets    = "config.hot-targets"
-)
-
-// TargetUpdateEvent represents a target config update.
-type TargetUpdateEvent struct {
-	ServerName string          `json:"server_name"`
-	Version    string          `json:"version"`
-	Config     json.RawMessage `json:"config"`
-	Timestamp  time.Time       `json:"timestamp"`
-}
-
-// TargetDeleteEvent represents a target deletion.
-type TargetDeleteEvent struct {
-	ServerName string    `json:"server_name"`
-	Timestamp  time.Time `json:"timestamp"`
-}
-
-// SnapshotRequest represents a request for full snapshot.
-type SnapshotRequest struct {
-	ReplyTo string `json:"reply_to"`
-}
-
-// SnapshotResponse represents a full config snapshot.
-type SnapshotResponse struct {
-	Targets map[string]TargetUpdateEvent `json:"targets"`
-	Version int64                        `json:"version"`
-}
-
-// HotTargetsResponse represents the list of hot targets.
-type HotTargetsResponse struct {
-	ServerNames []string `json:"server_names"`
-	Version     int64    `json:"version"`
-}
-
-// RegisterHandler registers a message handler for a subject.
-func (s *NATSConfigSync) RegisterHandler(subject string, handler func(ctx context.Context, msg jetstream.Msg) error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.handlers[subject] = handler
-}
-
-// Subscribe subscribes to target update/deleted events.
-func (s *NATSConfigSync) Subscribe(ctx context.Context) error {
-	s.mu.Lock()
-	handlers := make(map[string]func(ctx context.Context, msg jetstream.Msg) error)
-	for k, v := range s.handlers {
-		handlers[k] = v
-	}
-	s.mu.Unlock()
-
-	// Subscribe to target updates
-	if _, err := s.js.CreateConsumer(ctx, s.streamName(), jetstream.ConsumerConfig{
-		Durable:       "edge-updates",
-		FilterSubject: SubjectTargetUpdated + "*",
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		DeliverPolicy: jetstream.DeliverAllPolicy,
-		AckWait:       30 * time.Second,
-		MaxDeliver:    3,
-	}); err != nil && !isConsumerExists(err) {
-		return fmt.Errorf("create updates consumer: %w", err)
-	}
-
-	// Subscribe to target deletes
-	if _, err := s.js.CreateConsumer(ctx, s.streamName(), jetstream.ConsumerConfig{
-		Durable:       "edge-deletes",
-		FilterSubject: SubjectTargetDeleted + "*",
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		DeliverPolicy: jetstream.DeliverAllPolicy,
-		AckWait:       30 * time.Second,
-		MaxDeliver:    3,
-	}); err != nil && !isConsumerExists(err) {
-		return fmt.Errorf("create deletes consumer: %w", err)
-	}
-
-	return nil
-}
-
-// streamName returns the stream name (hardcoded for now, could be configurable)
-func (s *NATSConfigSync) streamName() string {
-	return "config-sync"
-}
-
-// StartConsuming starts consuming messages for target updates and deletes.
-func (s *NATSConfigSync) StartConsuming(ctx context.Context) error {
-	s.mu.Lock()
-	handlers := make(map[string]func(ctx context.Context, msg jetstream.Msg) error)
-	for k, v := range s.handlers {
-		handlers[k] = v
-	}
-	s.mu.Unlock()
-
-	// Consume target updates
-	updatesConsumer, err := s.js.Consumer(ctx, s.streamName(), "edge-updates")
-	if err != nil {
-		return fmt.Errorf("get updates consumer: %w", err)
-	}
-
-	_, err = updatesConsumer.Consume(func(msg jetstream.Msg) {
-		ctx := context.Background()
-		if handler, ok := handlers[SubjectTargetUpdated]; ok {
-			if err := handler(ctx, msg); err != nil {
-				msg.Nak()
-				return
-			}
-		}
-		msg.Ack()
+// EnsureStream makes sure the config stream exists. Control planes use this on
+// startup; they do not need to consume events.
+func EnsureStream(ctx context.Context, js jetstream.JetStream, cfg StreamConfig) error {
+	_, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:              cfg.Name,
+		Subjects:          []string{SubjectTargetPrefix + ">"},
+		Retention:         jetstream.LimitsPolicy,
+		Storage:           jetstream.FileStorage,
+		MaxMsgs:           -1,
+		MaxAge:            0,
+		MaxBytes:          -1,
+		MaxMsgsPerSubject: 1,
+		Discard:           jetstream.DiscardOld,
+		Replicas:          cfg.Replicas,
 	})
-	if err != nil {
-		return fmt.Errorf("consume updates: %w", err)
-	}
-
-	// Consume target deletes
-	deletesConsumer, err := s.js.Consumer(ctx, s.streamName(), "edge-deletes")
-	if err != nil {
-		return fmt.Errorf("get deletes consumer: %w", err)
-	}
-
-	_, err = deletesConsumer.Consume(func(msg jetstream.Msg) {
-		ctx := context.Background()
-		if handler, ok := handlers[SubjectTargetDeleted]; ok {
-			if err := handler(ctx, msg); err != nil {
-				msg.Nak()
-				return
-			}
-		}
-		msg.Ack()
-	})
-	if err != nil {
-		return fmt.Errorf("consume deletes: %w", err)
-	}
-
-	return nil
+	return err
 }
 
-// PublishTargetUpdate publishes a target update event.
-func (s *NATSConfigSync) PublishTargetUpdate(ctx context.Context, event TargetUpdateEvent) error {
-	subject := SubjectTargetUpdated + event.ServerName
+// TargetSubject returns the subject carrying a target's current state.
+func TargetSubject(serverName string) string {
+	return SubjectTargetPrefix + serverName
+}
+
+// PublishTarget writes a target's current state. Because the stream retains
+// only the newest message per subject, this is an idempotent "set".
+func (s *NATSConfigSync) PublishTarget(ctx context.Context, event TargetEvent) error {
+	if event.ServerName == "" {
+		return fmt.Errorf("publish target: empty server name")
+	}
+	if !event.Deleted && len(event.Config) == 0 {
+		return fmt.Errorf("publish target %q: no config", event.ServerName)
+	}
+	if event.Timestamp.IsZero() {
+		event.Timestamp = time.Now().UTC()
+	}
+
 	data, err := json.Marshal(event)
 	if err != nil {
-		return fmt.Errorf("marshal event: %w", err)
+		return fmt.Errorf("marshal event for %s: %w", event.ServerName, err)
 	}
-	if _, err := s.js.Publish(ctx, subject, data); err != nil {
-		return fmt.Errorf("publish event: %w", err)
-	}
-	return nil
-}
-
-// PublishTargetDelete publishes a target delete event.
-func (s *NATSConfigSync) PublishTargetDelete(ctx context.Context, event TargetDeleteEvent) error {
-	subject := SubjectTargetDeleted + event.ServerName
-	data, err := json.Marshal(event)
-	if err != nil {
-		return fmt.Errorf("marshal event: %w", err)
-	}
-	if _, err := s.js.Publish(ctx, subject, data); err != nil {
-		return fmt.Errorf("publish event: %w", err)
+	if _, err := s.js.Publish(ctx, TargetSubject(event.ServerName), data); err != nil {
+		return fmt.Errorf("publish event for %s: %w", event.ServerName, err)
 	}
 	return nil
 }
 
-// RequestSnapshot requests a full snapshot from the control plane.
-func (s *NATSConfigSync) RequestSnapshot(ctx context.Context) (*SnapshotResponse, error) {
-	replyTo := nats.NewInbox()
-	req := SnapshotRequest{ReplyTo: replyTo}
-	data, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
-	}
-
-	msg, err := s.nc.RequestWithContext(ctx, SubjectSnapshot, data)
-	if err != nil {
-		return nil, fmt.Errorf("request snapshot: %w", err)
-	}
-
-	var resp SnapshotResponse
-	if err := json.Unmarshal(msg.Data, &resp); err != nil {
-		return nil, fmt.Errorf("unmarshal response: %w", err)
-	}
-	return &resp, nil
+// PublishTargetDelete marks a target as removed.
+func (s *NATSConfigSync) PublishTargetDelete(ctx context.Context, serverName string) error {
+	return s.PublishTarget(ctx, TargetEvent{
+		ServerName: serverName,
+		Deleted:    true,
+		Timestamp:  time.Now().UTC(),
+	})
 }
 
-// RequestHotTargets requests the list of hot targets from control plane.
-func (s *NATSConfigSync) RequestHotTargets(ctx context.Context) (*HotTargetsResponse, error) {
-	replyTo := nats.NewInbox()
-	data, _ := json.Marshal(map[string]string{"reply_to": replyTo})
-
-	var msg *nats.Msg
-	var err error
-	msg, err = s.nc.RequestWithContext(ctx, SubjectHotTargets, data)
-	if err != nil {
-		return nil, fmt.Errorf("request hot targets: %w", err)
+// ConsumerName returns the durable consumer name for this edge node.
+//
+// Every edge needs its own durable consumer: a shared durable would
+// load-balance events between edges instead of delivering each event to all of
+// them. The name is derived from the node identity so that a restarted edge
+// resumes from its last acknowledged position.
+//
+// Set PERETUM_EDGE_ID to pin the identity explicitly, which is the usual
+// choice on Kubernetes (the StatefulSet pod name, for example).
+func ConsumerName() string {
+	id := os.Getenv("PERETUM_EDGE_ID")
+	if id == "" {
+		host, err := os.Hostname()
+		if err != nil {
+			klog.Warningf("config sync: cannot determine hostname, falling back to a random edge id: %v", err)
+		}
+		id = host
 	}
-
-	var resp HotTargetsResponse
-	if err := json.Unmarshal(msg.Data, &resp); err != nil {
-		return nil, fmt.Errorf("unmarshal response: %w", err)
+	if id == "" {
+		id = fmt.Sprintf("edge-%d", os.Getpid())
 	}
-	return &resp, nil
+	return "edge-" + sanitizeConsumerName(id)
 }
 
-// Close closes the NATS connection.
+// maxConsumerNameLen bounds the generated durable name. The NATS server caps
+// consumer names, and an over-long PERETUM_EDGE_ID would otherwise be rejected
+// at Consume time rather than at startup.
+const maxConsumerNameLen = 200
+
+// sanitizeConsumerName reduces an edge id to a durable consumer name the NATS
+// server accepts.
+//
+// The client-side validator only rejects "*>./ \t\r\n", but the *server* is
+// stricter and also rejects '.', which is the token separator in a NATS subject
+// (the consumer is addressed as stream.DURABLE.consumer). Hostnames very often
+// contain a dot — "host.example.com", "ip-10-0-1-2.ec2.internal" — so keeping
+// dots here made Consume fail outright on those hosts. Only [A-Za-z0-9_-] is
+// safe; everything else collapses to a dash.
+func sanitizeConsumerName(s string) string {
+	out := make([]rune, 0, len(s))
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			out = append(out, r)
+		default:
+			out = append(out, '-')
+		}
+	}
+	name := string(out)
+	if len(name) > maxConsumerNameLen {
+		name = name[:maxConsumerNameLen]
+	}
+	return name
+}
+
+// Consume delivers every target event to handle, starting from the beginning
+// of the stream so that a newly started edge builds the same state as every
+// other edge, then following live updates.
+//
+// Messages are acknowledged only after handle returns nil, so an edge that
+// crashes mid-apply replays the affected events on restart. Because events are
+// idempotent writes keyed by hostname, replay is safe.
+func (s *NATSConfigSync) Consume(ctx context.Context, handle func(context.Context, *TargetEvent) error) error {
+	if handle == nil {
+		return fmt.Errorf("consume: nil handler")
+	}
+
+	durable := ConsumerName()
+	cons, err := s.js.CreateOrUpdateConsumer(ctx, s.stream, jetstream.ConsumerConfig{
+		Durable:   durable,
+		AckPolicy: jetstream.AckExplicitPolicy,
+		// Replay the full retained state, then follow live updates. This is
+		// what makes the stream double as the initial snapshot.
+		DeliverPolicy: jetstream.DeliverAllPolicy,
+		AckWait:       30 * time.Second,
+		MaxDeliver:    5,
+		BackOff:       []time.Duration{time.Second, 5 * time.Second, 30 * time.Second},
+	})
+	if err != nil {
+		return fmt.Errorf("create consumer %q: %w", durable, err)
+	}
+
+	if _, err := cons.Consume(func(msg jetstream.Msg) {
+		var event TargetEvent
+		if err := json.Unmarshal(msg.Data(), &event); err != nil {
+			// A malformed event will never succeed; drop it rather than
+			// blocking the consumer on a poison message.
+			klog.Errorf("config sync: dropping malformed event: %v", err)
+			_ = msg.Term()
+			return
+		}
+		if err := handle(ctx, &event); err != nil {
+			klog.Errorf("config sync: apply %s: %v", event.ServerName, err)
+			_ = msg.Nak()
+			return
+		}
+		_ = msg.Ack()
+	}); err != nil {
+		return fmt.Errorf("consume %q: %w", durable, err)
+	}
+
+	return nil
+}
+
+// Close drains and closes the NATS connection.
 func (s *NATSConfigSync) Close() error {
-	s.nc.Drain()
+	if s == nil || s.nc == nil {
+		return nil
+	}
+	if err := s.nc.Drain(); err != nil {
+		s.nc.Close()
+	}
 	return nil
-}
-
-// Helper to check if consumer already exists
-func isConsumerExists(err error) bool {
-	return err != nil && (err.Error() == "consumer already exists" || err.Error() == "consumer already exists with different config")
 }

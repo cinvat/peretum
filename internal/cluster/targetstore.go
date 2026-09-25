@@ -3,22 +3,16 @@ package cluster
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/cockroachdb/pebble"
 )
 
 const (
-	hostKeyPrefix    = "h/" // hostname -> target YAML
-	versionKeyPrefix = "v/" // hostname -> version
-	globalKey        = "g"
+	hostKeyPrefix = "h/" // hostname -> target YAML
+	globalKey     = "g"  // global config JSON
 )
-
-// ErrNotFound is returned when a key is not found in the store.
-var ErrNotFound = errors.New("not found")
 
 // TargetStore is the local persistent store on an edge node. Target configs
 // live on disk (backed by Pebble) instead of RAM, which lets a single edge
@@ -28,12 +22,13 @@ var ErrNotFound = errors.New("not found")
 //
 // Key layout:
 //
-//	g/            -> global config JSON
-//	h/<hostname>  -> raw YAML of the target config (keyed by hostname)
-//	v/<hostname>  -> version string for the target
+//	g            -> global config JSON
+//	h/<hostname> -> raw YAML of the target config (keyed by hostname)
 //
-// The hostname is the key, enabling O(1) lookup by Host header.
-// A single target can be stored under multiple hostnames.
+// The hostname is the key, enabling O(1) lookup by Host header. A single
+// target can be stored under multiple hostnames. There are deliberately no
+// version or hash keys: the control plane publishes the current state of each
+// target, and the newest event wins.
 type TargetStore struct {
 	db *pebble.DB
 }
@@ -69,91 +64,51 @@ func (ts *TargetStore) GetGlobal(ctx context.Context) ([]byte, bool, error) {
 
 // PutTargetByHost stores a target config blob under a hostname key.
 // A target can be stored under multiple hostnames.
-func (ts *TargetStore) PutTargetByHost(ctx context.Context, hostname, version string, data []byte) error {
+func (ts *TargetStore) PutTargetByHost(ctx context.Context, hostname string, data []byte) error {
 	_ = ctx
-	b := ts.db.NewBatch()
-	defer b.Close()
-	if err := b.Set([]byte(hostKeyPrefix+hostname), data, pebble.NoSync); err != nil {
-		return err
-	}
-	if err := b.Set([]byte(versionKeyPrefix+hostname), []byte(version), pebble.NoSync); err != nil {
-		return err
-	}
-	return b.Commit(pebble.NoSync)
+	return ts.db.Set([]byte(hostKeyPrefix+hostname), data, pebble.NoSync)
 }
 
-// GetTargetByHost returns the version and YAML blob for a target by hostname.
-func (ts *TargetStore) GetTargetByHost(ctx context.Context, hostname string) (version string, data []byte, ok bool, err error) {
+// GetTargetByHost returns the YAML blob for a target by hostname.
+func (ts *TargetStore) GetTargetByHost(ctx context.Context, hostname string) (data []byte, ok bool, err error) {
 	_ = ctx
-
-	data, ok, err = ts.get(hostKeyPrefix + hostname)
-	if err != nil || !ok {
-		return "", data, ok, err
-	}
-	ver, _, verr := ts.get(versionKeyPrefix + hostname)
-	if verr != nil {
-		return "", data, ok, verr
-	}
-	return strings.TrimSpace(string(ver)), data, ok, nil
+	return ts.get(hostKeyPrefix + hostname)
 }
 
 // DeleteTargetByHost removes a target by hostname.
 func (ts *TargetStore) DeleteTargetByHost(ctx context.Context, hostname string) error {
 	_ = ctx
-	b := ts.db.NewBatch()
-	defer b.Close()
-	if err := b.Delete([]byte(hostKeyPrefix+hostname), pebble.NoSync); err != nil {
-		return err
-	}
-	if err := b.Delete([]byte(versionKeyPrefix+hostname), pebble.NoSync); err != nil {
-		return err
-	}
-	return b.Commit(pebble.NoSync)
+	return ts.db.Delete([]byte(hostKeyPrefix+hostname), pebble.NoSync)
 }
 
-// ListHosts returns every stored hostname mapped to its version.
-// Walks only the version keys for fast restart index rebuild.
-func (ts *TargetStore) ListHosts(ctx context.Context) (map[string]string, error) {
+// ListHosts returns every stored hostname.
+func (ts *TargetStore) ListHosts(ctx context.Context) ([]string, error) {
 	_ = ctx
-
 	iter, err := ts.db.NewIter(nil)
 	if err != nil {
 		return nil, err
 	}
 	defer iter.Close()
 
-	hosts := make(map[string]string)
-	prefix := []byte(versionKeyPrefix)
+	hosts := make([]string, 0, 1024)
+	prefix := []byte(hostKeyPrefix)
 	for valid := iter.SeekGE(prefix); valid; valid = iter.Next() {
 		key := iter.Key()
 		if !bytes.HasPrefix(key, prefix) {
 			break
 		}
-		host := string(key[len(prefix):])
-		hosts[host] = strings.TrimSpace(string(iter.Value()))
+		hosts = append(hosts, string(key[len(prefix):]))
 	}
 	return hosts, nil
 }
 
 // HostCount returns the number of stored hostnames.
 func (ts *TargetStore) HostCount(ctx context.Context) (int, error) {
-	_ = ctx
-
-	iter, err := ts.db.NewIter(nil)
+	hosts, err := ts.ListHosts(ctx)
 	if err != nil {
 		return 0, err
 	}
-	defer iter.Close()
-
-	count := 0
-	prefix := []byte(versionKeyPrefix)
-	for valid := iter.SeekGE(prefix); valid; valid = iter.Next() {
-		if !bytes.HasPrefix(iter.Key(), prefix) {
-			break
-		}
-		count++
-	}
-	return count, nil
+	return len(hosts), nil
 }
 
 // get retrieves a value by key. The returned slice is a copy safe to use after

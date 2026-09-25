@@ -5,11 +5,9 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -34,7 +32,6 @@ import (
 	"github.com/cinvat/peretum/internal/router"
 	"github.com/cinvat/peretum/plugins/base"
 	"github.com/cinvat/peretum/plugins/registry"
-	"github.com/nats-io/nats.go/jetstream"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/samber/lo"
 	"gopkg.in/yaml.v3"
@@ -53,10 +50,6 @@ type proxyServer struct {
 	maxBodySize int64
 	targets     []config.TargetConfig
 	pluginMgr   *manager.PluginManager
-
-	// CDN Scale features
-	configStore *cluster.ConfigVersionStore
-	metrics     *cluster.MetricsCollector
 
 	// Health checkers for each target (keyed by target name).
 	healthCheckers map[string]*loadbalancer.HealthChecker
@@ -109,17 +102,13 @@ func newProxyServer(proxyCfg *config.ProxyConfig, targets []config.TargetConfig,
 		pluginMgr:      pluginMgr,
 		maxBodySize:    maxBodySize,
 		healthCheckers: make(map[string]*loadbalancer.HealthChecker),
-		metrics:        &cluster.MetricsCollector{},
 	}
 
-	// Initialize cluster features (config versioning, metrics)
+	// Initialize the lazy on-disk target store when clustering is enabled.
 	if proxyCfg != nil && proxyCfg.Cluster != nil {
-		ps.configStore = cluster.NewConfigVersionStore(10000)
-		ps.metrics = &cluster.MetricsCollector{}
-
 		// Lazy mode: open the on-disk target store (Pebble) so configs can
-		// stay off-RAM. The store is seeded/pulled from the control plane or
-		// config.d before the first router build (see ensureLazyStore).
+		// stay off-RAM. The store is filled by the config event store, or
+		// seeded from config.d when no NATS URI is set (see ensureLazyStore).
 		if proxyCfg.Cluster.Lazy {
 			storeDir := proxyCfg.Cluster.DataDir
 			if storeDir == "" {
@@ -144,65 +133,20 @@ func newProxyServer(proxyCfg *config.ProxyConfig, targets []config.TargetConfig,
 		}
 	}
 
-	// Initialize NATS config sync if control plane is configured
+	// Initialize NATS config sync if a NATS cluster is configured.
 	if proxyCfg != nil && proxyCfg.Cluster != nil && proxyCfg.Cluster.NATSURI != "" {
-		streamCfg := cluster.DefaultStreamConfig()
-		natsSync, err := cluster.NewNATSConfigSync(context.Background(), proxyCfg.Cluster.NATSURI, streamCfg)
+		natsSync, err := cluster.NewNATSConfigSync(context.Background(), proxyCfg.Cluster.NATSURI, cluster.DefaultStreamConfig())
 		if err != nil {
 			klog.Errorf("failed to create NATS sync: %v", err)
 		} else {
 			ps.natsSync = natsSync
 
-			// Register handlers for target updates and deletes
-			natsSync.RegisterHandler(cluster.SubjectTargetUpdated, func(ctx context.Context, msg jetstream.Msg) error {
-				var event cluster.TargetUpdateEvent
-				if err := json.Unmarshal(msg.Data(), &event); err != nil {
-					klog.Errorf("unmarshal target update: %v", err)
-					return err
-				}
-				// Apply update
-				ps.applyTargetUpdate(&cluster.TargetConfigUpdate{
-					TargetName: event.ServerName,
-					Version:    event.Version,
-					Config:     map[string]interface{}{},
-				})
-				// Unmarshal the actual config
-				var targetConfig config.TargetConfig
-				if err := json.Unmarshal(event.Config, &targetConfig); err != nil {
-					return err
-				}
-				data, err := yaml.Marshal(targetConfig)
-				if err != nil {
-					return err
-				}
-				if err := ps.targetStore.PutTargetByHost(context.Background(), event.ServerName, event.Version, data); err != nil {
-					return err
-				}
-				ps.lazyLRU.Delete(event.ServerName)
-				if ps.lazyRouter != nil {
-					ps.lazyRouter.Upsert(event.ServerName, router.NewLazyHandler(event.ServerName, ps.lazyLRU, func(ctx context.Context) (*router.TargetConfigHandler, error) {
-						return ps.materializeTarget(ctx, event.ServerName)
-					}))
-				}
-				return nil
-			})
-
-			natsSync.RegisterHandler(cluster.SubjectTargetDeleted, func(ctx context.Context, msg jetstream.Msg) error {
-				var event cluster.TargetDeleteEvent
-				if err := json.Unmarshal(msg.Data(), &event); err != nil {
-					klog.Errorf("unmarshal target delete: %v", err)
-					return err
-				}
-				ps.applyTargetDelete(event.ServerName)
-				return nil
-			})
-
-			// Start consuming NATS messages
-			go func() {
-				if err := ps.natsSync.StartConsuming(context.Background()); err != nil {
-					klog.Errorf("NATS consumer error: %v", err)
-				}
-			}()
+			// Consume the config event store. Starting from the beginning of
+			// the stream gives this edge the current state of every target,
+			// then live updates keep it current.
+			if err := natsSync.Consume(context.Background(), ps.applyTargetEvent); err != nil {
+				klog.Errorf("failed to start NATS config consumer: %v", err)
+			}
 		}
 	}
 
@@ -364,14 +308,15 @@ func (ps *proxyServer) buildLazyHostRouter() *router.HostRouter {
 	if err != nil {
 		klog.Errorf("lazy router: list hosts from store: %v", err)
 	} else {
-		for hostname := range hosts {
+		for _, hostname := range hosts {
 			// In lazy mode, the router key is the hostname itself.
 			// The LazyHandler will use this same hostname to fetch from store.
-			targets[hostname] = router.NewLazyHandler(hostname, ps.lazyLRU, func(ctx context.Context) (*router.TargetConfigHandler, error) {
-				return ps.materializeTarget(ctx, hostname)
+			host := hostname
+			targets[host] = router.NewLazyHandler(host, ps.lazyLRU, func(ctx context.Context) (*router.TargetConfigHandler, error) {
+				return ps.materializeTarget(ctx, host)
 			})
-			if hostname == "_default" {
-				def = targets[hostname]
+			if host == router.DefaultHostname {
+				def = targets[host]
 			}
 		}
 	}
@@ -383,7 +328,7 @@ func (ps *proxyServer) buildLazyHostRouter() *router.HostRouter {
 // materializeTarget loads a target config from the Pebble store by hostname,
 // compiles its handlers, and returns the compiled TargetConfigHandler.
 func (ps *proxyServer) materializeTarget(ctx context.Context, hostname string) (*router.TargetConfigHandler, error) {
-	_, data, ok, err := ps.targetStore.GetTargetByHost(ctx, hostname)
+	data, ok, err := ps.targetStore.GetTargetByHost(ctx, hostname)
 	if err != nil {
 		return nil, err
 	}
@@ -407,9 +352,12 @@ func (ps *proxyServer) materializeTarget(ctx context.Context, hostname string) (
 }
 
 // ensureLazyStore provisions the Pebble store before the first router build.
-// A non-empty store is used as-is (fast restart). An empty store pulls the
-// full config snapshot from the control plane on first launch; if the control
-// plane is unreachable it falls back to seeding from the local config.d.
+// A non-empty store is used as-is (fast restart).
+//
+// When a NATS URI is configured the store is owned by the config event store:
+// the consumer started in newProxyServer replays the current state of every
+// target into the store, so there is nothing to seed here and no local
+// config.d is read. Without NATS the store is seeded from local config.d.
 func (ps *proxyServer) ensureLazyStore() error {
 	if ps.targetStore == nil {
 		return nil
@@ -425,12 +373,11 @@ func (ps *proxyServer) ensureLazyStore() error {
 		return nil
 	}
 
-	// First launch: if control_plane is configured, pull from it (required).
-	// Otherwise, seed from local config.d.
+	// With a NATS URI the store is filled by replaying the config event store
+	// in the consumer started above; local config.d is deliberately ignored so
+	// that the control plane stays the single source of truth.
 	if ps.proxyCfg != nil && ps.proxyCfg.Cluster != nil && ps.proxyCfg.Cluster.NATSURI != "" {
-		if err := ps.pullTargetsFromControlPlane(ctx); err != nil {
-			return fmt.Errorf("control plane pull failed: %w", err)
-		}
+		klog.Infof("config sourced from NATS event store at %s; skipping local config.d", ps.proxyCfg.Cluster.NATSURI)
 		return nil
 	}
 
@@ -443,13 +390,9 @@ func (ps *proxyServer) ensureLazyStore() error {
 			klog.Errorf("seed target %s: %v", t.ServerName, err)
 			continue
 		}
-		sum := sha256.Sum256(data)
-		version := hex.EncodeToString(sum[:])
-
 		// Determine hostnames from server_name field (comma-separated)
-		hostnames := parseServerNames(t.ServerName)
-		for _, hostname := range hostnames {
-			if err := ps.targetStore.PutTargetByHost(ctx, hostname, version, data); err != nil {
+		for _, hostname := range parseServerNames(t.ServerName) {
+			if err := ps.targetStore.PutTargetByHost(ctx, hostname, data); err != nil {
 				klog.Errorf("seed target %s for hostname %s: %v", t.ServerName, hostname, err)
 			}
 		}
@@ -481,97 +424,53 @@ func parseServerNames(serverName string) []string {
 	return hosts
 }
 
-// pullTargetsFromControlPlane fetches the full config snapshot from the leader
-// (/sync) and persists it to the local store.
-func (ps *proxyServer) pullTargetsFromControlPlane(ctx context.Context) error {
-	addr := ps.proxyCfg.Cluster.NATSURI
-	base := addr
-	if !strings.HasPrefix(base, "http") {
-		base = "http://" + base
+// applyTargetEvent applies a single target event from the config event store.
+func (ps *proxyServer) applyTargetEvent(ctx context.Context, event *cluster.TargetEvent) error {
+	if event == nil {
+		return errors.New("nil event")
 	}
-	url := strings.TrimRight(base, "/") + "/sync"
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return fmt.Errorf("control plane pull: %w", err)
+	if event.Deleted {
+		ps.applyTargetDelete(event.ServerName)
+		return nil
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("control plane pull: %w", err)
+	var targetConfig config.TargetConfig
+	if err := json.Unmarshal(event.Config, &targetConfig); err != nil {
+		return fmt.Errorf("unmarshal config for %s: %w", event.ServerName, err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("control plane pull: %s", resp.Status)
-	}
-
-	var syncResp struct {
-		Targets map[string]struct {
-			Target  *config.TargetConfig `json:"target"`
-			Version string               `json:"version"`
-		} `json:"targets"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&syncResp); err != nil {
-		return fmt.Errorf("control plane pull: decode: %w", err)
-	}
-
-	for name, entry := range syncResp.Targets {
-		if entry.Target == nil {
-			continue
-		}
-		data, err := yaml.Marshal(entry.Target)
-		if err != nil {
-			return fmt.Errorf("control plane pull: marshal %s: %w", name, err)
-		}
-		version := entry.Version
-		if version == "" {
-			sum := sha256.Sum256(data)
-			version = hex.EncodeToString(sum[:])
-		}
-
-		// Store under hostname(s) from server_name field
-		klog.Infof("pull: name=%s, target.ServerName=%s", name, entry.Target.ServerName)
-		hostnames := parseServerNames(entry.Target.ServerName)
-		for _, hostname := range hostnames {
-			klog.Infof("pull: storing hostname=%s", hostname)
-			if err := ps.targetStore.PutTargetByHost(ctx, hostname, version, data); err != nil {
-				return fmt.Errorf("control plane pull: store %s: %w", hostname, err)
-			}
-		}
-	}
-	klog.Infof("pulled %d targets from control plane", len(syncResp.Targets))
-	return nil
+	return ps.applyTargetUpdate(event.ServerName, &targetConfig)
 }
 
 // applyTargetUpdate persists a target config update from the control plane
-// and refreshes the lazy router to serve it on the next request.
-func (ps *proxyServer) applyTargetUpdate(update *cluster.TargetConfigUpdate) {
-	if update == nil {
-		return
+// and refreshes the lazy router so the next request serves the new config.
+// The config is stored under every hostname it claims via server_name, since
+// incoming Host lookups are hostname-keyed.
+func (ps *proxyServer) applyTargetUpdate(serverName string, targetConfig *config.TargetConfig) error {
+	if targetConfig == nil {
+		return errors.New("nil target config")
 	}
-	klog.Infof("Received target config update from control plane: %s", update.TargetName)
-	ps.RecordTenantReload()
+	klog.Infof("Received target config update from control plane: %s", serverName)
 
 	if ps.targetStore == nil {
-		return
+		return errors.New("target store not initialized")
 	}
 
-	data, err := yaml.Marshal(update.Config)
+	// Fall back to the event's subject name when the config omits server_name.
+	names := parseServerNames(targetConfig.ServerName)
+	if len(names) == 0 {
+		names = parseServerNames(serverName)
+	}
+	if len(names) == 0 {
+		return fmt.Errorf("target %q has no server_name", serverName)
+	}
+
+	data, err := yaml.Marshal(targetConfig)
 	if err != nil {
-		klog.Errorf("store target update %s: marshal: %v", update.TargetName, err)
-		return
+		return fmt.Errorf("marshal target %s: %w", serverName, err)
 	}
 
-	// Determine hostnames from the updated config's server_name field
-	targetConfig := update.Config
-	if targetConfig == nil {
-		return
-	}
-	hostnames := parseServerNames(targetConfig["server_name"].(string))
-	for _, hostname := range hostnames {
-		if err := ps.targetStore.PutTargetByHost(context.Background(), hostname, update.Version, data); err != nil {
-			klog.Errorf("store target update %s for hostname %s: %v", update.TargetName, hostname, err)
-			return
+	for _, hostname := range names {
+		if err := ps.targetStore.PutTargetByHost(context.Background(), hostname, data); err != nil {
+			return fmt.Errorf("store target %s for hostname %s: %w", serverName, hostname, err)
 		}
 
 		// Invalidate any compiled handler and re-point the router at a fresh stub.
@@ -582,6 +481,7 @@ func (ps *proxyServer) applyTargetUpdate(update *cluster.TargetConfigUpdate) {
 			}))
 		}
 	}
+	return nil
 }
 
 // applyTargetDelete removes a target from the store and the lazy router.
@@ -769,12 +669,6 @@ func (ps *proxyServer) reload() error {
 	return ps.reloadFrom(cfgPath, targetsDir)
 }
 
-func (ps *proxyServer) RecordTenantReload() {
-	if ps.metrics != nil {
-		ps.metrics.RecordTargetChange(true, false)
-	}
-}
-
 func (ps *proxyServer) reloadFrom(cfgPath, targetsDir string) error {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
@@ -785,47 +679,18 @@ func (ps *proxyServer) reloadFrom(cfgPath, targetsDir string) error {
 	// Load global config
 	proxyCfg, err := config.LoadProxy(cfgPath)
 	if err != nil {
-		ps.metrics.RecordReload(false, time.Since(startTime), err)
 		return fmt.Errorf("proxy config: %w", err)
 	}
 
-	// Load targets with versioning
 	targets, err := config.LoadTargets(targetsDir)
 	if err != nil {
-		ps.metrics.RecordReload(false, time.Since(startTime), err)
 		return fmt.Errorf("targets: %w", err)
 	}
 
-	// Check if global config changed
-	globalChanged := false
-	if ps.configStore != nil {
-		globalChanged, err = ps.configStore.LoadGlobalConfig(cfgPath)
-		if err != nil {
-			ps.metrics.RecordReload(false, time.Since(startTime), err)
-			return err
-		}
-	}
-
-	// Load targets with versioning (delta reload)
-	var changedTargets []string
-	if ps.configStore != nil {
-		_, changedTargets, err = ps.configStore.LoadTargets(targetsDir)
-		if err != nil {
-			ps.metrics.RecordReload(false, time.Since(startTime), err)
-			return err
-		}
-
-		// Record metrics
-		for _, ct := range changedTargets {
-			if strings.HasSuffix(ct, " (deleted)") {
-				ps.metrics.RecordTargetChange(false, true)
-			} else {
-				ps.metrics.RecordTargetChange(true, false)
-			}
-		}
-	}
-
-	isDelta := len(changedTargets) > 0 && !globalChanged && ps.configStore != nil
+	// Diff against the previously loaded targets. This only makes the reload
+	// log informative; the router is always rebuilt in full.
+	changedTargets := changedTargetNames(ps.targets, targets)
+	isDelta := len(changedTargets) > 0 && len(changedTargets) < len(targets)
 
 	ps.targets = targets
 	ps.proxyCfg = proxyCfg
@@ -863,7 +728,6 @@ func (ps *proxyServer) reloadFrom(cfgPath, targetsDir string) error {
 	}
 
 	duration := time.Since(startTime)
-	ps.metrics.RecordReload(len(changedTargets) > 0 && !globalChanged, duration, nil)
 
 	if isDelta {
 		klog.Infof("delta reload completed in %v: %d targets changed", duration, len(changedTargets))
@@ -890,6 +754,44 @@ func (ps *proxyServer) reloadFrom(cfgPath, targetsDir string) error {
 	}
 
 	return nil
+}
+
+// changedTargetNames returns the server names whose serialized config differs
+// between prev and next, marking removed targets with a " (deleted)" suffix.
+// It exists purely to make reload logs and metrics informative; the router is
+// always rebuilt from scratch.
+func changedTargetNames(prev, next []config.TargetConfig) []string {
+	serialize := func(in []config.TargetConfig) map[string]string {
+		out := make(map[string]string, len(in))
+		for i := range in {
+			if data, err := yaml.Marshal(&in[i]); err == nil {
+				out[in[i].ServerName] = string(data)
+			}
+		}
+		return out
+	}
+
+	prevByName := serialize(prev)
+	nextByName := make(map[string]struct{}, len(next))
+
+	var changed []string
+	for i := range next {
+		name := next[i].ServerName
+		nextByName[name] = struct{}{}
+		data, err := yaml.Marshal(&next[i])
+		if err != nil {
+			continue
+		}
+		if prevByName[name] != string(data) {
+			changed = append(changed, name)
+		}
+	}
+	for name := range prevByName {
+		if _, ok := nextByName[name]; !ok {
+			changed = append(changed, name+" (deleted)")
+		}
+	}
+	return changed
 }
 
 // tcpServers returns every active TCP http.Server, falling back to the
@@ -1213,8 +1115,8 @@ func run(ctx context.Context, cfgPath, targetsDir string) error {
 		return fmt.Errorf("failed to load proxy config: %w", err)
 	}
 
-	// For lazy edges with control_plane, skip loading local targets;
-	// they will pull from the control plane on first launch.
+	// A lazy edge configured with a NATS URI takes its state from the
+	// JetStream replay instead of the local config.d directory.
 	var targets []config.TargetConfig
 	skipLocalTargets := proxyCfg != nil && proxyCfg.Cluster != nil && proxyCfg.Cluster.Lazy && proxyCfg.Cluster.NATSURI != ""
 	if !skipLocalTargets {
