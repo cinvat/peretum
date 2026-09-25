@@ -245,3 +245,148 @@ func TestHostRouterUpsertAndRemove(t *testing.T) {
 		t.Fatalf("after remove status = %d, want 404", rec2.Code)
 	}
 }
+
+func TestLazyHandlerFollowerSeesLeaderFailure(t *testing.T) {
+	lru := cluster.NewLRUCache[string, *TargetConfigHandler](4)
+	release := make(chan struct{})
+	started := make(chan struct{})
+	var once sync.Once
+
+	lh := NewLazyHandler("svc-f", lru, func(ctx context.Context) (*TargetConfigHandler, error) {
+		once.Do(func() { close(started) })
+		<-release
+		return nil, fmt.Errorf("load boom")
+	})
+
+	// The leader blocks inside load until we release it.
+	leaderDone := make(chan int, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		lh.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-f/", nil))
+		leaderDone <- rec.Code
+	}()
+	<-started
+
+	// A follower that arrives while the leader is still in flight must not
+	// start a second load; it should observe the failure and get a 502.
+	followerDone := make(chan int, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		lh.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-f/", nil))
+		followerDone <- rec.Code
+	}()
+
+	close(release)
+	if code := <-leaderDone; code != http.StatusBadGateway {
+		t.Fatalf("leader status = %d, want 502", code)
+	}
+	if code := <-followerDone; code != http.StatusBadGateway {
+		t.Fatalf("follower status = %d, want 502", code)
+	}
+}
+
+func TestLazyHandlerFollowerCancelsWhileWaiting(t *testing.T) {
+	lru := cluster.NewLRUCache[string, *TargetConfigHandler](4)
+	started := make(chan struct{})
+	var once sync.Once
+	release := make(chan struct{})
+	defer close(release)
+
+	lh := NewLazyHandler("svc-g", lru, func(ctx context.Context) (*TargetConfigHandler, error) {
+		once.Do(func() { close(started) })
+		<-release
+		return lazyEchoHandler(t, "late-body"), nil
+	})
+
+	go func() {
+		rec := httptest.NewRecorder()
+		lh.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-g/", nil))
+	}()
+	<-started
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	canceled := make(chan int, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "http://svc-g/", nil).WithContext(ctx)
+		lh.ServeHTTP(rec, req)
+		canceled <- rec.Code
+	}()
+
+	// Cancel while the leader is still materializing; the follower must give
+	// up immediately rather than waiting for the load to finish.
+	cancel()
+	if code := <-canceled; code != http.StatusRequestTimeout {
+		t.Fatalf("canceled follower status = %d, want 408", code)
+	}
+}
+
+func TestLazyHandlerNilHandlerFailsClosed(t *testing.T) {
+	// A nil target store is the closest proxy for "nothing to load"; the
+	// handler must fail closed with a gateway error rather than panic.
+	lru := cluster.NewLRUCache[string, *TargetConfigHandler](4)
+	lh := NewLazyHandler("svc-h", lru, func(ctx context.Context) (*TargetConfigHandler, error) {
+		return nil, nil // no error, but no handler either
+	})
+
+	rec := httptest.NewRecorder()
+	lh.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-h/", nil))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+}
+
+func TestLazyHandlerLoadSurvivesLeaderDisconnect(t *testing.T) {
+	// A client that disconnects must not destroy the materialization for the
+	// followers that joined the same flight. The load runs on a context
+	// detached from the request, so it completes and populates the LRU; the
+	// leader just never gets to read the response.
+	lru := cluster.NewLRUCache[string, *TargetConfigHandler](4)
+	loadStarted := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+
+	lh := NewLazyHandler("svc-detach", lru, func(ctx context.Context) (*TargetConfigHandler, error) {
+		once.Do(func() { close(loadStarted) })
+		<-release
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return lazyEchoHandler(t, "detached"), nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	leaderRec := httptest.NewRecorder()
+	leaderDone := make(chan int, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "http://svc-detach/", nil).WithContext(ctx)
+		lh.ServeHTTP(leaderRec, req)
+		leaderDone <- leaderRec.Code
+	}()
+	<-loadStarted
+
+	followerRec := httptest.NewRecorder()
+	followerDone := make(chan int, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "http://svc-detach/", nil)
+		lh.ServeHTTP(followerRec, req)
+		followerDone <- followerRec.Code
+	}()
+
+	// The leader's client goes away mid-load.
+	cancel()
+	close(release)
+
+	if code := <-leaderDone; code != http.StatusRequestTimeout {
+		t.Fatalf("leader status = %d, want 408", code)
+	}
+
+	// The follower must still be served: the load survived the disconnect.
+	if code := <-followerDone; code != http.StatusOK {
+		t.Fatalf("follower status = %d, want 200 (body %q)", code, followerRec.Body.String())
+	}
+	if followerRec.Body.String() != "detached" {
+		t.Fatalf("follower body = %q, want detached", followerRec.Body.String())
+	}
+}
