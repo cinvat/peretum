@@ -20,122 +20,145 @@ var errMaterializeFailed = errors.New("target config materialization failed")
 // config cannot pin the flight open indefinitely.
 const materializeTimeout = 30 * time.Second
 
-// LazyHandler serves a single host whose compiled handler lives off-RAM until
-// first use. On the first request it materializes the handler via load(), caches
-// it in the shared LRU (bounded), and LRU eviction pushes cold configs back to
-// disk. Parallel first-requests for the same host are coalesced onto a single
-// materialization.
-type LazyHandler struct {
-	key  string
-	lru  *cluster.LRUCache[string, *TargetConfigHandler]
-	load func(context.Context) (*TargetConfigHandler, error)
+// loadFunc compiles a target's handlers. It is called with a context that is
+// canceled when the request that triggered it is canceled.
+type loadFunc func(context.Context) (*TargetConfigHandler, error)
 
-	// flights coalesces materializations for this key. It is shared across
-	// every LazyHandler serving the same host so that a store-backed router can
-	// build a throwaway handler per request without losing coalescing.
-	flights *flightTable
-}
-
-// loadCall is a single materialization that other requests can join.
-type loadCall struct {
-	done chan struct{}
-}
-
-// flightTable tracks in-flight materializations keyed by hostname.
+// FlightTable owns the single-flight protocol for materialized targets: it holds
+// the compiled-handler cache and the set of loads currently running.
 //
-// It is shared by every LazyHandler in the process. That matters for a
-// store-backed router, which cannot keep one handler per target in memory
-// without giving up the 10M+ target goal: it creates a LazyHandler on demand
-// for each request instead. If the in-flight state lived on the handler, every
-// concurrent request for the same cold host would start its own load and the
-// coalescing guarantee would be lost. Sharing the table keeps it while the
-// handler itself stays a throwaway.
+// A store-backed router cannot keep one LazyHandler per target in memory without
+// giving up the 10M+ target goal, so it builds a throwaway handler per request
+// instead. If in-flight state lived on the handler, every concurrent request for
+// the same cold host would start its own load. Sharing one table across all
+// hosts keeps the coalescing guarantee while the handler itself stays
+// disposable.
 //
-// Entries exist only while a load is actually running, so the table is bounded
-// by concurrent cold requests rather than by the number of targets.
-type flightTable struct {
+// Flight entries exist only while a load is actually running, so the table is
+// bounded by concurrent cold requests rather than by the number of targets.
+type FlightTable struct {
 	lru *cluster.LRUCache[string, *TargetConfigHandler]
 
 	mu    sync.Mutex
-	calls map[string]*loadCall
+	calls map[string]chan struct{}
 }
 
-// NewFlightTable returns a flight table for handlers that share lru. Pass the
-// same table to every NewSharedLazyHandler for a given host so concurrent
-// requests for that host coalesce onto one materialization.
-func NewFlightTable(lru *cluster.LRUCache[string, *TargetConfigHandler]) *flightTable {
-	return newFlightTable(lru)
+// NewFlightTable returns a table caching compiled handlers in lru. Handlers that
+// may serve the same hostname must be built with the same table, or they will
+// each run their own load.
+func NewFlightTable(lru *cluster.LRUCache[string, *TargetConfigHandler]) *FlightTable {
+	return &FlightTable{lru: lru, calls: make(map[string]chan struct{})}
 }
 
-func newFlightTable(lru *cluster.LRUCache[string, *TargetConfigHandler]) *flightTable {
-	return &flightTable{lru: lru, calls: make(map[string]*loadCall)}
+// cached returns the resident handler for key, if any.
+func (ft *FlightTable) cached(key string) (*TargetConfigHandler, bool) {
+	return ft.lru.Get(key)
 }
 
-// acquire reports a cached handler for key, or else claims the flight for it.
-// The LRU check happens under the same lock as the claim so that "nothing
-// cached" and "no load in progress" cannot disagree, which would let a second
-// caller start a redundant load.
-func (ft *flightTable) acquire(key string) (tch *TargetConfigHandler, call *loadCall, owner bool) {
+// materialize returns the handler for key, running load at most once across
+// concurrent callers. Followers wait for the load that is already running and
+// then read what it published to the cache.
+//
+// The lock is only held for short critical sections, never across load, which
+// reads from disk and compiles a handler chain and can be slow. Holding it across
+// the load would serialize every request for the host and stop followers from
+// reacting to their own cancellation.
+func (ft *FlightTable) materialize(ctx context.Context, key string, load loadFunc) (*TargetConfigHandler, error) {
 	ft.mu.Lock()
-	defer ft.mu.Unlock()
-
-	if cached, ok := ft.lru.Get(key); ok {
-		return cached, nil, false
+	// The cache check and the flight claim share one lock, so "nothing cached"
+	// and "no load in progress" cannot disagree and start two loads.
+	if cached, ok := ft.cached(key); ok {
+		ft.mu.Unlock()
+		return cached, nil
 	}
-	if existing, ok := ft.calls[key]; ok {
-		return nil, existing, false
+	if call, running := ft.calls[key]; running {
+		ft.mu.Unlock()
+		select {
+		case <-call:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		// The owner publishes to the cache before waking followers, so a hit
+		// here means the load succeeded.
+		if cached, ok := ft.cached(key); ok {
+			return cached, nil
+		}
+		return nil, errMaterializeFailed
 	}
-	call = &loadCall{done: make(chan struct{})}
+	call := make(chan struct{})
 	ft.calls[key] = call
-	return nil, call, true
-}
+	ft.mu.Unlock()
 
-// release publishes tch into the LRU (when materialization succeeded), clears
-// the flight, and wakes every follower.
-func (ft *flightTable) release(key string, call *loadCall, tch *TargetConfigHandler, ok bool) {
+	// Detach the load from the initiating request's cancellation. Otherwise a
+	// client that disconnects mid-load aborts the work for every follower that
+	// joined this flight, and all of them fail even though their own requests
+	// are still live. The load still bounds itself with a timeout.
+	loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), materializeTimeout)
+	tch, err := runLoad(loadCtx, key, load)
+	cancel()
+
 	ft.mu.Lock()
-	defer ft.mu.Unlock()
-	if ok && tch != nil {
+	if err == nil && tch != nil {
 		ft.lru.Put(key, tch)
 	}
-	if current, exists := ft.calls[key]; exists && current == call {
-		delete(ft.calls, key)
-	}
-	close(call.done)
+	delete(ft.calls, key)
+	close(call)
+	ft.mu.Unlock()
+
+	return tch, err
 }
 
-// NewLazyHandler creates a lazily-materializing handler for key. The shared
-// lru keeps compiled handlers resident across hosts up to its capacity.
-// load is called with a context that is canceled when the request is canceled.
-func NewLazyHandler(key string, lru *cluster.LRUCache[string, *TargetConfigHandler], load func(context.Context) (*TargetConfigHandler, error)) *LazyHandler {
-	return &LazyHandler{
-		key:     key,
-		lru:     lru,
-		load:    load,
-		flights: newFlightTable(lru),
-	}
+// runLoad invokes load with the given key for error messages. A panic becomes an
+// error, so that a bad config fails one request with a gateway error instead of
+// taking down the server, and so that followers are released rather than hanging
+// on a flight whose owner never returns.
+func runLoad(ctx context.Context, key string, load loadFunc) (tch *TargetConfigHandler, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			tch, err = nil, fmt.Errorf("materialize %q: panic: %v", key, r)
+		}
+	}()
+
+	return load(ctx)
 }
 
-// NewSharedLazyHandler is NewLazyHandler with an explicit shared flight table.
-// Handlers for the same key must be built with the same table and the same lru
-// for coalescing to work; see flightTable.
-func NewSharedLazyHandler(key string, lru *cluster.LRUCache[string, *TargetConfigHandler], load func(context.Context) (*TargetConfigHandler, error), flights *flightTable) *LazyHandler {
+// LazyHandler serves a single host whose compiled handler lives off-RAM until
+// first use. On the first request it materializes the handler via load and caches
+// it in the shared LRU; LRU eviction pushes cold configs back to disk.
+//
+// A LazyHandler holds no state of its own, so building one per request is cheap.
+// The state that matters -- the cache and in-flight loads -- lives in flights,
+// which all handlers for the same host must share.
+type LazyHandler struct {
+	key     string
+	flights *FlightTable
+	load    loadFunc
+}
+
+// NewLazyHandler returns a lazily-materializing handler for key. The shared lru
+// keeps compiled handlers resident across hosts up to its capacity. Handlers that
+// may serve the same hostname concurrently must be built with the same flights
+// table so their first requests coalesce; pass nil for a private table when no
+// other handler serves that host.
+func NewLazyHandler(key string, lru *cluster.LRUCache[string, *TargetConfigHandler], load loadFunc, flights *FlightTable) *LazyHandler {
 	if flights == nil {
-		return NewLazyHandler(key, lru, load)
+		flights = NewFlightTable(lru)
 	}
-	return &LazyHandler{key: key, lru: lru, load: load, flights: flights}
+	return &LazyHandler{key: key, flights: flights, load: load}
 }
 
 func (lh *LazyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Fast path: already materialized in the shared LRU.
-	if tch, ok := lh.lru.Get(lh.key); ok {
+	// Fast path: a resident handler needs neither the flight lock nor a load.
+	// This is the common case for a hot target, so it is worth reading the
+	// cache directly rather than going through materialize.
+	if tch, ok := lh.flights.cached(lh.key); ok {
 		tch.ServeHTTP(w, r)
 		return
 	}
 
-	tch, err := lh.loadOnce(ctx)
+	tch, err := lh.flights.materialize(ctx, lh.key, lh.load)
 	if err != nil || tch == nil {
 		if ctx.Err() != nil {
 			http.Error(w, "request canceled", http.StatusRequestTimeout)
@@ -152,63 +175,4 @@ func (lh *LazyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tch.ServeHTTP(w, r)
-}
-
-// loadOnce returns the compiled handler for lh.key, running lh.load at most
-// once across concurrent callers. Followers wait on the in-flight call and then
-// read the result from the LRU.
-//
-// The flight lock is only ever held for short critical sections, never across
-// lh.load, which reads from disk and compiles the handler chain and can be
-// slow. Holding it across the load would serialize every request for the host
-// and stop followers from reacting to their own cancellation. The lock order is
-// always flights.mu before lru.mu; the LRU has its own lock and never calls
-// back into this handler.
-func (lh *LazyHandler) loadOnce(ctx context.Context) (*TargetConfigHandler, error) {
-	// A cached handler or an existing flight both come back from one atomic
-	// check, so two callers can never both decide they own the load.
-	cached, call, owner := lh.flights.acquire(lh.key)
-	if cached != nil {
-		return cached, nil
-	}
-
-	if !owner {
-		select {
-		case <-call.done:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-		// The leader publishes to the LRU before clearing the flight, so a
-		// hit here means the load succeeded.
-		if tch, ok := lh.lru.Get(lh.key); ok {
-			return tch, nil
-		}
-		return nil, errMaterializeFailed
-	}
-
-	// Detach the load from the initiating request's cancellation. Otherwise a
-	// client that disconnects mid-load aborts the work for every follower that
-	// joined this flight, and all of them fail even though their own requests
-	// are still live. The load still bounds itself with a timeout.
-	loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), materializeTimeout)
-	tch, err := lh.runLoad(loadCtx)
-	cancel()
-
-	lh.flights.release(lh.key, call, tch, err == nil)
-
-	return tch, err
-}
-
-// runLoad invokes lh.load without holding lh.mu. A panic from load is converted
-// into an error so that the request fails with a gateway error instead of
-// taking down the server, and so that followers waiting on the call are
-// released rather than hanging forever.
-func (lh *LazyHandler) runLoad(ctx context.Context) (tch *TargetConfigHandler, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			tch, err = nil, fmt.Errorf("materialize %q: panic: %v", lh.key, r)
-		}
-	}()
-
-	return lh.load(ctx)
 }

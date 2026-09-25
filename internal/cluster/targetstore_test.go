@@ -134,9 +134,6 @@ func TestTargetStoreReopenPersists(t *testing.T) {
 	if got, ok, _ := ts2.GetTargetByHost(ctx, "b"); !ok || string(got) != "server_name: b" {
 		t.Fatalf("GetTargetByHost(b) after reopen = %q ok=%v", got, ok)
 	}
-	if count, err := ts2.HostCount(ctx); err != nil || count != 2 {
-		t.Fatalf("HostCount = %d, err %v", count, err)
-	}
 }
 
 func TestTargetStoreManyNames(t *testing.T) {
@@ -263,32 +260,5 @@ func TestTargetStoreHasTargetByHost(t *testing.T) {
 	data, ok, err := ts.GetTargetByHost(ctx, "a.example.com")
 	if err != nil || !ok || string(data) != "server_name: a" {
 		t.Fatalf("GetTargetByHost = %q ok %v err %v", data, ok, err)
-	}
-}
-
-func TestTargetStoreHostCountMatchesListHosts(t *testing.T) {
-	ctx := context.Background()
-	ts, err := OpenTargetStore(t.TempDir())
-	if err != nil {
-		t.Fatalf("OpenTargetStore: %v", err)
-	}
-	defer ts.Close()
-
-	if err := ts.PutGlobal(ctx, []byte("{}")); err != nil {
-		t.Fatalf("PutGlobal: %v", err)
-	}
-	const n = 25
-	for i := 0; i < n; i++ {
-		if err := ts.PutTargetByHost(ctx, fmt.Sprintf("host%d.example.com", i), []byte("{}")); err != nil {
-			t.Fatalf("PutTargetByHost(%d): %v", i, err)
-		}
-	}
-
-	count, err := ts.HostCount(ctx)
-	if err != nil {
-		t.Fatalf("HostCount: %v", err)
-	}
-	if count != n {
-		t.Fatalf("HostCount = %d, want %d (global key must not be counted)", count, n)
 	}
 }

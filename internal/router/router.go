@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"sync"
@@ -18,11 +19,14 @@ const DefaultHostname = "_default"
 // table, and reports whether the hostname is known at all.
 //
 // This is what lets a router serve an unbounded number of targets without
-// holding them in memory. A store-backed implementation answers from the
-// target store (a point lookup on the hostname key), so the routing table can
-// stay empty and the cost of a request becomes one disk read instead of one map
-// entry per target.
-type Resolver func(host string) (http.Handler, bool)
+// holding them in memory. A store-backed implementation answers from the target
+// store (a point lookup on the hostname key), so the routing table can stay
+// empty and the cost of a request becomes one disk read instead of one map entry
+// per target.
+//
+// ctx is the request context, so an implementation can abandon a slow lookup
+// when the client goes away.
+type Resolver func(ctx context.Context, host string) (http.Handler, bool)
 
 type HostRouter struct {
 	targets        map[string]http.Handler
@@ -72,45 +76,45 @@ func NormalizeHost(host string) string {
 	return strings.TrimSuffix(host, ".")
 }
 
+// lookup returns the handler for a single hostname, preferring an explicit table
+// entry and falling back to the resolver. The table wins because its entries are
+// deliberate, whereas a resolver may be answering from a store that has since
+// changed.
+func (hr *HostRouter) lookup(ctx context.Context, host string) (http.Handler, bool) {
+	hr.mu.RLock()
+	h, inTable := hr.targets[host]
+	resolver := hr.resolver
+	hr.mu.RUnlock()
+
+	if inTable {
+		return h, true
+	}
+	if resolver == nil {
+		return nil, false
+	}
+	return resolver(ctx, host)
+}
+
 func (hr *HostRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	host := NormalizeHost(req.Host)
 
-	// Both table lookups happen under a single read lock; reading the default
-	// after unlocking would race with Reload.
+	// Resolution order: the exact host, then the default hostname, then the
+	// router-wide catch-all. The default costs a store lookup in lazy mode, so it
+	// is only tried once the host itself has failed to resolve.
+	for _, candidate := range [2]string{host, DefaultHostname} {
+		if h, ok := hr.lookup(req.Context(), candidate); ok {
+			klog.V(4).Infof("Found target handler for host: %s", candidate)
+			h.ServeHTTP(w, req)
+			return
+		}
+	}
+
 	hr.mu.RLock()
-	tch, ok := hr.targets[host]
-	fallback, hasFallback := hr.targets[DefaultHostname]
-	resolver := hr.resolver
 	def := hr.defaultHandler
 	hr.mu.RUnlock()
-
-	if !ok && resolver != nil {
-		// The hostname is not in the table, but it may still be a known target
-		// that the table deliberately does not hold. Ask the resolver.
-		if resolved, found := resolver(host); found {
-			tch, ok = resolved, true
-		}
-	}
-	if !ok {
-		tch, ok = fallback, hasFallback
-	}
-	if !ok && resolver != nil {
-		// Resolve the default target too, so a store-backed default does not
-		// need to be pinned in the table either.
-		if resolved, found := resolver(DefaultHostname); found {
-			tch, ok = resolved, true
-		}
-	}
-
-	if !ok && def != nil {
+	if def != nil {
 		klog.V(4).Infof("Using default handler for host: %s", host)
 		def.ServeHTTP(w, req)
-		return
-	}
-
-	if tch != nil {
-		klog.V(4).Infof("Found target handler for host: %s", host)
-		tch.ServeHTTP(w, req)
 		return
 	}
 
@@ -166,6 +170,11 @@ func (tch *TargetConfigHandler) ServeHTTP(w http.ResponseWriter, req *http.Reque
 func (hr *HostRouter) Reload(targets map[string]http.Handler, defaultHandler http.Handler) {
 	hr.mu.Lock()
 	defer hr.mu.Unlock()
+	if targets == nil {
+		// "No table" is a legitimate state, but Upsert still has to be able to
+		// write into it, and assigning to a nil map panics.
+		targets = make(map[string]http.Handler)
+	}
 	hr.targets = targets
 	hr.defaultHandler = defaultHandler
 }

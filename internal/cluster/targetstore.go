@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/cockroachdb/pebble"
 )
@@ -92,6 +93,12 @@ func (ts *TargetStore) HasTargetByHost(ctx context.Context, hostname string) (bo
 	return true, nil
 }
 
+// inHostPrefix reports whether key belongs to the hostname space rather than
+// being the global config key or any other bookkeeping key.
+func inHostPrefix(key []byte) bool {
+	return bytes.HasPrefix(key, []byte(hostKeyPrefix))
+}
+
 // HasAnyTarget reports whether the store holds at least one target, without
 // enumerating the keyspace. Startup uses this to tell a fresh store from a
 // provisioned one; ListHosts would allocate one string per target to answer a
@@ -104,9 +111,9 @@ func (ts *TargetStore) HasAnyTarget(ctx context.Context) (bool, error) {
 	}
 	defer iter.Close()
 
-	prefix := []byte(hostKeyPrefix)
-	valid := iter.SeekGE(prefix)
-	return valid && bytes.HasPrefix(iter.Key(), prefix), nil
+	// The global config key sorts before the hostname prefix, so seek to the
+	// prefix rather than starting at the first key in the store.
+	return iter.SeekGE([]byte(hostKeyPrefix)) && inHostPrefix(iter.Key()), nil
 }
 
 // DeleteTargetByHost removes a target by hostname.
@@ -125,38 +132,10 @@ func (ts *TargetStore) ListHosts(ctx context.Context) ([]string, error) {
 	defer iter.Close()
 
 	hosts := make([]string, 0, 1024)
-	prefix := []byte(hostKeyPrefix)
-	for valid := iter.SeekGE(prefix); valid; valid = iter.Next() {
-		key := iter.Key()
-		if !bytes.HasPrefix(key, prefix) {
-			break
-		}
-		hosts = append(hosts, string(key[len(prefix):]))
+	for valid := iter.SeekGE([]byte(hostKeyPrefix)); valid && inHostPrefix(iter.Key()); valid = iter.Next() {
+		hosts = append(hosts, strings.TrimPrefix(string(iter.Key()), hostKeyPrefix))
 	}
 	return hosts, nil
-}
-
-// HostCount returns the number of stored hostnames.
-//
-// It walks the keyspace but allocates nothing per key, so counting 10M targets
-// costs a scan rather than 10M strings.
-func (ts *TargetStore) HostCount(ctx context.Context) (int, error) {
-	_ = ctx
-	iter, err := ts.db.NewIter(nil)
-	if err != nil {
-		return 0, err
-	}
-	defer iter.Close()
-
-	count := 0
-	prefix := []byte(hostKeyPrefix)
-	for valid := iter.SeekGE(prefix); valid; valid = iter.Next() {
-		if !bytes.HasPrefix(iter.Key(), prefix) {
-			break
-		}
-		count++
-	}
-	return count, nil
 }
 
 // get retrieves a value by key. The returned slice is a copy safe to use after

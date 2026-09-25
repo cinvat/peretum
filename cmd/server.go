@@ -315,6 +315,16 @@ func targetHostKey(target *config.TargetConfig) string {
 	return target.ServerName
 }
 
+// lazyMaterialize is the load path the lazy router's handlers use. The indirection
+// exists so tests can count how often a target is compiled; production always
+// goes through materializeTarget.
+func (ps *proxyServer) lazyMaterialize(ctx context.Context, hostname string) (*router.TargetConfigHandler, error) {
+	if ps.lazyLoad != nil {
+		return ps.lazyLoad(ctx, hostname)
+	}
+	return ps.materializeTarget(ctx, hostname)
+}
+
 // buildLazyHostRouter builds a router that resolves hosts from the target store
 // instead of holding them in memory.
 //
@@ -333,21 +343,14 @@ func targetHostKey(target *config.TargetConfig) string {
 // router at all. applyTargetUpdate only has to invalidate the LRU entry.
 func (ps *proxyServer) buildLazyHostRouter() *router.HostRouter {
 	hr := router.NewHostRouter()
-	hr.Reload(nil, nil)
+	hr.Reload(nil, nil) // no in-memory table: the store is the routing table
 
-	// The flight table is shared by every host so that the per-request
-	// LazyHandler built below still coalesces concurrent first requests.
+	// Shared by every host, so the per-request handler the resolver builds below
+	// still coalesces concurrent first requests for the same cold target.
 	flights := router.NewFlightTable(ps.lazyLRU)
-	load := ps.lazyLoad
-	if load == nil {
-		load = ps.materializeTarget
-	}
 
-	hr.SetResolver(func(host string) (http.Handler, bool) {
-		if host == "" {
-			return nil, false
-		}
-		exists, err := ps.targetStore.HasTargetByHost(context.Background(), host)
+	hr.SetResolver(func(ctx context.Context, host string) (http.Handler, bool) {
+		exists, err := ps.targetStore.HasTargetByHost(ctx, host)
 		if err != nil {
 			klog.Errorf("lazy router: lookup %s: %v", host, err)
 			return nil, false
@@ -355,8 +358,8 @@ func (ps *proxyServer) buildLazyHostRouter() *router.HostRouter {
 		if !exists {
 			return nil, false
 		}
-		return router.NewSharedLazyHandler(host, ps.lazyLRU, func(ctx context.Context) (*router.TargetConfigHandler, error) {
-			return load(ctx, host)
+		return router.NewLazyHandler(host, ps.lazyLRU, func(ctx context.Context) (*router.TargetConfigHandler, error) {
+			return ps.lazyMaterialize(ctx, host)
 		}, flights), true
 	})
 

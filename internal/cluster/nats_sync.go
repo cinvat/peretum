@@ -234,44 +234,32 @@ type EventHandler func(context.Context, *TargetEvent) error
 // event. Applying an event twice is harmless in any case: they are idempotent
 // writes keyed by hostname.
 func (s *NATSConfigSync) Start(ctx context.Context, handle EventHandler) (<-chan struct{}, error) {
-	if handle == nil {
-		return nil, fmt.Errorf("start: nil handler")
-	}
-
-	durable := ConsumerName()
-	cons, err := s.js.CreateOrUpdateConsumer(ctx, s.stream, jetstream.ConsumerConfig{
-		Durable:   durable,
-		AckPolicy: jetstream.AckExplicitPolicy,
-		// Replay the full retained state, then follow live updates. This is
-		// what makes the stream double as the initial snapshot.
-		DeliverPolicy: jetstream.DeliverAllPolicy,
-		AckWait:       30 * time.Second,
-		MaxDeliver:    5,
-		BackOff:       []time.Duration{time.Second, 5 * time.Second, 30 * time.Second},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("create consumer %q: %w", durable, err)
-	}
-
-	ready := make(chan struct{})
-	if err := s.catchUp(ctx, cons, handle); err != nil {
+	// Reuse CatchUp so there is one implementation of the drain and one
+	// definition of what "caught up" means.
+	if err := s.CatchUp(ctx, handle); err != nil {
 		return nil, err
 	}
 
+	cons, err := s.ensureConsumer(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := cons.Consume(func(msg jetstream.Msg) {
 		applyMessage(ctx, handle, msg)
 	}); err != nil {
-		return nil, fmt.Errorf("consume %q: %w", durable, err)
+		return nil, fmt.Errorf("consume %q: %w", cons.CachedInfo().Name, err)
 	}
-	close(ready)
 
+	// Already closed: every awaiter is released the moment the live consumer is
+	// attached.
+	ready := make(chan struct{})
+	close(ready)
 	return ready, nil
 }
 
-// CatchUp is Start without the live consumer: it applies the retained backlog
-// and returns when the consumer has caught up. It is the same durable Start
-// uses, so a caller can catch up and later attach live updates on the same
-// consumer without replaying anything twice.
+// CatchUp applies the retained backlog to handle and returns when the edge's
+// durable consumer has caught up. It is the same durable Start uses, so a caller
+// can replay first and attach live updates later without replaying twice.
 func (s *NATSConfigSync) CatchUp(ctx context.Context, handle EventHandler) error {
 	if handle == nil {
 		return fmt.Errorf("catch up: nil handler")

@@ -33,7 +33,7 @@ func TestLazyHandlerLoadsOnce(t *testing.T) {
 		loads++
 		mu.Unlock()
 		return lazyEchoHandler(t, "lazy-body"), nil
-	})
+	}, nil)
 
 	// First request materializes.
 	rec := httptest.NewRecorder()
@@ -66,7 +66,7 @@ func TestLazyHandlerConcurrentCoalescing(t *testing.T) {
 		loads++
 		mu.Unlock()
 		return lazyEchoHandler(t, "coalesced-body"), nil
-	})
+	}, nil)
 
 	const n = 32
 	var wg sync.WaitGroup
@@ -107,8 +107,8 @@ func TestLazyHandlerReloadsAfterEviction(t *testing.T) {
 			return lazyEchoHandler(t, body), nil
 		}
 	}
-	a := NewLazyHandler("a", lru, makeLoad("a", "body-a"))
-	b := NewLazyHandler("b", lru, makeLoad("b", "body-b"))
+	a := NewLazyHandler("a", lru, makeLoad("a", "body-a"), nil)
+	b := NewLazyHandler("b", lru, makeLoad("b", "body-b"), nil)
 
 	serve := func(lh *LazyHandler, host string) string {
 		rec := httptest.NewRecorder()
@@ -146,7 +146,7 @@ func TestLazyHandlerLoadFailureRetries(t *testing.T) {
 			return nil, fmt.Errorf("boom")
 		}
 		return lazyEchoHandler(t, "retried-body"), nil
-	})
+	}, nil)
 
 	rec := httptest.NewRecorder()
 	lh.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-c/", nil))
@@ -177,7 +177,7 @@ func TestLazyHandlerContextCancellation(t *testing.T) {
 		case <-time.After(100 * time.Millisecond):
 		}
 		return lazyEchoHandler(t, "context-body"), nil
-	})
+	}, nil)
 
 	// Start a request and cancel it before load completes
 	ctx, cancel := context.WithCancel(context.Background())
@@ -209,7 +209,7 @@ func TestLazyHandlerPanicRecovery(t *testing.T) {
 	lru := cluster.NewLRUCache[string, *TargetConfigHandler](4)
 	lh := NewLazyHandler("svc-e", lru, func(ctx context.Context) (*TargetConfigHandler, error) {
 		panic("materialize panic")
-	})
+	}, nil)
 
 	// First request should get 502 (or 503) and not hang
 	rec := httptest.NewRecorder()
@@ -256,7 +256,7 @@ func TestLazyHandlerFollowerSeesLeaderFailure(t *testing.T) {
 		once.Do(func() { close(started) })
 		<-release
 		return nil, fmt.Errorf("load boom")
-	})
+	}, nil)
 
 	// The leader blocks inside load until we release it.
 	leaderDone := make(chan int, 1)
@@ -296,7 +296,7 @@ func TestLazyHandlerFollowerCancelsWhileWaiting(t *testing.T) {
 		once.Do(func() { close(started) })
 		<-release
 		return lazyEchoHandler(t, "late-body"), nil
-	})
+	}, nil)
 
 	go func() {
 		rec := httptest.NewRecorder()
@@ -328,7 +328,7 @@ func TestLazyHandlerNilHandlerFailsClosed(t *testing.T) {
 	lru := cluster.NewLRUCache[string, *TargetConfigHandler](4)
 	lh := NewLazyHandler("svc-h", lru, func(ctx context.Context) (*TargetConfigHandler, error) {
 		return nil, nil // no error, but no handler either
-	})
+	}, nil)
 
 	rec := httptest.NewRecorder()
 	lh.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-h/", nil))
@@ -354,7 +354,7 @@ func TestLazyHandlerLoadSurvivesLeaderDisconnect(t *testing.T) {
 			return nil, err
 		}
 		return lazyEchoHandler(t, "detached"), nil
-	})
+	}, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	leaderRec := httptest.NewRecorder()
@@ -421,7 +421,7 @@ func TestSharedFlightTableCoalescesAcrossHandlers(t *testing.T) {
 			// A distinct handler per goroutine, exactly as the resolver builds
 			// them: no shared *LazyHandler, so the only thing that can coalesce
 			// these is the table.
-			lh := NewSharedLazyHandler("svc-b", lru, load, flights)
+			lh := NewLazyHandler("svc-b", lru, load, flights)
 			rec := httptest.NewRecorder()
 			lh.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-b/", nil))
 			bodies[i] = rec.Body.String()
@@ -466,7 +466,7 @@ func TestSharedFlightTableReleasesEntriesAfterLoad(t *testing.T) {
 	}
 
 	for _, host := range []string{"a", "b", "c", "d", "e", "f"} {
-		lh := NewSharedLazyHandler(host, lru, load, flights)
+		lh := NewLazyHandler(host, lru, load, flights)
 		rec := httptest.NewRecorder()
 		lh.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+host+"/", nil))
 		if rec.Body.String() != "b" {
@@ -502,7 +502,7 @@ func TestSharedFlightTableReleasesEntriesAfterFailure(t *testing.T) {
 		return lazyEchoHandler(t, "b"), nil
 	}
 
-	lh := NewSharedLazyHandler("svc-f", lru, load, flights)
+	lh := NewLazyHandler("svc-f", lru, load, flights)
 	rec := httptest.NewRecorder()
 	lh.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-f/", nil))
 	if rec.Code != http.StatusBadGateway {
@@ -529,7 +529,7 @@ func TestHostRouterResolverServesUnlistedHosts(t *testing.T) {
 	hr.Reload(nil, nil) // table deliberately empty, as in lazy mode
 
 	known := map[string]string{"svc-r": "resolved-body"}
-	hr.SetResolver(func(host string) (http.Handler, bool) {
+	hr.SetResolver(func(_ context.Context, host string) (http.Handler, bool) {
 		body, ok := known[host]
 		if !ok {
 			return nil, false
@@ -560,7 +560,7 @@ func TestHostRouterResolverServesDefaultHost(t *testing.T) {
 	hr.Reload(nil, nil)
 
 	known := map[string]string{DefaultHostname: "default-body"}
-	hr.SetResolver(func(host string) (http.Handler, bool) {
+	hr.SetResolver(func(_ context.Context, host string) (http.Handler, bool) {
 		body, ok := known[host]
 		if !ok {
 			return nil, false
@@ -584,7 +584,7 @@ func TestHostRouterResolverDoesNotOverrideTable(t *testing.T) {
 	hr.Upsert("svc-t", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "table-body")
 	}))
-	hr.SetResolver(func(host string) (http.Handler, bool) {
+	hr.SetResolver(func(_ context.Context, host string) (http.Handler, bool) {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprint(w, "resolver-body")
 		}), true
@@ -602,7 +602,7 @@ func TestHostRouterResolverDoesNotOverrideTable(t *testing.T) {
 func TestHostRouterReloadKeepsResolver(t *testing.T) {
 	hr := NewHostRouter()
 	called := false
-	hr.SetResolver(func(host string) (http.Handler, bool) {
+	hr.SetResolver(func(_ context.Context, host string) (http.Handler, bool) {
 		called = true
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), true
 	})
@@ -617,7 +617,7 @@ func TestHostRouterReloadKeepsResolver(t *testing.T) {
 
 func TestHostRouterSetResolverNilRestoresTableOnly(t *testing.T) {
 	hr := NewHostRouter()
-	hr.SetResolver(func(host string) (http.Handler, bool) {
+	hr.SetResolver(func(_ context.Context, host string) (http.Handler, bool) {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprint(w, "resolver-body")
 		}), true
@@ -635,7 +635,7 @@ func TestHostRouterSetResolverNilRestoresTableOnly(t *testing.T) {
 // single-host caller does not have to construct a table.
 func TestNewSharedLazyHandlerNilTableFallsBack(t *testing.T) {
 	lru := cluster.NewLRUCache[string, *TargetConfigHandler](4)
-	lh := NewSharedLazyHandler("svc-nil", lru, func(ctx context.Context) (*TargetConfigHandler, error) {
+	lh := NewLazyHandler("svc-nil", lru, func(ctx context.Context) (*TargetConfigHandler, error) {
 		return lazyEchoHandler(t, "nil-table-body"), nil
 	}, nil)
 	if lh.flights == nil {
@@ -646,5 +646,21 @@ func TestNewSharedLazyHandlerNilTableFallsBack(t *testing.T) {
 	lh.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-nil/", nil))
 	if rec.Body.String() != "nil-table-body" {
 		t.Fatalf("body = %q, want %q", rec.Body.String(), "nil-table-body")
+	}
+}
+
+// "No table" is a legitimate state for a store-backed router, but Upsert must
+// still work on it: assigning into a nil map panics.
+func TestHostRouterReloadNilTableStaysUsable(t *testing.T) {
+	hr := NewHostRouter()
+	hr.Reload(nil, nil)
+
+	hr.Upsert("svc-nil-table", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "body")
+	}))
+	rec := httptest.NewRecorder()
+	hr.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://svc-nil-table/", nil))
+	if rec.Body.String() != "body" {
+		t.Fatalf("body = %q, want %q", rec.Body.String(), "body")
 	}
 }
