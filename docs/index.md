@@ -75,7 +75,8 @@ Serves on `:8081` by default using `config.yaml` and `config.d/`. See the
 - [HTTP/3 (QUIC)](http3.md)
 - [gRPC proxying](grpc.md)
 - [Disk cache](cache.md)
-- [Routing & load balancing](routing.md)
+- [Routing](routing.md)
+- [Load balancing](loadbalancing.md)
 
 **Development**
 

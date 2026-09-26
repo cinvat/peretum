@@ -45,7 +45,7 @@ locations:
 | `server_name` | string | **Required**. Target hostname; used as the router host key and Pebble key. |
 | `host_header` | string | Optional upstream `Host` header override sent on every request proxied by this target's locations. Takes precedence over `proxy.pass_host_header`; empty keeps the default behavior. |
 | `upstreams` | []object | `url` (required), `weight` (`<= 0` treated as `1`), `health_check` (see [Health tracking](#health-tracking)). |
-| `lb_algorithm` | string | See [load balancing](#load-balancing-algorithms). |
+| `lb_algorithm` | string | See [load balancing](#load-balancing-algorithms). Unrecognized values silently fall back to `round_robin`. |
 | `locations` | []object | Ordered location list; first match wins (see priorities below). |
 | `tls` | object | `cert_file`, `key_file` — per-target certificate presented via SNI. |
 
@@ -103,7 +103,10 @@ A location is matched by `path` (first match wins, ordered by priority):
 | `round_robin` / `rr` / (empty) | Equal distribution (default). |
 | `weighted_rr` / `wrr` | Respects `weight` (smooth weights). |
 | `maglev` | Maglev consistent hashing over a 65537-slot table, keyed by `CRC32(path + rawQuery)` — minimal reshuffle across upstream changes. |
-| `least_conn` / `least_connections` | Routes to the upstream with the fewest active requests. |
+| `least_conn` / `least_connections` | Intended to route to the upstream with the fewest active requests. **Currently does not balance** — see [Load balancing](../loadbalancing.md). |
+
+See **[Load balancing](../loadbalancing.md)** for how each algorithm behaves, and
+for caveats worth knowing before choosing one.
 
 ## Health tracking
 

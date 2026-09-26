@@ -42,11 +42,12 @@ locations:
 
 ## Load balancing
 
-An LB algorithm picks an upstream from the target's `upstreams` list:
+Once a target is chosen, an LB algorithm picks one of its `upstreams`. Set it with
+the target's `lb_algorithm`:
 
 | Value | Behavior |
 | --- | --- |
-| `round_robin` / `rr` / (empty) | Equal distribution. |
+| `round_robin` / `rr` / (empty) | Equal distribution (default). |
 | `weighted_rr` / `wrr` | Respects `weight` (smooth). |
 | `maglev` | consistent hashing over 65537 slots, keyed by `CRC32(path + rawQuery)`. |
 | `least_conn` | upstream with the fewest active requests. |
@@ -54,6 +55,9 @@ An LB algorithm picks an upstream from the target's `upstreams` list:
 All algorithms skip unhealthy upstreams; a whole-target failure returns
 `503`, and the LB pool is repaired by the health tracker (see
 [Targets](configuration/targets.md)).
+
+For what each algorithm actually does, how health tracking works, and the
+caveats, see **[Load balancing](loadbalancing.md)**.
 
 ## gRPC routing
 
