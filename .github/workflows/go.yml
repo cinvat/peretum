@@ -53,3 +53,16 @@ jobs:
             exit 1
           fi
           echo "Coverage check passed (total: ${total}%)"
+      - name: Upload coverage to Codecov
+        # The repository must be activated on codecov.io and CODECOV_TOKEN added
+        # as a repository secret. Until both are true this step fails; that is
+        # deliberate, because a badge fed by a silently failing upload would be
+        # no better than the hardcoded one it replaces. fail_ci_if_error keeps
+        # a Codecov outage from blocking unrelated work, since the 95% gate
+        # above is what actually protects the build.
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.out
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+          verbose: true

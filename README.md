@@ -2,7 +2,7 @@
 
 [![Go](https://github.com/cinvat/peretum/actions/workflows/go.yml/badge.svg)](https://github.com/cinvat/peretum/actions/workflows/go.yml)
 [![Docs](https://github.com/cinvat/peretum/actions/workflows/docs.yml/badge.svg)](https://github.com/cinvat/peretum/actions/workflows/docs.yml)
-[![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)](https://github.com/cinvat/peretum/actions)
+[![Coverage](https://codecov.io/gh/cinvat/peretum/branch/main/graph/badge.svg)](https://codecov.io/gh/cinvat/peretum)
 [![Go Version](https://img.shields.io/badge/go-1.26%2B-blue)](https://go.dev/)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 
@@ -105,15 +105,19 @@ go build ./...
 go run .                              # run proxy against config.yaml + config.d/
 go run ./cmd/testserver               # upstream test server on :8082
 
-# Tests (100% statement coverage required)
-go test ./... -cover                  # all packages (must stay 100%)
+# Tests (CI enforces >=95% total statement coverage)
+go test ./... -cover                  # all packages
 go test ./internal/cache/disk/ -v -race
 go test ./internal/cache/disk/ -bench=.
 ```
+
+Coverage is measured in CI and reported to Codecov; the badge above tracks the
+real number. CI fails below 95% total and warns on any individual function under
+100%, so 100% everywhere is the goal but not yet the gate.
 
 ### PR Checklist
 
 - [ ] `go build ./...` and `go vet ./...` clean
 - [ ] `gofmt -l .` prints nothing
-- [ ] `go test ./... -cover` stays at **100% statement coverage** in every package
+- [ ] `go test ./... -cover` holds total statement coverage at **95% or better**
 - [ ] Config/behavior changes documented in [docs](https://cinvat.github.io/peretum/)
