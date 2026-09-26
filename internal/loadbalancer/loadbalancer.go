@@ -203,9 +203,30 @@ func NewMaglev(upstreams []*Upstream) LoadBalancer {
 	return m
 }
 
+// hasHealthy reports whether any upstream is currently eligible for selection.
+// Callers must hold at least a read lock.
+func (m *maglev) hasHealthy() bool {
+	for _, u := range m.upstreams {
+		if u.Healthy.Load() {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *maglev) buildTable() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Filling the table needs at least one healthy upstream. With none, the loop
+	// below skips every upstream and fills nothing, so it would spin forever
+	// holding the lock -- and a target reaches that state whenever its whole
+	// origin set fails at once. Keeping the previous table is correct: Next
+	// already falls back to probeCandidate while everything is unhealthy, and
+	// the next recovery rebuilds the table anyway.
+	if !m.hasHealthy() {
+		return
+	}
 
 	n := len(m.upstreams)
 	m.table = make([]int, maglevTableSize)
@@ -268,33 +289,36 @@ func (m *maglev) Next(r *http.Request) *Upstream {
 	return probeCandidate(m.upstreams)
 }
 
-// MarkHealthy updates upstream health and lazily marks the table as dirty.
-// The table is rebuilt on the next Next() call if needed, to avoid O(tableSize)
-// work on every health check callback.
 func (m *maglev) MarkHealthy(url string, healthy bool) {
-	m.mu.Lock()
-	changed := false
-	for _, u := range m.upstreams {
-		if u.URL == url {
-			if u.Healthy.Load() != healthy {
-				u.Healthy.Store(healthy)
-				u.LastCheck.Store(time.Now())
-				changed = true
-			}
-			break
-		}
-	}
-	// Mark table as needing rebuild by setting a flag
-	// We'll rebuild on next Next() call if needed
-	if changed {
-		// Invalidate table by setting a special marker
-		// For simplicity, rebuild immediately but this could be optimized
-		// with a dirty flag and lazy rebuild
-		m.mu.Unlock()
-		m.buildTable()
+	if !m.setHealth(url, healthy) {
 		return
 	}
-	m.mu.Unlock()
+	// The healthy set changed, so re-balance the lookup table across it. This is
+	// O(maglevTableSize) and runs on the caller's goroutine, which on the request
+	// path is every health flip.
+	m.buildTable()
+}
+
+// setHealth records a new health state and reports whether it actually changed,
+// which is the only case in which the lookup table needs rebuilding. Holding the
+// lock here rather than across the rebuild keeps buildTable out of a
+// lock-upgrade dance at every call site.
+func (m *maglev) setHealth(url string, healthy bool) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, u := range m.upstreams {
+		if u.URL != url {
+			continue
+		}
+		if u.Healthy.Load() == healthy {
+			return false
+		}
+		u.Healthy.Store(healthy)
+		u.LastCheck.Store(time.Now())
+		return true
+	}
+	return false
 }
 
 func (m *maglev) GetUpstreams() []*Upstream {

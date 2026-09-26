@@ -1,6 +1,7 @@
 package loadbalancer
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -315,5 +316,90 @@ func TestLeastConnectionsMin(t *testing.T) {
 	// a(5) then b(0): b wins via curr < bestActive.
 	if u := lc.Next(testReq(t, "/")); u == nil || u.URL != "http://b:8080" {
 		t.Fatalf("expected b, got %+v", u)
+	}
+}
+
+// Regression: filling the lookup table needs a healthy upstream. When a target's
+// entire origin set failed at once, buildTable skipped every upstream, filled
+// nothing, and spun forever holding the lock -- on whichever goroutine marked
+// the last upstream unhealthy, which on the request path is the request itself.
+//
+// The assertion is that buildTable returns, so it runs in a goroutine with a
+// deadline: a regression fails the test instead of hanging the suite.
+func TestMaglevBuildTableTerminatesWhenAllUnhealthy(t *testing.T) {
+	lb := NewMaglev([]*Upstream{
+		{URL: "http://a:8080"},
+		{URL: "http://b:8080"},
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		lb.MarkHealthy("http://a:8080", false)
+		lb.MarkHealthy("http://b:8080", false) // last flip: nothing healthy left
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("MarkHealthy hung with every upstream unhealthy; buildTable is spinning")
+	}
+}
+
+// Having survived the all-unhealthy state, the balancer must still recover: the
+// table is rebuilt on the next health flip and routing resumes.
+func TestMaglevRecoversAfterAllUnhealthy(t *testing.T) {
+	lb := NewMaglev([]*Upstream{
+		{URL: "http://a:8080"},
+		{URL: "http://b:8080"},
+	})
+
+	lb.MarkHealthy("http://a:8080", false)
+	lb.MarkHealthy("http://b:8080", false)
+
+	// While everything is unhealthy, Next still returns something to try.
+	if got := lb.Next(testReq(t, "/x")); got == nil {
+		t.Fatal("Next returned nil with every upstream unhealthy")
+	}
+
+	lb.MarkHealthy("http://b:8080", true)
+	u := lb.Next(testReq(t, "/x"))
+	if u == nil {
+		t.Fatal("Next returned nil after an upstream recovered")
+	}
+	if !u.Healthy.Load() {
+		t.Fatalf("Next picked unhealthy upstream %s after recovery", u.URL)
+	}
+}
+
+// A rebuilt table must still spread distinct keys across the healthy upstreams.
+func TestMaglevTableRebuiltAfterHealthChange(t *testing.T) {
+	lb := NewMaglev([]*Upstream{
+		{URL: "http://a:8080"},
+		{URL: "http://b:8080"},
+		{URL: "http://c:8080"},
+	})
+
+	lb.MarkHealthy("http://a:8080", false)
+
+	// Distinct keys: maglev maps a key to one backend, so a single repeated
+	// path would always land on the same upstream and prove nothing.
+	seen := map[string]int{}
+	for i := 0; i < 300; i++ {
+		u := lb.Next(testReq(t, fmt.Sprintf("/key-%d", i)))
+		if u == nil {
+			t.Fatal("Next returned nil with a healthy upstream available")
+		}
+		if !u.Healthy.Load() {
+			t.Fatalf("Next picked unhealthy upstream %s", u.URL)
+		}
+		seen[u.URL]++
+	}
+
+	if seen["http://a:8080"] != 0 {
+		t.Fatalf("unhealthy upstream a was selected %d times", seen["http://a:8080"])
+	}
+	if seen["http://b:8080"] == 0 || seen["http://c:8080"] == 0 {
+		t.Fatalf("keys did not spread across the healthy upstreams: %v", seen)
 	}
 }
