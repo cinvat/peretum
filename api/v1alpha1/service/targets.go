@@ -119,6 +119,72 @@ func UpdateTarget(serverName string, t *config.TargetConfig) error {
 	return nil
 }
 
+// PatchTarget performs a partial update of the target configuration file
+// <server_name>.yaml. The provided JSON/YAML body fields are deep-merged into
+// the existing file. If the file does not exist, it returns an error (use
+// CreateTarget to create a new target).
+func PatchTarget(serverName string, data []byte) error {
+	if serverName == "" {
+		return fmt.Errorf("server_name is required to determine filename")
+	}
+
+	filename := serverName + ".yaml"
+	path := filepath.Join(defaultTargetDir, filename)
+
+	// Read existing file
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("target %s does not exist", filename)
+		}
+		return fmt.Errorf("read %s: %w", filename, err)
+	}
+
+	// Unmarshal existing as a generic map for flexible merging
+	var existingMap map[string]interface{}
+	if err := yaml.Unmarshal(existing, &existingMap); err != nil {
+		return fmt.Errorf("unmarshal existing %s: %w", filename, err)
+	}
+
+	// Unmarshal incoming data as a generic map
+	var incomingMap map[string]interface{}
+	if err := yaml.Unmarshal(data, &incomingMap); err != nil {
+		return fmt.Errorf("unmarshal patch data: %w", err)
+	}
+
+	// Deep merge: incoming keys overwrite existing keys
+	mergeMaps(existingMap, incomingMap)
+
+	// Re-marshal and write back
+	out, err := yaml.Marshal(existingMap)
+	if err != nil {
+		return fmt.Errorf("marshal patched %s: %w", filename, err)
+	}
+
+	if err := os.WriteFile(path, out, 0644); err != nil {
+		return fmt.Errorf("write %s: %w", filename, err)
+	}
+
+	return nil
+}
+
+// mergeMaps recursively merges src into dst. Keys in src overwrite dst.
+func mergeMaps(dst, src map[string]interface{}) {
+	for k, v := range src {
+		if dstVal, ok := dst[k]; ok {
+			// Both exist; if both are maps, recurse
+			if dstMap, ok := dstVal.(map[string]interface{}); ok {
+				if srcMap, ok := v.(map[string]interface{}); ok {
+					mergeMaps(dstMap, srcMap)
+					continue
+				}
+			}
+		}
+		// Overwrite with incoming value
+		dst[k] = v
+	}
+}
+
 // DeleteTarget removes the target configuration file <server_name>.yaml
 // from the configured directory.
 func DeleteTarget(serverName string) error {

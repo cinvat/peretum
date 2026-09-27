@@ -15,6 +15,7 @@ func RegisterTargetsRoutes(r *gin.Engine) {
 		targets.GET("", listTargets)
 		targets.POST("", createTarget)
 		targets.PUT("/:server_name", updateTarget)
+		targets.PATCH("/:server_name", patchTarget)
 		targets.DELETE("/:server_name", deleteTarget)
 	}
 }
@@ -86,4 +87,25 @@ func deleteTarget(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"server_name": serverName, "message": "target deleted"})
+}
+
+func patchTarget(c *gin.Context) {
+	serverName := c.Param("server_name")
+	if serverName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "server_name parameter is required"})
+		return
+	}
+
+	data, err := c.GetRawData()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read body"})
+		return
+	}
+
+	if err := service.PatchTarget(serverName, data); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"server_name": serverName, "message": "target patched"})
 }
