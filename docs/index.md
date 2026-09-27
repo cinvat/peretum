@@ -78,6 +78,12 @@ Serves on `:8081` by default using `config.yaml` and `config.d/`. See the
 - [Routing](routing.md)
 - [Load balancing](loadbalancing.md)
 
+**API**
+
+- [Target config CRUD](/api) — create, read, update, delete per-target
+  configuration files (`<server_name>.yaml`) via REST at
+  `/v1alpha1/targets`
+
 **Development**
 
 - [Development index](development/index.md)
