@@ -1,4 +1,4 @@
-name: Go
+name: Go 🐹
 
 on:
   push:
@@ -14,25 +14,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Go
+      - name: 🦀 Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.26'
           cache: true
-      - name: Run gofmt
+      - name: 🎨 Run gofmt
         run: |
           if [ -n "$(gofmt -l .)" ]; then
             echo "gofmt failed on:"
             gofmt -l .
             exit 1
           fi
-      - name: Run go vet
+      - name: 🔍 Run go vet
         run: go vet ./...
-      - name: Build
+      - name: 📦 Build
         run: go build ./...
-      - name: Test with race detector
+      - name: 🧪 Test with race detector
         run: go test ./... -race -count=1
-      - name: Check coverage (core packages)
+      - name: 📊 Check coverage (core packages)
         run: |
           # Exclude tools package (standalone h3 check tool) from coverage
           go test ./... -coverprofile=coverage.out
@@ -49,20 +49,25 @@ jobs:
           # Check overall coverage is high
           total=$(go tool cover -func=coverage.out | grep "^total:" | awk '{print $3}' | sed 's/%//')
           if [ -n "$total" ] && [ "${total%.*}" -lt 95 ]; then
-            echo "FAIL: Total coverage ${total}% < 95%"
+            echo "❌ FAIL: Total coverage ${total}% < 95%"
             exit 1
           fi
-          echo "Coverage check passed (total: ${total}%)"
-      - name: Upload coverage to Codecov
-        # The repository must be activated on codecov.io and CODECOV_TOKEN added
-        # as a repository secret. Until both are true this step fails; that is
-        # deliberate, because a badge fed by a silently failing upload would be
-        # no better than the hardcoded one it replaces. fail_ci_if_error keeps
-        # a Codecov outage from blocking unrelated work, since the 95% gate
-        # above is what actually protects the build.
-        uses: codecov/codecov-action@v5
+          echo "✅ Coverage check passed (total: ${total}%)"
+      - name: 🛠️ Generate coverage badges
+        uses: benmacg1/coverage-badges-generation-action@v1
         with:
-          files: ./coverage.out
-          token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: false
-          verbose: true
+          coverage_path: coverage.out
+          title: coverage
+  code-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 🦀 Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: 🔧 Install golangci-lint
+        uses: golangci/golangci-lint-action@v3
+      - name: 🕵️ Run golangci-lint
+        run: golangci-lint run ./...
