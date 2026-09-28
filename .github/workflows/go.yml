@@ -73,5 +73,6 @@ jobs:
           cache: true
       - name: 🔧 Install golangci-lint
         uses: golangci/golangci-lint-action@v3
+        install-mode: go
       - name: 🕵️ Run golangci-lint
         run: golangci-lint run ./...
