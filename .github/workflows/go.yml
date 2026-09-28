@@ -53,11 +53,15 @@ jobs:
             exit 1
           fi
           echo "✅ Coverage check passed (total: ${total}%)"
-      - name: 🛠️ Generate coverage badges
-        uses: benmacg1/coverage-badges-generation-action@v1
-        with:
-          coverage_path: coverage.out
-          title: coverage
+      - name: 🛠️ Generate coverage badge
+        run: |
+          total=$(go tool cover -func=coverage.out | grep "^total:" | awk '{print $3}' | sed 's/%//')
+          if [ -n "$total" ]; then
+            label="coverage"
+            # Generate Shields.io badge URL
+            badge_url="https://img.shields.io/badge/${label}-${total}%25-brightgreen"
+            echo "badge_url=$badge_url" >> $GITHUB_ENV
+          fi
   code-quality:
     runs-on: ubuntu-latest
     steps:
