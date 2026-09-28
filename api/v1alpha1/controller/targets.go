@@ -3,24 +3,12 @@ package controller
 import (
 	"net/http"
 
-	"github.com/gin-gonic/gin"
 	"github.com/cinvat/peretum/api/v1alpha1/service"
 	"github.com/cinvat/peretum/internal/config"
+	"github.com/gin-gonic/gin"
 )
 
-// RegisterTargetsRoutes registers the target CRUD routes on the given router.
-func RegisterTargetsRoutes(r *gin.Engine) {
-	targets := r.Group("/v1alpha1/targets")
-	{
-		targets.GET("", listTargets)
-		targets.POST("", createTarget)
-		targets.PUT("/:server_name", updateTarget)
-		targets.PATCH("/:server_name", patchTarget)
-		targets.DELETE("/:server_name", deleteTarget)
-	}
-}
-
-func listTargets(c *gin.Context) {
+func ListTargets(c *gin.Context) {
 	targets, err := service.ListTargets()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -38,7 +26,7 @@ func listTargets(c *gin.Context) {
 	c.JSON(http.StatusOK, summaries)
 }
 
-func createTarget(c *gin.Context) {
+func CreateTarget(c *gin.Context) {
 	var t config.TargetConfig
 	if err := c.BindJSON(&t); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON: " + err.Error()})
@@ -53,7 +41,7 @@ func createTarget(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"server_name": t.ServerName, "message": "target created"})
 }
 
-func updateTarget(c *gin.Context) {
+func UpdateTarget(c *gin.Context) {
 	serverName := c.Param("server_name")
 	if serverName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "server_name parameter is required"})
@@ -74,7 +62,7 @@ func updateTarget(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"server_name": t.ServerName, "message": "target updated"})
 }
 
-func deleteTarget(c *gin.Context) {
+func DeleteTarget(c *gin.Context) {
 	serverName := c.Param("server_name")
 	if serverName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "server_name parameter is required"})
@@ -89,7 +77,7 @@ func deleteTarget(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"server_name": serverName, "message": "target deleted"})
 }
 
-func patchTarget(c *gin.Context) {
+func PatchTarget(c *gin.Context) {
 	serverName := c.Param("server_name")
 	if serverName == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "server_name parameter is required"})
