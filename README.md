@@ -2,9 +2,10 @@
 
 [![Go](https://github.com/cinvat/peretum/actions/workflows/go.yml/badge.svg)](https://github.com/cinvat/peretum/actions/workflows/go.yml)
 [![Docs](https://github.com/cinvat/peretum/actions/workflows/docs.yml/badge.svg)](https://github.com/cinvat/peretum/actions/workflows/docs.yml)
-[![Coverage](https://codecov.io/gh/cinvat/peretum/branch/main/graph/badge.svg)](https://codecov.io/gh/cinvat/peretum)
+[![Coverage](https://github.com/cinvat/peretum/actions/workflows/go.yml/badge.svg)](https://github.com/cinvat/peretum/actions/workflows/go.yml)
 [![Go Version](https://img.shields.io/badge/go-1.26%2B-blue)](https://go.dev/)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
+[![Code Quality](https://github.com/cinvat/peretum/actions/workflows/code-quality/badge.svg)](https://github.com/cinvat/peretum/actions/workflows/code-quality)
 
 **Peretum** is a lightweight, high-performance HTTP/HTTPS reverse proxy with transparent disk-based response caching, host+location routing, plugin system, HTTP/3 (QUIC), gRPC passthrough, and a Web Application Firewall.
 
@@ -111,7 +112,7 @@ go test ./internal/cache/disk/ -v -race
 go test ./internal/cache/disk/ -bench=.
 ```
 
-Coverage is measured in CI and reported to Codecov; the badge above tracks the
+Coverage is measured in CI and reported via the coverage-badges-generation-action; the badge above tracks the
 real number. CI fails below 95% total and warns on any individual function under
 100%, so 100% everywhere is the goal but not yet the gate.
 
