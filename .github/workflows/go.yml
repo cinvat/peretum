@@ -62,3 +62,28 @@ jobs:
             badge_url="https://img.shields.io/badge/${label}-${total}%25-brightgreen"
             echo "badge_url=$badge_url" >> $GITHUB_ENV
           fi
+      - name: 📝 Write coverage percent to file
+        run: |
+          total=$(go tool cover -func=coverage.out | grep -v "api/" | grep -v "tools/" | grep "^total:" | awk '{print $3}' | sed 's/%//')
+          echo "$total" > coverage-percent.txt
+      - name: 📤 Commit coverage percent
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add coverage-percent.txt
+          git commit -m "Update coverage percent"
+          git push
+  code-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 🦀 Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: 🔧 Install golangci-lint
+        uses: golangci/golangci-lint-action@v3
+      - name: 🕵️ Run golangci-lint
+        run: golangci-lint run ./...
