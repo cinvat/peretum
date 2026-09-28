@@ -16,6 +16,7 @@ require (
 	github.com/samber/lo v1.53.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
+	github.com/stretchr/testify v1.12.1
 	github.com/tdewolff/minify/v2 v2.24.17
 	golang.org/x/image v0.46.0
 	golang.org/x/net v0.58.0
