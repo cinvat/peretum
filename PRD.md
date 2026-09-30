@@ -247,8 +247,8 @@ cluster:
 |------|---------|
 | `internal/cluster/targetstore.go` | Pebble-backed config store |
 | `internal/router/lazy.go` | Single-flight materialization |
-| `cmd/server.go` | Proxy lifecycle, lazy wiring |
-| `cmd/controlplane.go` | fsnotify reconciler + JetStream publisher (health-only HTTP) |
+| `internal/proxyserver/` | Proxy lifecycle, lazy wiring |
+| `internal/controlplane/` | fsnotify reconciler + JetStream publisher (health-only HTTP) |
 | `internal/cluster/nats_sync.go` | Stream config, target events, durable consumers |
 | `internal/cluster/lru.go` | Bounded compiled-handler LRU |
 | `internal/loadbalancer/loadbalancer.go` | LB algorithms + health checks |
