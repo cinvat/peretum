@@ -99,7 +99,7 @@ func TestCachePath_Deterministic(t *testing.T) {
 }
 
 func BenchmarkCacheKey(b *testing.B) {
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		CacheKey("example.com", "/api/v1/users/123?page=1&limit=10")
 	}
 }
