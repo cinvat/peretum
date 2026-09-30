@@ -41,6 +41,11 @@ waf:
   geolite_dir: "./plugins/waf/geolite"       # shared by every location's WAF
   max_body_size: "1MB"                       # max request body to read for "body" param
 
+rate_limit:
+  enabled: false
+  rps: 100       # sustained requests/second per target+client IP
+  burst: 200     # bucket size; absorbs short bursts
+
 cluster:
   enabled: true
   nats_uri: "nats://nats.example.com:4222"  # NATS JetStream URL for config sync
@@ -66,6 +71,7 @@ cluster:
 | `json_log` | object | See [JSON logs](../plugins/jsonlog.md). |
 | `error_page` | object | See [Error pages](../plugins/errorpage.md). |
 | `waf` | object | Global WAF settings: `enabled`, `geolite_dir`, `max_body_size` (see [WAF](../plugins/waf.md)). |
+| `rate_limit` | object | Global token bucket: `enabled`, `rps`, `burst` (see [Rate limiting](../plugins/ratelimit.md)). |
 | `cluster` | object | Cluster settings: `enabled`, `nats_uri`, `lazy`, `data_dir`, `lru_size`, `replay_timeout` (see [Cluster Mode](../configuration/cluster.md)). |
 
 ## Size strings

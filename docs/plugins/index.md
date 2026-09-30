@@ -24,6 +24,7 @@ Registered plugins:
 | `jsonlog` | no | [JSON logs](jsonlog.md) |
 | `prometheus_exporter` | no | [Prometheus metrics](prometheus.md) |
 | `error_page` | no | [Error pages](errorpage.md) |
+| `ratelimit` | no (global) | [Rate limiting](ratelimit.md) |
 | `waf` | per target+location | [WAF](waf.md) |
 
 Notes:
@@ -44,7 +45,7 @@ Notes:
 Request handling in `internal/handler/handler.go` dispatches:
 
 - **BeforeProxy** — before the upstream fetch (also before cache lookup): CORS,
-  request headers, rewrite, WAF.
+  request headers, rewrite, WAF, rate limiting.
 - **AfterProxy** — after the upstream response: response headers.
 - **ResponseBodyHook / TransformResponseBody** — on the store-to-cache path
   only: optimizer.
@@ -73,4 +74,5 @@ rewrites and preflight short-circuits are one-shot).
 - [JSON logs](jsonlog.md)
 - [Prometheus metrics](prometheus.md)
 - [Error pages](errorpage.md)
+- [Rate limiting](ratelimit.md)
 - [Web Application Firewall](waf.md)

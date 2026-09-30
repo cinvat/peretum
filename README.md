@@ -22,7 +22,7 @@
 - **TLS** — global and per-target certificates, automatic self-signed certificate generation
 - **HTTP/3 (QUIC)** — served on the listen port by default; HTTP/1.1, HTTP/2 and HTTP/3 all work out of the box.
 - **gRPC** — pure bidirectional streaming passthrough (h2c + ALPN h2), never cached or buffered.
-- **Plugins** — compression, CSS/JS/image optimization, CORS, request and response headers, path rewrite, JSON access/error logs, Prometheus metrics, branded error pages and a Web Application Firewall.
+- **Plugins** — compression, CSS/JS/image optimization, CORS, request and response headers, path rewrite, JSON access/error logs, Prometheus metrics, branded error pages, rate limiting and a Web Application Firewall.
 - **WAF** — per-location signature rules (Aho–Corasick driven `contains`), operates on geo/IP fields as ordinary rule conditions.
 - **Hot reload** — `SIGHUP` reloads configs and rotates log outputs; graceful 30s shutdown on `SIGINT`/`SIGTERM`.
 
@@ -64,6 +64,7 @@ Full docs at **[cinvat.github.io/peretum](https://cinvat.github.io/peretum/)**:
 - [JSON logs](plugins/jsonlog.md)
 - [Prometheus metrics](plugins/prometheus.md)
 - [Error pages](plugins/errorpage.md)
+- [Rate limiting](plugins/ratelimit.md)
 - [Web Application Firewall](plugins/waf.md)
 
 **Core subsystems**

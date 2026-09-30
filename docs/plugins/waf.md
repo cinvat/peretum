@@ -71,7 +71,7 @@ locations:
           name: "Block obvious SQL injection"
           enabled: true        # per-rule toggle
           action:
-            type: "deny"       # deny | allow | log
+            type: "deny"       # deny | allow | log | rate_limit
             code: 403          # HTTP status for the block page
             message: "SQL injection attempt blocked"   # block page body
           conditions:
@@ -85,6 +85,19 @@ locations:
             - - param: "query"
                 operator: "matches"
                 value: "union.*select"
+        # Per-endpoint throttle (token bucket per rule+IP, shared with the
+        # ratelimit plugin's store).
+        - id: "login-throttle"
+          action:
+            type: "rate_limit"   # or "ratelimit"
+            rps: 5
+            burst: 10
+            code: 429
+            message: "Too Many Requests"
+          conditions:
+            - - param: "path"
+                operator: "startswith"
+                value: "/login"
 ```
 
 ## Evaluation order
@@ -92,7 +105,12 @@ locations:
 Rules are evaluated in the order they appear in the `rules:` list. A rule
 with `action.type: "allow"` short-circuits the evaluation (the request passes
 immediately). The first matching deny rule blocks the request. A rule with
-`action.type: "log"` records the match and evaluation continues.
+`action.type: "log"` records the match and evaluation continues. A rule with
+`action.type: "rate_limit"` (alias `"ratelimit"`) checks a token bucket keyed
+by `rule-id|client-IP` with the rule's `rps`/`burst` (defaults `100`/`200`):
+under-limit requests pass, over-limit requests are blocked with `429` (plus
+`Retry-After: 1`) unless the rule sets its own `code`/`message`. See [Rate
+limiting](ratelimit.md).
 
 A rule matches when **any** group of conditions matches (DNF). Geo and IP
 checks (country, asn, asn_org, city, ip) are ordinary condition parameters
@@ -181,6 +199,7 @@ how many rules reference it.
 ## Blocking
 
 Blocks write a plain-text body with `X-WAF-Block: true` and the status from
-the matched rule's `action.code`, default `403`. A rule without `action.code`
-or `action.message` uses `403` and `Request blocked by WAF`. The [error page
-plugin](errorpage.md) layers its branded page on top.
+the matched rule's `action.code`, default `403` (`429`/`Too Many Requests`
+for `rate_limit` rules without an explicit `code`/`message`). A rule without
+`action.code` or `action.message` uses `403` and `Request blocked by WAF`.
+The [error page plugin](errorpage.md) layers its branded page on top.
