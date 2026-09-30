@@ -281,3 +281,44 @@ func TestStructToMap(t *testing.T) {
 		t.Fatalf("headers empty map expected, got nil")
 	}
 }
+
+func TestBuildPluginConfigsRateLimit(t *testing.T) {
+	proxyCfg := &config.ProxyConfig{RateLimit: &config.RateLimitConfig{Enabled: true, RPS: 10, Burst: 20}}
+	configs := buildPluginConfigs(proxyCfg, nil)
+	v, ok := configs["ratelimit"]
+	if !ok {
+		t.Fatalf("ratelimit config missing: %v", configs)
+	}
+	if v["enabled"] != true || v["rps"] != 10.0 || v["burst"] != 20 {
+		t.Fatalf("ratelimit = %v, want enabled/rps=10/burst=20", v)
+	}
+
+	configs = buildPluginConfigs(&config.ProxyConfig{}, nil)
+	if v := configs["ratelimit"]; v["enabled"] != false {
+		t.Fatalf("absent rate_limit must be disabled, got %v", v)
+	}
+}
+
+func TestWAFLocationsPassRateLimitParams(t *testing.T) {
+	rps := 5.0
+	targets := []config.TargetConfig{{
+		ServerName: "t",
+		Locations: []config.LocationConfig{{
+			Path: "/",
+			WAF: &config.WAFLocationConfig{Enabled: true, Rules: []config.WAFRule{{
+				ID:         "rl",
+				Action:     config.WAFRuleAction{Type: "rate_limit", RPS: rps, Burst: 7},
+				Conditions: [][]config.WAFCondition{{{Param: "path", Operator: "startswith", Value: "/"}}},
+			}}},
+		}},
+	}}
+	locs := buildWAFLocations(targets)
+	if len(locs) != 1 {
+		t.Fatalf("locations = %d, want 1", len(locs))
+	}
+	rule := locs[0].(map[string]any)["waf"].(map[string]any)["rules"].([]any)[0].(map[string]any)
+	am := rule["action"].(map[string]any)
+	if am["type"] != "rate_limit" || am["rps"] != rps || am["burst"] != 7 {
+		t.Fatalf("action = %v, want rate_limit/rps=5/burst=7", am)
+	}
+}

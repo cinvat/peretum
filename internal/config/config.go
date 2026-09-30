@@ -49,6 +49,9 @@ type ProxyConfig struct {
 	// across all per-location WAF configs.
 	WAF *WAFConfig `yaml:"waf"`
 
+	// RateLimit plugin: global token-bucket throttle, keyed per target+client.
+	RateLimit *RateLimitConfig `yaml:"rate_limit"`
+
 	// Cluster enables CDN-scale features: sharding, delta reload, lazy loading, config streaming.
 	Cluster *ClusterConfig `yaml:"cluster"`
 }
@@ -58,6 +61,14 @@ type ProxyConfig struct {
 type WAFConfig struct {
 	Enabled    bool   `yaml:"enabled"`
 	GeoLiteDir string `yaml:"geolite_dir"`
+}
+
+// RateLimitConfig holds the global ratelimit plugin settings: a token bucket
+// per target+client IP. Per-location throttles use WAF rate_limit actions.
+type RateLimitConfig struct {
+	Enabled bool    `yaml:"enabled"`
+	RPS     float64 `yaml:"rps"`
+	Burst   int     `yaml:"burst"`
 }
 
 // ClusterConfig holds cluster feature configuration.
@@ -185,11 +196,14 @@ type WAFRule struct {
 }
 
 // WAFRuleAction mirrors the Lua actions handler. Type is one of
-// "deny", "allow", or "log".
+// "deny", "allow", "log", or "rate_limit" (token-bucket throttle; carries
+// RPS/Burst and answers 429 while over limit).
 type WAFRuleAction struct {
-	Type    string `yaml:"type"`
-	Code    int    `yaml:"code"`
-	Message string `yaml:"message"`
+	Type    string  `yaml:"type"`
+	Code    int     `yaml:"code"`
+	Message string  `yaml:"message"`
+	RPS     float64 `yaml:"rps"`
+	Burst   int     `yaml:"burst"`
 }
 
 // WAFCondition mirrors the Lua conditions: a parameter getter, an operator,

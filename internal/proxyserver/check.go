@@ -35,6 +35,14 @@ func CheckConfig(cfgPath, targetsDir string) error {
 	if _, err := proxyCfg.ParseListeners(); err != nil {
 		return fmt.Errorf("listeners: %w", err)
 	}
+	if rl := proxyCfg.RateLimit; rl != nil {
+		if rl.RPS < 0 {
+			return fmt.Errorf("rate_limit.rps: must be >= 0")
+		}
+		if rl.Burst < 0 {
+			return fmt.Errorf("rate_limit.burst: must be >= 0")
+		}
+	}
 	if c := proxyCfg.Cluster; c != nil && c.Enabled {
 		if c.Lazy {
 			if c.DataDir == "" {
@@ -66,6 +74,19 @@ func CheckConfig(cfgPath, targetsDir string) error {
 		for _, loc := range t.Locations {
 			if _, err := loc.ParseCacheTTL(); err != nil {
 				return fmt.Errorf("target %s location %s cache_ttl: %w", t.ServerName, loc.Path, err)
+			}
+			if loc.WAF != nil {
+				for _, r := range loc.WAF.Rules {
+					at := strings.ToLower(strings.ReplaceAll(r.Action.Type, "-", "_"))
+					if at == "rate_limit" || at == "ratelimit" {
+						if r.Action.RPS < 0 {
+							return fmt.Errorf("target %s location %s rule %s: rps must be >= 0", t.ServerName, loc.Path, r.ID)
+						}
+						if r.Action.Burst < 0 {
+							return fmt.Errorf("target %s location %s rule %s: burst must be >= 0", t.ServerName, loc.Path, r.ID)
+						}
+					}
+				}
 			}
 		}
 	}

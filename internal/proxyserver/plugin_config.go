@@ -40,6 +40,20 @@ func buildPluginConfigs(proxyCfg *config.ProxyConfig, targets []config.TargetCon
 		configs["error_page"] = m
 	}
 
+	// Rate limit plugin: global token bucket per target+client IP.
+	if proxyCfg.RateLimit != nil {
+		m := map[string]any{"enabled": proxyCfg.RateLimit.Enabled}
+		if proxyCfg.RateLimit.RPS > 0 {
+			m["rps"] = proxyCfg.RateLimit.RPS
+		}
+		if proxyCfg.RateLimit.Burst > 0 {
+			m["burst"] = proxyCfg.RateLimit.Burst
+		}
+		configs["ratelimit"] = m
+	} else {
+		configs["ratelimit"] = map[string]any{"enabled": false}
+	}
+
 	// WAF plugin: global GeoLite directory plus per-location policies
 	// aggregated in one config, so BeforeProxy can pick the policy by
 	// target|location instead of the last-wins pattern other plugins use.
@@ -216,7 +230,7 @@ func wafLocationToMap(v *config.WAFLocationConfig) map[string]any {
 		if r.Enabled != nil {
 			rm["enabled"] = *r.Enabled
 		}
-		if r.Action.Type != "" || r.Action.Code != 0 || r.Action.Message != "" {
+		if r.Action.Type != "" || r.Action.Code != 0 || r.Action.Message != "" || r.Action.RPS != 0 || r.Action.Burst != 0 {
 			am := map[string]any{}
 			if r.Action.Type != "" {
 				am["type"] = r.Action.Type
@@ -226,6 +240,12 @@ func wafLocationToMap(v *config.WAFLocationConfig) map[string]any {
 			}
 			if r.Action.Message != "" {
 				am["message"] = r.Action.Message
+			}
+			if r.Action.RPS != 0 {
+				am["rps"] = r.Action.RPS
+			}
+			if r.Action.Burst != 0 {
+				am["burst"] = r.Action.Burst
 			}
 			rm["action"] = am
 		}
