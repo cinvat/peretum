@@ -100,6 +100,13 @@ func readMetadata(r *bufio.Reader) (int, string, string, http.Header, error) {
 	return readMetadataV1(r)
 }
 
+// Sanity caps for metadata parsing: a corrupt or hostile sidecar must
+// fail fast instead of driving multi-gigabyte allocations.
+const (
+	maxMetaHeaders = 10000
+	maxMetaString  = 1 << 20
+)
+
 func readMetadataV1(r *bufio.Reader) (int, string, string, http.Header, error) {
 	var statusCode uint16
 	if err := binary.Read(r, binary.LittleEndian, &statusCode); err != nil {
@@ -109,6 +116,9 @@ func readMetadataV1(r *bufio.Reader) (int, string, string, http.Header, error) {
 	var numHeaders uint32
 	if err := binary.Read(r, binary.LittleEndian, &numHeaders); err != nil {
 		return 0, "", "", nil, err
+	}
+	if numHeaders > maxMetaHeaders {
+		return 0, "", "", nil, fmt.Errorf("metadata has %d headers, max %d", numHeaders, maxMetaHeaders)
 	}
 
 	headers := make(http.Header, numHeaders)
@@ -147,6 +157,9 @@ func readMetadataV2(r *bufio.Reader) (int, string, string, http.Header, error) {
 	if err := binary.Read(r, binary.LittleEndian, &numHeaders); err != nil {
 		return 0, "", "", nil, err
 	}
+	if numHeaders > maxMetaHeaders {
+		return 0, "", "", nil, fmt.Errorf("metadata has %d headers, max %d", numHeaders, maxMetaHeaders)
+	}
 
 	headers := make(http.Header, numHeaders)
 	for i := uint32(0); i < numHeaders; i++ {
@@ -170,6 +183,9 @@ func readString(r *bufio.Reader) (string, error) {
 	var length uint32
 	if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
 		return "", err
+	}
+	if length > maxMetaString {
+		return "", fmt.Errorf("metadata string of %d bytes exceeds max %d", length, maxMetaString)
 	}
 	buf := make([]byte, length)
 	if _, err := io.ReadFull(r, buf); err != nil {
