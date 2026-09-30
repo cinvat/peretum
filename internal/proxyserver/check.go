@@ -1,4 +1,4 @@
-package cmd
+package proxyserver
 
 import (
 	"fmt"
@@ -9,7 +9,7 @@ import (
 
 // checkConfig validates the proxy and target configuration files without
 // starting the server.
-func checkConfig(cfgPath, targetsDir string) error {
+func CheckConfig(cfgPath, targetsDir string) error {
 	proxyCfg, err := config.LoadProxy(cfgPath)
 	if err != nil {
 		return fmt.Errorf("proxy config: %w", err)

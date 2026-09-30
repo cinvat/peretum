@@ -14,15 +14,15 @@ peretum/
 │   ├── static.yaml
 │   └── test.yaml
 ├── main.go                  # Entrypoint: delegates to cmd.Execute()
-├── cmd/                     # cobra-cli style command tree
+├── cmd/                     # cobra-cli command tree (thin adapters only)
 │   ├── root.go              # Root command + flags (-t/-r, --config, ...)
 │   ├── run.go               # Default run (pid file + server lifecycle)
-│   ├── reload.go            # --reload: SIGHUP to the pid in --pid-file
-│   ├── check.go             # --test: config syntax check without starting
-│   └── server.go            # Proxy server assembly (routers, TLS, HTTP/3)
-├── cmd/testserver/          # Upstream test server
-├── docs/                    # GitHub Pages documentation (this site)
+│   ├── api.go               # `api` subcommand
+│   └── controlplane.go      # `controlplane` subcommand
 ├── internal/
+│   ├── proxyserver/         # Proxy server assembly (routers, TLS, HTTP/3,
+│   │                        # lifecycle, plugin config, --test/--reload)
+│   ├── controlplane/        # Config publisher (fsnotify -> NATS JetStream)
 │   ├── cache/disk/          # Disk cache (shards, atomic writes, eviction)
 │   ├── config/              # YAML loading + parsing
 │   ├── handler/             # Proxy handler, caching, coalescing
@@ -48,7 +48,7 @@ peretum/
 | Concern | Location |
 | --- | --- |
 | CLI and flags | `cmd/root.go` |
-| Server assembly, plugin wiring (`buildPluginConfigs`) | `cmd/server.go` |
+| Server assembly, plugin wiring (`buildPluginConfigs`) | `internal/proxyserver/` |
 | Config types and parsers | `internal/config/config.go` |
 | Request lifecycle and plugin hook dispatch | `internal/handler/handler.go` |
 | Plugin hook implementation | `internal/plugin/manager/manager.go` |

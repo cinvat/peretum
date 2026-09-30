@@ -20,7 +20,7 @@ order: 200
    ```go
    Register("my_plugin", func() base.Plugin { return myplugin.New() })
    ```
-3. **Wire the config** in `cmd/server.go` `buildPluginConfigs` (and, for
+3. **Wire the config** in `internal/proxyserver/plugin_config.go` `buildPluginConfigs` (and, for
    location-scoped plugins, a `structToMap`-style conversion) so that your
    plugin's keys are emitted with `enabled` as the load gate.
 4. **Enable it** under the `plugins:`/location settings in your YAML config.

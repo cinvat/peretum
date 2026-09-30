@@ -1,4 +1,4 @@
-package cmd
+package proxyserver
 
 import (
 	"fmt"
@@ -10,7 +10,7 @@ import (
 
 // reloadProxy sends SIGHUP to the pid stored in pidFile, triggering the running
 // proxy's config reload handler.
-func reloadProxy(pidFile string) error {
+func ReloadProxy(pidFile string) error {
 	data, err := os.ReadFile(pidFile)
 	if err != nil {
 		return fmt.Errorf("read pid file %s: %w", pidFile, err)

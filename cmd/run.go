@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+
+	"github.com/cinvat/peretum/internal/proxyserver"
 )
 
 // runProxy writes a pid file (so --reload can target this instance), runs the
@@ -14,5 +16,5 @@ func runProxy(ctx context.Context, cfgPath, targetsDir, pidFile string) error {
 		return fmt.Errorf("write pid file %s: %w", pidFile, err)
 	}
 	defer os.Remove(pidFile)
-	return run(ctx, cfgPath, targetsDir)
+	return proxyserver.Run(ctx, cfgPath, targetsDir)
 }

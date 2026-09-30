@@ -278,6 +278,26 @@ type ProxyLocationConfig struct {
 	PassHostHeader bool `yaml:"pass_host_header"`
 }
 
+// ParseServerNames extracts hostnames from a comma-separated server_name
+// field, stripping whitespace and any port suffix.
+func ParseServerNames(serverName string) []string {
+	if serverName == "" {
+		return nil
+	}
+	var hosts []string
+	for _, h := range strings.Split(serverName, ",") {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		if idx := strings.Index(h, ":"); idx != -1 {
+			h = h[:idx]
+		}
+		hosts = append(hosts, h)
+	}
+	return hosts
+}
+
 func (c *ProxyConfig) ParseMaxCacheSize() (int64, error) {
 	return parseSize(c.MaxCacheSize)
 }

@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/cinvat/peretum/internal/proxyserver"
 	"github.com/spf13/cobra"
 )
 
@@ -35,9 +36,9 @@ func newRootCommand() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			switch {
 			case checkSyntaxFlag(cmd):
-				return checkConfig(cfgPath, targetsDir)
+				return proxyserver.CheckConfig(cfgPath, targetsDir)
 			case reloadFlag(cmd):
-				return reloadProxy(pidFile)
+				return proxyserver.ReloadProxy(pidFile)
 			default:
 				ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 				defer stop()
