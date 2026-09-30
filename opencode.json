@@ -1,0 +1,30 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": [
+    "AGENTS.md",
+    "SKILL.md",
+    "docs/development/contributing.md",
+    "docs/development/testing.md"
+  ],
+  "permission": {
+    "bash": "ask",
+    "edit": "allow",
+    "webfetch": "allow"
+  },
+  "mcp": {
+    "context7": {
+      "type": "local",
+      "command": ["npx", "--yes", "@upstash/context7-mcp"],
+      "enabled": true
+    },
+    "github": {
+      "type": "local",
+      "command": [
+        "npx",
+        "--yes",
+        "@modelcontextprotocol/server-github"
+      ],
+      "enabled": false
+    }
+  }
+}
