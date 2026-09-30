@@ -31,6 +31,16 @@ func getInt(m map[string]any, key string) int {
 	return 0
 }
 
+func getFloat(m map[string]any, key string) float64 {
+	switch v := m[key].(type) {
+	case float64:
+		return v
+	case int:
+		return float64(v)
+	}
+	return 0
+}
+
 // parseIPNets splits a comma-separated rule value into IP addresses and CIDR
 // blocks, skipping entries that fail to parse.
 func parseIPNets(value string) []*net.IPNet {

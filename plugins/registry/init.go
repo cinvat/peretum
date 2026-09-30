@@ -12,6 +12,7 @@ import (
 	"github.com/cinvat/peretum/plugins/jsonlog"
 	"github.com/cinvat/peretum/plugins/optimizer"
 	"github.com/cinvat/peretum/plugins/prometheus"
+	"github.com/cinvat/peretum/plugins/ratelimit"
 	"github.com/cinvat/peretum/plugins/rewrite"
 	"github.com/cinvat/peretum/plugins/waf"
 )
@@ -39,6 +40,7 @@ func registerDefaultFactories() {
 	Register("prometheus_exporter", func() base.Plugin { return prometheus.NewPrometheusPlugin() })
 	Register("error_page", func() base.Plugin { return errorpage.NewErrorPagePlugin() })
 	Register("waf", func() base.Plugin { return waf.NewWAFPlugin() })
+	Register("ratelimit", func() base.Plugin { return ratelimit.NewRateLimitPlugin() })
 }
 
 func LoadAndInitializePlugins(ctx context.Context, configs map[string]map[string]any) ([]base.Plugin, error) {

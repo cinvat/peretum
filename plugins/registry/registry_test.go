@@ -76,8 +76,8 @@ func TestInitFactories(t *testing.T) {
 			t.Fatalf("Get(%q) name = %q", name, p.Name())
 		}
 	}
-	if n := len(List()); n != 9 {
-		t.Fatalf("expected 9 init-registered plugins, got %d", n)
+	if n := len(List()); n != 10 {
+		t.Fatalf("expected 10 init-registered plugins, got %d", n)
 	}
 }
 

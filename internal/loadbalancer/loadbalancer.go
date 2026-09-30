@@ -191,6 +191,7 @@ const maglevTableSize = 65537
 type maglev struct {
 	upstreams []*Upstream
 	table     []int
+	dirty     atomic.Bool
 	mu        sync.RWMutex
 }
 
@@ -217,8 +218,12 @@ func (m *maglev) hasHealthy() bool {
 func (m *maglev) buildTable() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.buildTableLocked()
+}
 
-	// Filling the table needs at least one healthy upstream. With none, the loop
+// buildTableLocked rebuilds the lookup table; caller must hold the write lock.
+// Filling the table needs at least one healthy upstream. With none, the loop
+func (m *maglev) buildTableLocked() {
 	// below skips every upstream and fills nothing, so it would spin forever
 	// holding the lock -- and a target reaches that state whenever its whole
 	// origin set fails at once. Keeping the previous table is correct: Next
@@ -267,10 +272,21 @@ func (m *maglev) buildTable() {
 }
 
 func (m *maglev) Next(r *http.Request) *Upstream {
+	// Lazy rebuild: health flips only set the dirty flag (cheap), the
+	// O(tableSize) rebuild happens here once before the next selection
+	// instead of on the MarkHealthy caller's goroutine.
+	if m.dirty.Load() {
+		m.mu.Lock()
+		if m.dirty.Load() {
+			m.buildTableLocked()
+			m.dirty.Store(false)
+		}
+		m.mu.Unlock()
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	if len(m.upstreams) == 0 {
+	if len(m.upstreams) == 0 || len(m.table) == 0 {
 		return nil
 	}
 
@@ -293,10 +309,8 @@ func (m *maglev) MarkHealthy(url string, healthy bool) {
 	if !m.setHealth(url, healthy) {
 		return
 	}
-	// The healthy set changed, so re-balance the lookup table across it. This is
-	// O(maglevTableSize) and runs on the caller's goroutine, which on the request
-	// path is every health flip.
-	m.buildTable()
+	// Lazy rebuild: just mark dirty; Next rebuilds once before selection.
+	m.dirty.Store(true)
 }
 
 // setHealth records a new health state and reports whether it actually changed,

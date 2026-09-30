@@ -19,6 +19,8 @@ type PrometheusPlugin struct {
 
 	targetRequestsTotal         *prometheus.CounterVec
 	targetCachedRequestsTotal   *prometheus.CounterVec
+	targetErrorsTotal           *prometheus.CounterVec
+	targetRequestDuration       *prometheus.HistogramVec
 	locationRequestsTotal       *prometheus.CounterVec
 	locationCachedRequestsTotal *prometheus.CounterVec
 	proxyRequestsTotal          prometheus.Counter
@@ -63,6 +65,23 @@ func (p *PrometheusPlugin) Init(config map[string]any) error {
 		prometheus.CounterOpts{
 			Name: "peretum_target_cached_requests_total",
 			Help: "Total number of cached requests served by target",
+		},
+		[]string{"target"},
+	)
+
+	p.targetErrorsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "peretum_target_errors_total",
+			Help: "Total number of errored requests by target and status code",
+		},
+		[]string{"target", "code"},
+	)
+
+	p.targetRequestDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "peretum_target_request_duration_seconds",
+			Help:    "Per-target request latency in seconds",
+			Buckets: prometheus.DefBuckets,
 		},
 		[]string{"target"},
 	)
@@ -196,6 +215,11 @@ func (p *PrometheusPlugin) RecordRequest(target, location, matchType string, cac
 	}
 
 	p.proxyRequestDuration.WithLabelValues(target, location, strconv.FormatBool(cached)).Observe(duration)
+	p.targetRequestDuration.WithLabelValues(target).Observe(duration)
+}
+
+func (p *PrometheusPlugin) RecordError(target, code string) {
+	p.targetErrorsTotal.WithLabelValues(target, code).Inc()
 }
 
 func (p *PrometheusPlugin) RecordCacheHit(target, location string) {

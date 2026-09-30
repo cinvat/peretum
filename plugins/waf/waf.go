@@ -11,14 +11,16 @@ import (
 	"strings"
 
 	"github.com/cinvat/peretum/plugins/base"
+	"github.com/cinvat/peretum/plugins/ratelimit"
 	"k8s.io/klog/v2"
 )
 
 // Action types mirroring the Lua actions/handler.
 const (
-	actionDeny  = "deny"
-	actionAllow = "allow"
-	actionLog   = "log"
+	actionDeny      = "deny"
+	actionAllow     = "allow"
+	actionLog       = "log"
+	actionRateLimit = "ratelimit"
 )
 
 var errWAFBlocked = fmt.Errorf("waf: request blocked")
@@ -32,11 +34,12 @@ type WAFPlugin struct {
 	rs          map[string]*ruleSet
 	gs          *geodb
 	maxBodySize int64 // maximum request body size to read for "body" parameter
+	limiter     *ratelimit.Store
 }
 
 // NewWAFPlugin returns a fresh WAF plugin instance.
 func NewWAFPlugin() *WAFPlugin {
-	return &WAFPlugin{BasePlugin: base.NewBasePlugin("waf")}
+	return &WAFPlugin{BasePlugin: base.NewBasePlugin("waf"), limiter: ratelimit.NewStore()}
 }
 
 // Init parses the plugin config, which carries a global geolite directory and
@@ -112,6 +115,21 @@ func (p *WAFPlugin) BeforeProxy(w http.ResponseWriter, r *http.Request, target, 
 	action, rule := rs.evaluate(r, p.gs)
 	if action == ruleSetActionBlock {
 		status, message := blockConfig(rule)
+		// Rate-limit rules share the token-bucket store with the standalone
+		// ratelimit plugin; only over-limit requests are blocked (429).
+		if rule != nil && rule.action == actionRateLimit {
+			key := rule.id + "|" + clientIP(r)
+			if p.limiter.Allow(key, rule.rps, rule.burst) {
+				return nil
+			}
+			if status == 403 {
+				status = http.StatusTooManyRequests
+			}
+			if message == "Request blocked by WAF" {
+				message = "Too Many Requests"
+			}
+			w.Header().Set("Retry-After", "1")
+		}
 		p.writeBlock(w, r, status, message)
 		return errWAFBlocked
 	}
@@ -290,6 +308,8 @@ type ruleSet struct {
 
 // compiledRule is a rule with its OR-of-AND-groups of condition ids. The
 // action is self-contained: deny rules carry their own status and message.
+// A "ratelimit"/"rate_limit" action additionally carries rps/burst and is
+// enforced via the shared token-bucket store in BeforeProxy.
 type compiledRule struct {
 	id      string
 	name    string
@@ -297,6 +317,8 @@ type compiledRule struct {
 	action  string
 	code    int
 	message string
+	rps     float64
+	burst   int
 	groups  [][]int
 }
 
@@ -405,8 +427,17 @@ func buildRuleSet(cfg map[string]any, maxBodySize int64) (*ruleSet, error) {
 			if rule.action == "" {
 				rule.action = actionDeny
 			}
+			rule.action = strings.ToLower(strings.ReplaceAll(rule.action, "-", "_"))
+			if rule.action == "rate_limit" {
+				rule.action = actionRateLimit
+			}
 			rule.code = getInt(am, "code")
 			rule.message = getString(am, "message")
+			rule.rps = getFloat(am, "rps")
+			if rule.rps == 0 {
+				rule.rps = getFloat(am, "requests_per_second")
+			}
+			rule.burst = getInt(am, "burst")
 		}
 
 		groups, _ := rm["conditions"].([]any)
@@ -544,7 +575,7 @@ func (rs *ruleSet) evaluate(r *http.Request, gs *geodb) (ruleSetAction, *compile
 		case actionLog:
 			klog.Infof("waf: log rule %q matched for %s", rule.id, ctx.ip)
 			continue
-		case actionDeny:
+		case actionDeny, actionRateLimit:
 			return ruleSetActionBlock, rule
 		}
 	}

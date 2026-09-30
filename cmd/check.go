@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/cinvat/peretum/internal/config"
 )
@@ -33,6 +34,24 @@ func checkConfig(cfgPath, targetsDir string) error {
 	}
 	if _, err := proxyCfg.ParseListeners(); err != nil {
 		return fmt.Errorf("listeners: %w", err)
+	}
+	if c := proxyCfg.Cluster; c != nil && c.Enabled {
+		if c.Lazy {
+			if c.DataDir == "" {
+				return fmt.Errorf("cluster.data_dir: required when cluster.lazy is true")
+			}
+			if c.LRUSize < 0 {
+				return fmt.Errorf("cluster.lru_size: must be >= 0")
+			}
+		}
+		if c.NATSURI != "" {
+			if !strings.HasPrefix(c.NATSURI, "nats://") && !strings.HasPrefix(c.NATSURI, "tls://") {
+				return fmt.Errorf("cluster.nats_uri: must start with nats:// or tls://")
+			}
+		}
+		if c.ReplayTimeout < 0 {
+			return fmt.Errorf("cluster.replay_timeout: must be >= 0")
+		}
 	}
 	targets, err := config.LoadTargets(targetsDir)
 	if err != nil {
