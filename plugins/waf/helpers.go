@@ -45,7 +45,7 @@ func getFloat(m map[string]any, key string) float64 {
 // blocks, skipping entries that fail to parse.
 func parseIPNets(value string) []*net.IPNet {
 	var nets []*net.IPNet
-	for _, item := range strings.Split(value, ",") {
+	for item := range strings.SplitSeq(value, ",") {
 		if n := parseCIDR(item); n != nil {
 			nets = append(nets, n)
 		}

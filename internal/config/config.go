@@ -299,7 +299,7 @@ func ParseServerNames(serverName string) []string {
 		return nil
 	}
 	var hosts []string
-	for _, h := range strings.Split(serverName, ",") {
+	for h := range strings.SplitSeq(serverName, ",") {
 		h = strings.TrimSpace(h)
 		if h == "" {
 			continue

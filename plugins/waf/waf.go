@@ -508,7 +508,7 @@ func compileCondition(idx *paramIndex, op, value string, condID int) {
 	case "in", "not_in":
 		negate := strings.ToLower(op) == "not_in"
 		vals := make(map[string]struct{})
-		for _, item := range strings.Split(value, ",") {
+		for item := range strings.SplitSeq(value, ",") {
 			if v := strings.TrimSpace(item); v != "" {
 				vals[v] = struct{}{}
 			}
