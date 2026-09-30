@@ -424,16 +424,28 @@ func (d *DiskCache) PurgeByHost(host string) int {
 // PurgeByPath removes all cache entries matching the exact path.
 // Returns the number of entries purged.
 func (d *DiskCache) PurgeByPath(path string) int {
-	return d.purgeByPathPrefix(path, false)
+	return d.purgeByHostPath("", path, false)
 }
 
 // PurgeByPrefix removes all cache entries where the path starts with the given prefix.
 // Returns the number of entries purged.
 func (d *DiskCache) PurgeByPrefix(prefix string) int {
-	return d.purgeByPathPrefix(prefix, true)
+	return d.purgeByHostPath("", prefix, true)
 }
 
-func (d *DiskCache) purgeByPathPrefix(path string, isPrefix bool) int {
+// PurgeByHostPath removes the cached entry for host+path.
+// An empty host matches any host.
+func (d *DiskCache) PurgeByHostPath(host, path string) int {
+	return d.purgeByHostPath(host, path, false)
+}
+
+// PurgeByHostPrefix removes cached entries for host whose path starts with
+// prefix. An empty host matches any host.
+func (d *DiskCache) PurgeByHostPrefix(host, prefix string) int {
+	return d.purgeByHostPath(host, prefix, true)
+}
+
+func (d *DiskCache) purgeByHostPath(host, path string, isPrefix bool) int {
 	purged := 0
 	for _, s := range d.shards {
 		s.mu.Lock()
@@ -444,9 +456,12 @@ func (d *DiskCache) purgeByPathPrefix(path string, isPrefix bool) int {
 			if err != nil {
 				continue
 			}
-			_, _, entryPath, _, err := readMetadata(bufio.NewReader(metaFile))
+			_, entryHost, entryPath, _, err := readMetadata(bufio.NewReader(metaFile))
 			metaFile.Close()
 			if err != nil {
+				continue
+			}
+			if host != "" && entryHost != host {
 				continue
 			}
 			match := false

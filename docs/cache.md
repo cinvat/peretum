@@ -52,3 +52,45 @@ and to serve `HIT` immediately after a `MISS`.
 
 HTTP/3 (QUIC) responses bypass the disk cache path entirely (see
 [HTTP/3 (QUIC)](http3.md)).
+
+## Purging via the REST API
+
+`DELETE /v1alpha1/cache` on the API server removes entries by site, object,
+or location subtree:
+
+```bash
+# whole site
+curl -X DELETE "localhost:8080/v1alpha1/cache?host=example.com"
+# single object
+curl -X DELETE "localhost:8080/v1alpha1/cache?host=example.com&path=/exact"
+# location subtree
+curl -X DELETE "localhost:8080/v1alpha1/cache?host=example.com&prefix=/blog/"
+# everything (host/path/prefix must be empty)
+curl -X DELETE "localhost:8080/v1alpha1/cache?all=true"
+# → {"purged": 42}
+```
+
+| Param | Scope |
+| --- | --- |
+| `host` | Every entry for the site. |
+| `host` + `path` | One object (exact path). |
+| `host` + `prefix` | A location subtree (`prefix` may also be used without `host`). |
+| `all=true` | The whole cache; exclusive with the other params. |
+
+### Standalone vs cluster mode
+
+- **Standalone** (default): the API purges local cache files
+  (`peretum api --cache-dir` must point at the proxy's `cache_dir`) and
+  reports `{"purged": N}`. Purged entries miss immediately — the read path
+  stats files on every request.
+- **Cluster** (`peretum api --nats-uri`): the API instead publishes the
+  purge on the ephemeral `cache.purge` NATS subject, and **every edge**
+  purges its own live cache in memory, reporting
+  `{"published": true}` (no per-edge counts — fire-and-forget, like all
+  cluster broadcasts). An edge offline during the broadcast keeps stale
+  entries until TTL/expiry, then refills from origin.
+
+Two caveats for standalone mode: the proxy's in-memory size accounting
+drifts until purged keys age out of its LRU (never a stale serve), and a
+purge racing an in-flight cache write can lose (the late write re-creates
+the file).

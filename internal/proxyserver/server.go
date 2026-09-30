@@ -145,6 +145,13 @@ func newProxyServer(proxyCfg *config.ProxyConfig, targets []config.TargetConfig,
 			if ps.configErr != nil {
 				klog.Errorf("failed to start NATS config consumer: %v", ps.configErr)
 			}
+
+			// Subscribe to cache purge broadcasts. The handler purges the
+			// live disk cache in memory, so every edge drops the entries
+			// without scanning files.
+			if _, err := natsSync.SubscribeCachePurge(ps.handlePurgeEvent); err != nil {
+				klog.Errorf("failed to subscribe to cache purge: %v", err)
+			}
 		}
 	}
 

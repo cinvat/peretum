@@ -13,6 +13,25 @@ import (
 	"net/http"
 )
 
+// handlePurgeEvent applies a cache purge broadcast against the edge's live
+// disk cache. In-memory purges also fix the LRU accounting, which the
+// out-of-process disk walk used by standalone mode cannot do.
+func (ps *proxyServer) handlePurgeEvent(_ context.Context, event cluster.PurgeEvent) int {
+	if ps.diskCache == nil {
+		return 0
+	}
+	switch {
+	case event.All:
+		return ps.diskCache.PurgeAll()
+	case event.Path != "":
+		return ps.diskCache.PurgeByHostPath(event.Host, event.Path)
+	case event.Prefix != "":
+		return ps.diskCache.PurgeByHostPrefix(event.Host, event.Prefix)
+	default:
+		return ps.diskCache.PurgeByHost(event.Host)
+	}
+}
+
 // lazyMaterialize is the load path the lazy router's handlers use. The indirection
 // exists so tests can count how often a target is compiled; production always
 // goes through materializeTarget.

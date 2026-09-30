@@ -17,4 +17,6 @@ func Register(r *gin.Engine) {
 	v1alpha1Router.PATCH("/targets/:server_name", controller.PatchTarget)
 	v1alpha1Router.DELETE("/targets/:server_name", controller.DeleteTarget)
 
+	v1alpha1Router.DELETE("/cache", controller.PurgeCache)
+
 }
